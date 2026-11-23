@@ -80,6 +80,28 @@ class Generation(unittest.TestCase):
         self.assertEqual(sum(1 for m in self.mutants if m.line == line and m.label == "OpIAdd -> OpISub"), 1)
         self.assertFalse(any(m.line == line and m.label == "OpISub -> OpIAdd" for m in self.mutants))
 
+    def test_docstrings_are_left_alone(self):
+        # A docstring is text: an OpIAdd/UMin named there can't fail a test, so a mutant of it always "survives".
+        source = textwrap.dedent('''\
+            class Gen:
+                def helper(self, x, y):
+                    """Emit OpIAdd, then UMin with self.cu(31)."""
+                    self.emit(f"{r} = OpIAdd %uint {x} {y}")
+
+                def multi(self, x):
+                    """First line.
+
+                    OpISub and NMin are named here too.
+                    """
+                    self.emit(f"{t} = OpExtInst %uint %glsl UMin {x} {self.cu(31)}")
+                    s = "OpISub in a plain string assignment is still code"
+            ''').split("\n")
+        for name, code_lines in (("helper", [4]), ("multi", [11, 12])):
+            first, last = sm.find_function(source, name)
+            lines = {m.line for m in sm.mutants_for(source, first, last)}
+            with self.subTest(function=name):
+                self.assertEqual(sorted(lines), code_lines)
+
 
 class Tables(unittest.TestCase):
     def test_entry_takes_the_other_values_of_its_table(self):

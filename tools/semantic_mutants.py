@@ -27,7 +27,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
+import tokenize
 from dataclasses import dataclass
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -140,9 +142,32 @@ def find_function(lines: list[str], name: str) -> tuple[int, int]:
     raise LookupError(f"no method named {name}")
 
 
+def docstring_lines(lines: list[str]) -> set[int]:
+    """0-based lines that belong to a string standing alone as a statement (a docstring): text, not code, so a
+    mutant there can never fail a test. Empty when the lines do not tokenize."""
+    out: set[int] = set()
+    source = iter(line + "\n" for line in lines)
+    prev = tokenize.NEWLINE
+    try:
+        tokens = list(tokenize.generate_tokens(lambda: next(source, "")))
+    except (tokenize.TokenError, SyntaxError):
+        return out
+    for i, tok in enumerate(tokens):
+        if tok.type == tokenize.STRING and prev in (tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT):
+            after = next((t for t in tokens[i + 1:] if t.type not in (tokenize.COMMENT, tokenize.NL)), None)
+            if after is None or after.type in (tokenize.NEWLINE, tokenize.ENDMARKER):
+                out.update(range(tok.start[0] - 1, tok.end[0]))
+        if tok.type not in (tokenize.COMMENT, tokenize.NL):
+            prev = tok.type
+    return out
+
+
 def mutants_for(lines: list[str], first: int, last: int) -> list[Mutant]:
     out: list[Mutant] = []
     seen: set[tuple[int, str]] = set()
+    # Only the mutated range is tokenized (the whole translator takes seconds); dedented, a branch or method tokenizes.
+    span = textwrap.dedent("\n".join(lines[first:last + 1])).split("\n")
+    docs = {first + i for i in docstring_lines(span)}
 
     def add(i: int, label: str, new: str) -> None:
         if new != lines[i] and (i, new) not in seen:
@@ -150,6 +175,8 @@ def mutants_for(lines: list[str], first: int, last: int) -> list[Mutant]:
             out.append(Mutant(i + 1, label, lines[i], new))
 
     for i in range(first, last + 1):
+        if i in docs:
+            continue
         line = lines[i]
         code = line.split("#", 1)[0] if not line.lstrip().startswith(("f\"", "\"", "'")) else line
         if not code.strip() or code.lstrip().startswith("#"):
