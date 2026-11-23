@@ -20,6 +20,7 @@ CPU walker on the real-BVH first call, so this case also pins the `<< 8`, not a 
 
     python -m unittest tests/semantic/test_image_bvh_tri.py -v
 """
+import re
 import struct
 import unittest
 
@@ -114,6 +115,23 @@ class TriangleSlots(unittest.TestCase):
             with self.subTest(nan=hex(nan)):
                 self.assertEqual(run(0, 0x09, 0.2, 0.3, poke={NODE: nan}),
                                  [0xFF800000, 0xFFC00000, 0xFFC00000, 0xFFC00000])
+
+    def test_no_select_mixes_the_nan_or_miss_constant_with_a_computed_word(self):
+        # KosmicKrisp mistypes `OpSelect %uint %c 0xFFC00000 %x` when %x comes from a float, and returns 0x7FC00000
+        # (#6623). The workaround selects only between constants and combines with bitwise ops, so no select may
+        # pair 0xFFC00000 or 0xFFFFFFFF with a computed operand. Unlike the GPU and interpreter runs, this catches
+        # a return to the old form on any machine.
+        spv = translate_lines("ps_bvh_select_form", [
+            "s_mov_b32 s4, 0x10", "s_mov_b32 s5, 0", "s_mov_b32 s6, -1", "s_mov_b32 s7, 0",
+            "image_bvh64_intersect_ray v[20:23], [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12], s[4:7]",
+            "exp mrt0 v20, v21, v22, v23 done vm", "s_endpgm"])
+        constants = set(re.findall(r"^\s*(%\S+) = OpConstant\b", spv, re.M))
+        special = set(re.findall(r"^\s*(%\S+) = OpConstant %uint (?:4290772992|4294967295)$", spv, re.M))
+        self.assertTrue(special)
+        mixed = [ln.strip() for ln in spv.splitlines()
+                 if " OpSelect " in ln and special & set(ln.split()[-2:])
+                 and not set(ln.split()[-2:]) <= constants]
+        self.assertEqual(mixed, [])
 
 
 class RemapByte(unittest.TestCase):
