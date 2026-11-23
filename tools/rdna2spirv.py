@@ -14745,6 +14745,25 @@ class Gen:
             e(f"{r} = OpSelect {ty} {c} {x} {y}")
             return r
 
+        def usel_k(c, k, x, invert=False):
+            """c ? k : x (or c ? x : k with invert) for a constant k whose bits are a float NaN. Built as
+            (x & ~m) | (k & m) with m a select of two constants, not as an OpSelect between x and k: KosmicKrisp
+            (Mesa 26.3.1) types an OpSelect by the first concrete type that reaches it, which is float when x
+            came from a bitcast float or shares a register with one, and then prints k as the literal (NAN),
+            which Metal reads as 0x7FC00000 (#6623). Its bitwise ops never take a float type, so they keep k
+            an integer whatever x is."""
+            kc, zc = self.cu(k), self.cu(0)
+            km = sel(c, zc, kc, "%uint") if invert else sel(c, kc, zc, "%uint")      # k where k is chosen, else 0
+            r = T()
+            if k == 0xFFFFFFFF:                         # x | km alone gives k where km is set
+                e(f"{r} = OpBitwiseOr %uint {x} {km}")
+                return r
+            ones = self.cu(0xFFFFFFFF)
+            xkeep, xm = (sel(c, ones, zc, "%uint") if invert else sel(c, zc, ones, "%uint")), T()
+            e(f"{xm} = OpBitwiseAnd %uint {x} {xkeep}")
+            e(f"{r} = OpBitwiseOr %uint {xm} {km}")
+            return r
+
         is_tri, is_b16, is_box = T(), T(), T()
         e(f"{is_tri} = OpULessThan %bool {ntype} {self.cu(4)}")
         e(f"{is_b16} = OpIEqual %bool {ntype} {self.cu(4)}")
@@ -14876,7 +14895,7 @@ class Gen:
         def canon(x):
             u, nan = self.tou(x), T()
             e(f"{nan} = OpIsNan %bool {x}")
-            return sel(nan, self.cu(0xFFC00000), sel(eq0(x), self.cu(0), u, "%uint"), "%uint")
+            return usel_k(nan, 0xFFC00000, sel(eq0(x), self.cu(0), u, "%uint"))
         w = [canon(x) for x in [tk] + [fop("OpFMul", adz, x) for x in (det, pick(0), pick(2))]]
         sgn, minf = T(), T()
         e(f"{sgn} = OpBitwiseAnd %uint {w[1]} {self.cu(0x80000000)}")
@@ -14936,7 +14955,7 @@ class Gen:
             h2 = bop("OpFOrdLessThan", tmin, tmax)
             hb = andd(nonan, andd(h1, h2))
             dist.append(sel(hb, tnear, INF))
-            idx.append(sel(hb, child, self.cu(0xFFFFFFFF), "%uint"))
+            idx.append(usel_k(hb, 0xFFFFFFFF, child, invert=True))
         for p_, q_ in ((0, 2), (1, 3), (0, 1), (2, 3), (1, 2)):
             sw = andd(sort, bop("OpFOrdLessThan", dist[q_], dist[p_]))
             dist[p_], dist[q_] = sel(sw, dist[q_], dist[p_]), sel(sw, dist[p_], dist[q_])
