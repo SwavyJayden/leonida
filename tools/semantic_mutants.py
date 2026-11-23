@@ -162,12 +162,36 @@ def docstring_lines(lines: list[str]) -> set[int]:
     return out
 
 
+TRIPLE_QUOTE = re.compile(r'"""|\'\'\'')
+
+
+def string_context(lines: list[str], first: int, last: int) -> tuple[int, int]:
+    """Widen [first, last] to whole triple-quoted strings, so a range that starts or ends inside a docstring (a
+    --lines span) is tokenized with both of its delimiters. Delimiters are counted from the enclosing def or class,
+    a text scan that stays cheap inside the translator's long dispatch method."""
+    top = first
+    while top > 0 and not re.match(r"\s*(async\s+def|def|class)\s", lines[top]):
+        top -= 1
+    start = first
+    for i in range(top, first):
+        for _ in TRIPLE_QUOTE.finditer(lines[i]):
+            start = first if start != first else i      # an odd count before `first`: it opens at line i
+    end, open_ = last, False
+    for i in range(start, len(lines)):
+        open_ ^= len(TRIPLE_QUOTE.findall(lines[i])) % 2 == 1
+        if i >= last and not open_:
+            end = i
+            break
+    return start, end
+
+
 def mutants_for(lines: list[str], first: int, last: int) -> list[Mutant]:
     out: list[Mutant] = []
     seen: set[tuple[int, str]] = set()
     # Only the mutated range is tokenized (the whole translator takes seconds); dedented, a branch or method tokenizes.
-    span = textwrap.dedent("\n".join(lines[first:last + 1])).split("\n")
-    docs = {first + i for i in docstring_lines(span)}
+    start, end = string_context(lines, first, last)
+    span = textwrap.dedent("\n".join(lines[start:end + 1])).split("\n")
+    docs = {start + i for i in docstring_lines(span)}
 
     def add(i: int, label: str, new: str) -> None:
         if new != lines[i] and (i, new) not in seen:

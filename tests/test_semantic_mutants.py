@@ -101,6 +101,12 @@ class Generation(unittest.TestCase):
             lines = {m.line for m in sm.mutants_for(source, first, last)}
             with self.subTest(function=name):
                 self.assertEqual(sorted(lines), code_lines)
+        # A --lines range can start or end inside a docstring, without its opening or closing delimiter.
+        inside = next(i for i, s in enumerate(source) if "OpISub and NMin" in s)       # 0-based
+        for first, last in ((inside, inside), (inside, inside + 2), (inside - 3, inside)):
+            with self.subTest(lines=(first + 1, last + 1)):
+                lines = {m.line for m in sm.mutants_for(source, first, last)}
+                self.assertEqual(sorted(lines), [n for n in (11,) if first < n <= last + 1])
 
 
 class Tables(unittest.TestCase):
