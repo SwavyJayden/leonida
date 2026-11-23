@@ -4159,7 +4159,9 @@ private:
             raster.pNext = &conservative;
         }
         VkPipelineRasterizationLineStateCreateInfoEXT line{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO_EXT};
-        // Vulkan has no narrow quadrilateral mode; rectangular is the closest available approximation.
+        // Vulkan has no narrow quadrilateral mode; rectangular is the closest available approximation. Both
+        // QUADRILATERAL_WIDE and QUADRILATERAL_NARROW therefore become a rectangular line of the default width 1,
+        // so WIDE is not wider than NARROW here.
         bool use_line = false;
         switch (r.line_mode) {
         case D3D12_LINE_RASTERIZATION_MODE_ALIASED:

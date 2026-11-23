@@ -53,10 +53,244 @@ static_assert(offsetof(Vertex, marker) == 12);
 static_assert(offsetof(Vertex, narrow_color) == 14);
 static_assert(offsetof(Vertex, wrong_color) == 16);
 
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, typename T>
+struct alignas(void*) StreamObject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
+    T value{};
+};
+
+// Two diagonal LINE_LIST segments per D3D12_LINE_RASTERIZATION_MODE, drawn through a RASTERIZER2 pipeline state
+// stream into a 64x64 RGBA8 target cleared blue and read back. Only what real hardware and the spec guarantee is
+// checked, not exact pixels (WARP rasterizes the anti-aliased modes differently): every mode creates a pipeline and
+// draws; ALIASED leaves each pixel fully covered or untouched; WIDE and NARROW both cover pixels; nothing lands far
+// from the segments. With line_features false the layer is told the device has no VK_EXT_line_rasterization
+// feature, so the same draws must still work through the ordinary raster state. WIDE and NARROW are both a
+// rectangular line of width 1 in the layer, so their coverage is not compared with each other.
+int run_line_modes(const vktest::Device& d, const std::string& shader_dir, const std::vector<std::uint8_t>& vs_container,
+                   const std::vector<std::uint8_t>& ps_container, bool line_features) {
+    constexpr UINT size = 64;
+    rt::d3d12::VulkanDeviceInfo info{};
+    info.get_instance_proc = d.instance_proc;
+    info.instance = d.instance;
+    info.physical = d.physical;
+    info.device = d.device;
+    info.queue = d.queue;
+    info.queue_family = d.family;
+    info.buffer_device_address = true;
+    info.subgroup = d.subgroup;
+    info.shader_dir = shader_dir;
+    info.vertex_attribute_divisor = d.vertex_attribute_divisor;
+    info.line_bresenham = line_features && d.line_bresenham;
+    info.line_smooth = line_features && d.line_smooth;
+    info.line_rectangular = line_features && d.line_rectangular;
+    ID3D12Device* inner = nullptr;
+    EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
+    Ref<ID3D12Device> device;
+    EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
+                                                       reinterpret_cast<void**>(&device.p))));
+    rt::d3d12::set_device_outer(inner, device.p);
+    Ref<ID3D12Device2> device2;
+    EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device2.p))));
+
+    D3D12_ROOT_PARAMETER params[2] = {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants = {0, 0, 2};
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[1].Descriptor = {1, 0};
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+    root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
+    root_desc.Desc_1_0 = {2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+    const auto root_blob = serialize_root_signature(root_desc);
+    EXPECT(!root_blob.empty());
+    Ref<ID3D12RootSignature> root;
+    EXPECT(SUCCEEDED(device->CreateRootSignature(0, root_blob.data(), root_blob.size(), IID_PPV_ARGS(&root.p))));
+
+    const D3D12_INPUT_ELEMENT_DESC elements[2] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, D3D12_APPEND_ALIGNED_ELEMENT,
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+    struct Stream {
+        StreamObject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root;
+        StreamObject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_SHADER_BYTECODE> vs;
+        StreamObject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+        StreamObject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_BLEND_DESC> blend;
+        StreamObject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> sample_mask;
+        StreamObject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2, D3D12_RASTERIZER_DESC2> raster;
+        StreamObject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, D3D12_INPUT_LAYOUT_DESC> layout;
+        StreamObject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
+        StreamObject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> targets;
+        StreamObject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> samples;
+    } stream{};
+    stream.root.value = root.p;
+    stream.vs.value = {vs_container.data(), vs_container.size()};
+    stream.ps.value = {ps_container.data(), ps_container.size()};
+    stream.blend.value.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    stream.sample_mask.value = 0xffffffffu;
+    stream.raster.value.FillMode = D3D12_FILL_MODE_SOLID;
+    stream.raster.value.CullMode = D3D12_CULL_MODE_NONE;
+    stream.raster.value.DepthClipEnable = TRUE;
+    stream.layout.value = {elements, 2};
+    stream.topology.value = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+    stream.targets.value.NumRenderTargets = 1;
+    stream.targets.value.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    stream.samples.value.Count = 1;
+
+    // Two segments along the pixel diagonal row == col: (3.2, 3.2) to (28.8, 28.8) and (35.2, 35.2) to (60.8, 60.8).
+    const Vertex vertices[4] = {{-0.9f, 0.9f, 255, 0, 0, 255}, {-0.1f, 0.1f, 255, 0, 0, 255},
+                                {0.1f, -0.1f, 255, 0, 0, 255}, {0.9f, -0.9f, 255, 0, 0, 255}};
+    const float tint[3] = {1, 0, 1};  // red stays red, alpha 1
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT}, upload_heap{D3D12_HEAP_TYPE_UPLOAD},
+        readback_heap{D3D12_HEAP_TYPE_READBACK};
+    Ref<ID3D12Resource> upload, readback, target;
+    const auto upload_desc = buffer_desc(4096);
+    EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
+                                                     D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                     IID_PPV_ARGS(&upload.p))));
+    const auto readback_desc = buffer_desc(size * 256);
+    EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                     IID_PPV_ARGS(&readback.p))));
+    D3D12_RESOURCE_DESC rt_desc{};
+    rt_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rt_desc.Width = rt_desc.Height = size;
+    rt_desc.DepthOrArraySize = 1;
+    rt_desc.MipLevels = 1;
+    rt_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rt_desc.SampleDesc.Count = 1;
+    rt_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &rt_desc,
+                                                     D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&target.p))));
+    std::uint8_t* up = nullptr;
+    EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&up))));
+    std::memcpy(up, vertices, sizeof(vertices));
+    std::memcpy(up + 256, tint, sizeof(tint));
+    upload->Unmap(0, nullptr);
+    const D3D12_GPU_VIRTUAL_ADDRESS upload_va = upload->GetGPUVirtualAddress();
+
+    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    Ref<ID3D12DescriptorHeap> rtv_heap;
+    EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&rtv_heap.p))));
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv{SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(rtv_heap.p, 9))(rtv_heap.p))};
+    device->CreateRenderTargetView(target.p, nullptr, rtv);
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12Fence> fence;
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+    EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                               IID_PPV_ARGS(&list.p))));
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+    EXPECT(SUCCEEDED(list->Close()));
+
+    const D3D12_VIEWPORT viewport{0, 0, float(size), float(size), 0, 1};
+    const D3D12_RECT scissor{0, 0, LONG(size), LONG(size)};
+    const FLOAT blue[4] = {0, 0, 1, 1};
+    const float origin[2] = {0, 0};
+    const char* const names[4] = {"aliased", "alpha_antialiased", "quadrilateral_wide", "quadrilateral_narrow"};
+    const D3D12_LINE_RASTERIZATION_MODE modes[4] = {
+        D3D12_LINE_RASTERIZATION_MODE_ALIASED, D3D12_LINE_RASTERIZATION_MODE_ALPHA_ANTIALIASED,
+        D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_WIDE, D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW};
+    void* mapped = nullptr;
+    EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+    UINT64 fence_value = 0;
+    std::string summary;
+    unsigned counts[4] = {};
+    bool first = true;
+    for (int m = 0; m != 4; ++m) {
+        stream.raster.value.LineRasterizationMode = modes[m];
+        const D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{sizeof(stream), &stream};
+        Ref<ID3D12PipelineState> pso;
+        EXPECT(device2->CreatePipelineState(&stream_desc, IID_PPV_ARGS(&pso.p)) == S_OK);
+
+        EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
+        D3D12_RESOURCE_BARRIER to_target = transition(target.p, first ? D3D12_RESOURCE_STATE_COMMON
+                                                                      : D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                      D3D12_RESOURCE_STATE_RENDER_TARGET);
+        list->ResourceBarrier(1, &to_target);
+        first = false;
+        list->ClearRenderTargetView(rtv, blue, 0, nullptr);
+        list->SetGraphicsRootSignature(root.p);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINELIST);
+        const D3D12_VERTEX_BUFFER_VIEW vbv{upload_va, sizeof(vertices), sizeof(Vertex)};
+        list->IASetVertexBuffers(0, 1, &vbv);
+        list->RSSetViewports(1, &viewport);
+        list->RSSetScissorRects(1, &scissor);
+        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+        list->SetGraphicsRootConstantBufferView(1, upload_va + 256);
+        list->DrawInstanced(4, 1, 0, 0);
+        D3D12_RESOURCE_BARRIER to_copy = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->ResourceBarrier(1, &to_copy);
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = readback.p;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = {0, {DXGI_FORMAT_R8G8B8A8_UNORM, size, size, 1, 256}};
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = target.p;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        EXPECT(list->Close() == S_OK);
+        ID3D12CommandList* lists[] = {list.p};
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+        ++fence_value;
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, fence_value)) &&
+               SUCCEEDED(fence->SetEventOnCompletion(fence_value, nullptr)));
+
+        unsigned covered = 0, partial = 0, far_touched = 0;
+        for (UINT row = 0; row < size; ++row) {
+            for (UINT col = 0; col < size; ++col) {
+                const std::uint8_t* px = static_cast<const std::uint8_t*>(mapped) + row * 256 + col * 4;
+                const bool clear = px[0] == 0 && px[1] == 0 && px[2] == 255 && px[3] == 255;
+                const bool full = px[0] == 255 && px[1] == 0 && px[2] == 0 && px[3] == 255;
+                if (clear) continue;
+                ++covered;
+                if (!full) ++partial;
+                const int off = int(col) - int(row);
+                // Far from both segments, or in the gap between them (rows 30 to 33 on the diagonal).
+                if (off > 3 || off < -3 || (col >= 30 && col <= 33 && off == 0)) ++far_touched;
+            }
+        }
+        char line[160];
+        counts[m] = covered;
+        std::snprintf(line, sizeof(line), " %s=%u(partial %u)", names[m], covered, partial);
+        summary += line;
+        if (covered < 40 || covered > 400 || far_touched != 0 || (modes[m] == D3D12_LINE_RASTERIZATION_MODE_ALIASED && partial != 0)) {
+            std::fprintf(stderr, "line mode %s: covered %u partial %u far %u (line features %d)\n", names[m], covered,
+                         partial, far_touched, int(line_features));
+            return 1;
+        }
+    }
+    readback->Unmap(0, nullptr);
+    // Smooth lines cover every pixel the one-pixel-wide rectangle touches, more than Bresenham's one per step along
+    // the major axis. Seen only where the line state really reaches the driver.
+    if (info.line_smooth && counts[1] <= counts[0]) {
+        std::fprintf(stderr, "smooth lines covered %u pixels, aliased %u\n", counts[1], counts[0]);
+        return 1;
+    }
+    std::printf("d3d12_draw_test: line modes, line features %s (device bresenham %d smooth %d rectangular %d):%s\n",
+                line_features ? "on" : "off", int(info.line_bresenham), int(info.line_smooth),
+                int(info.line_rectangular), summary.c_str());
+    for (auto* r : {&upload, &readback, &target}) r->reset();
+    rtv_heap.reset();
+    list.reset();
+    allocator.reset();
+    queue.reset();
+    fence.reset();
+    root.reset();
+    device2.reset();
+    EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
+    return 0;
+}
+
 }  // namespace
 
 int main() {
     vktest::Device d;
+    d.request_line_rasterization = true;  // for the line-mode draws at the end
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) {
         std::fprintf(stderr, "SKIP: no usable Vulkan 1.3 device\n");
@@ -1170,6 +1404,9 @@ int main() {
                     "pixels from red to magenta)\n",
                     step1_flipped, (size / 2) * (size / 2));
     }
+    // Line modes: once with the device's VK_EXT_line_rasterization features, once told it has none (the fallback).
+    for (const bool line_features : {true, false})
+        if (run_line_modes(d, library.string(), vs_container, ps_container, line_features)) return 1;
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
