@@ -5904,6 +5904,9 @@ class Gen:
             sgl = self.tmp()
             self.emit(f"{sgl} = OpLoad %uint %sg_lane")
             self.emit(f"{half} = OpBitwiseAnd %uint {sgl} {self.cu(32)}")
+            self_lane = sgl
+        else:
+            self_lane = lane
         bal = self.tmp()
         self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
         acc = self.cu(0)
@@ -5912,12 +5915,13 @@ class Gen:
             if self.wave64 or self.wave32_fragment:
                 src = self.tmp()
                 self.emit(f"{src} = OpBitwiseOr %uint {half} {self.cu(j)}")
-            ex, shv, v, shd, hit, nxt = (self.tmp() for _ in range(6))
-            # a shuffle from a lane that isn't running (the missing lanes of a partial wave) is undefined
+            ex, safe_src, shv, v, shd, hit, nxt = (self.tmp() for _ in range(7))
+            # Redirect absent source lanes before the shuffle: even a masked undefined result is undefined.
             self.emit(f"{ex} = OpGroupNonUniformBallotBitExtract %bool %c3 {bal} {src}")
-            self.emit(f"{shv} = OpGroupNonUniformShuffle %uint %c3 {tp} {src}")
+            self.emit(f"{safe_src} = OpSelect %uint {ex} {src} {self_lane}")
+            self.emit(f"{shv} = OpGroupNonUniformShuffle %uint %c3 {tp} {safe_src}")
             self.emit(f"{v} = OpSelect %uint {ex} {shv} {self.cu(0)}")
-            self.emit(f"{shd} = OpGroupNonUniformShuffle %uint %c3 {dat} {src}")
+            self.emit(f"{shd} = OpGroupNonUniformShuffle %uint %c3 {dat} {safe_src}")
             self.emit(f"{hit} = OpIEqual %bool {v} {mine}")
             self.emit(f"{nxt} = OpSelect %uint {hit} {shd} {acc}")
             acc = nxt
