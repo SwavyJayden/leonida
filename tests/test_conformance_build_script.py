@@ -2,6 +2,7 @@
 version. Before, it took CMake from PATH or C:\\Program Files\\CMake only, and always asked for Visual Studio 2022.
 
 Nothing is built: a copy of the script runs with stand-ins for cmake that record their arguments. Windows only."""
+import base64
 import os
 from pathlib import Path
 import re
@@ -21,11 +22,9 @@ class BuildScriptTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.base = Path(tmp.name).resolve()
-        native = self.base / "a b" / "native"
-        (native / "scripts").mkdir(parents=True)
-        self.native = native
-        self.script = Path(shutil.copy(SCRIPT, native / "scripts"))
-        self.log = self.base / "calls.txt"
+        scripts = self.base / "a b" / "native" / "scripts"
+        scripts.mkdir(parents=True)
+        self.script = Path(shutil.copy(SCRIPT, scripts))
         # No vswhere.exe and no CMake here, so a test sees only the stand-ins it adds.
         self.programs = self.base / "programs"
         self.programs.mkdir()
@@ -43,7 +42,8 @@ class BuildScriptTest(unittest.TestCase):
     def powershell(self, arguments, path, **extra):
         exe = shutil.which("powershell.exe")
         result = subprocess.run([exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", *arguments],
-                                env=self.environment(path, **extra), capture_output=True, text=True, timeout=60)
+                                env=self.environment(path, **extra), capture_output=True, text=True,
+                                errors="replace", timeout=60)
         return result.returncode, result.stdout + result.stderr
 
     def run_script(self, path, **extra):
@@ -53,23 +53,27 @@ class BuildScriptTest(unittest.TestCase):
         """A cmake.cmd that answers --help, and records every other call and the CMAKE_GENERATOR it sees."""
         path = self.base / folder / "cmake.cmd"
         path.parent.mkdir()
+        # The log goes next to the stand-in (%~dp0), so the batch file holds no path and stays ASCII.
         path.write_text("\r\n".join((
             "@echo off",
             f'if "%~1"=="--help" (echo {generators}& exit /b 0)',
-            f'>>"{self.log}" echo [%CMAKE_GENERATOR%] %*',
+            '>>"%~dp0calls.txt" echo [%CMAKE_GENERATOR%] %*',
             "exit /b 0", "")), encoding="ascii", newline="")
         return path
 
-    def calls(self):
-        return self.log.read_text(encoding="ascii").splitlines() if self.log.exists() else []
+    def calls(self, cmake):
+        """The recorded calls; cmd writes them in the console code page, so only their ASCII parts are compared."""
+        return cmake.with_name("calls.txt").read_text(encoding="ascii", errors="replace").splitlines()
 
     def find(self, visual_studio, path):
         text = SCRIPT.read_text(encoding="ascii")
         function = re.search(r"^function Find-CMake.*?^\}", text, re.M | re.S).group(0)
-        code = function + "\nWrite-Output ('FOUND=' + (Find-CMake $env:TEST_VS))"
+        # Base64, because the console code page may not have every character of the path.
+        code = function + ("\n$found = [Text.Encoding]::UTF8.GetBytes((Find-CMake $env:TEST_VS))"
+                           "\nWrite-Output ('FOUND=' + [Convert]::ToBase64String($found))")
         status, output = self.powershell(["-Command", code], path, TEST_VS=str(visual_studio))
         self.assertEqual(status, 0, output)
-        return re.search(r"FOUND=(.*)", output).group(1).strip()
+        return base64.b64decode(re.search(r"FOUND=(\S*)", output).group(1)).decode("utf-8")
 
     def test_visual_studio_cmake_comes_first(self):
         on_path = self.cmake("path")
@@ -100,14 +104,13 @@ class BuildScriptTest(unittest.TestCase):
                          ["CMake was not found: install Visual Studio's C++ CMake tools or CMake"])
 
     def test_configure_names_no_visual_studio_version(self):
-        status, output = self.run_script([self.cmake("path").parent], CMAKE_GENERATOR="Ninja")
+        cmake = self.cmake("path")
+        status, output = self.run_script([cmake.parent], CMAKE_GENERATOR="Ninja")
         self.assertEqual(status, 0, output)
         self.assertIn("BUILD EXIT 0", output)
-        configure, build = self.calls()
-        self.assertRegex(configure, r"^\[\] -S .* -B .* -A x64$")
-        self.assertIn(str(self.native), configure)
-        self.assertNotIn("-G", configure.split())
-        self.assertRegex(build, r"^\[Ninja\] --build .* --config Release --parallel$")
+        configure, build = self.calls(cmake)
+        self.assertRegex(configure, r'^\[\] -S "[^"]*\\a b\\native" -B "[^"]*\\a b\\native\\build" -A x64$')
+        self.assertRegex(build, r'^\[Ninja\] --build "[^"]*\\a b\\native\\build" --config Release --parallel$')
 
 
 if __name__ == "__main__":
