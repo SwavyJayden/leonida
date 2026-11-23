@@ -4164,10 +4164,10 @@ private:
         switch (r.line_mode) {
         case D3D12_LINE_RASTERIZATION_MODE_ALIASED:
             line.lineRasterizationMode = VK_LINE_RASTERIZATION_MODE_BRESENHAM_EXT;
-            use_line = device_.info.line_bresenham; break;
+            use_line = device_.info.line_bresenham && !multisample.alphaToCoverageEnable; break;
         case D3D12_LINE_RASTERIZATION_MODE_ALPHA_ANTIALIASED:
             line.lineRasterizationMode = VK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH_EXT;
-            use_line = device_.info.line_smooth; break;
+            use_line = device_.info.line_smooth && !multisample.alphaToCoverageEnable; break;
         case D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_WIDE:
         case D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW:
             line.lineRasterizationMode = VK_LINE_RASTERIZATION_MODE_RECTANGULAR_EXT;
