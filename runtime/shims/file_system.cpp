@@ -1398,7 +1398,16 @@ bool volume_host_root(std::wstring& result) {
     const Roots r = roots();
     auto dir = r.overlay;
     const DWORD attributes = dir.empty() ? INVALID_FILE_ATTRIBUTES : ::GetFileAttributesW(dir.c_str());
-    if (attributes == INVALID_FILE_ATTRIBUTES) dir = r.game;
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        if (r.game.empty() || ::GetFileAttributesW(r.game.c_str()) == INVALID_FILE_ATTRIBUTES)
+            return fail_bool(ERROR_PATH_NOT_FOUND);
+        if (dir.empty()) dir = r.game;
+        while (!dir.empty() && ::GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            const auto parent = dir.parent_path();
+            if (parent == dir) break;
+            dir = parent;
+        }
+    }
     if (dir.empty() || ::GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES)
         return fail_bool(ERROR_PATH_NOT_FOUND);
     wchar_t root[MAX_PATH]{};

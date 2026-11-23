@@ -228,7 +228,7 @@ void run_checks(const std::filesystem::path& root) {
         rt::fs::configure(package, missing_overlay);
         check(info && info(L"GAME:\\", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
               !std::filesystem::exists(missing_overlay.parent_path()),
-              "volume query falls back to the package without creating the overlay");
+              "volume query succeeds without creating the overlay");
         const auto info_a_missing = resolve<decltype(&::GetVolumeInformationA)>("kernel32.dll", "GetVolumeInformationA");
         const auto path_w_missing = resolve<decltype(&::GetVolumePathNameW)>("kernel32.dll", "GetVolumePathNameW");
         const auto path_a_missing = resolve<decltype(&::GetVolumePathNameA)>("kernel32.dll", "GetVolumePathNameA");
@@ -247,6 +247,20 @@ void run_checks(const std::filesystem::path& root) {
               path_w_missing && path_w_missing(L"T:\\file", root_w, MAX_PATH) && std::wstring(root_w) == L"T:\\" &&
               path_a_missing && path_a_missing("T:\\file", root_a, MAX_PATH) && std::string(root_a) == "T:\\" &&
               !std::filesystem::exists(missing_overlay.parent_path()), "valid T: volume queries succeed without creating overlay");
+        DWORD serial_before{}, flags_before{}, serial_after{}, flags_after{};
+        DWORD serial_a_before{}, flags_a_before{}, serial_a_after{}, flags_a_after{};
+        wchar_t fs_before[MAX_PATH]{}, fs_after[MAX_PATH]{};
+        char fs_a_before[MAX_PATH]{}, fs_a_after[MAX_PATH]{};
+        const bool before = info && info(L"T:\\", nullptr, 0, &serial_before, nullptr, &flags_before, fs_before, MAX_PATH) &&
+            info_a_missing && info_a_missing("T:\\", nullptr, 0, &serial_a_before, nullptr, &flags_a_before, fs_a_before, MAX_PATH);
+        std::filesystem::create_directories(missing_overlay);
+        const bool after = info && info(L"T:\\", nullptr, 0, &serial_after, nullptr, &flags_after, fs_after, MAX_PATH) &&
+            info_a_missing && info_a_missing("T:\\", nullptr, 0, &serial_a_after, nullptr, &flags_a_after, fs_a_after, MAX_PATH);
+        check(before && after && serial_before == serial_after && flags_before == flags_after &&
+              std::wstring(fs_before) == fs_after && serial_a_before == serial_a_after &&
+              flags_a_before == flags_a_after && std::string(fs_a_before) == fs_a_after,
+              "T: volume identity stays stable when the overlay is created (W and A)");
+        std::filesystem::remove_all(missing_overlay.parent_path());
         const auto missing_game = root / "missing-game";
         rt::fs::configure(missing_game, missing_overlay);
         check(info && !info(L"GAME:\\", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
