@@ -1547,10 +1547,22 @@ DWORD WINAPI get_temp_path_a(DWORD size, LPSTR buffer) {
     if (target.error) return fail_bool(target.error);
     std::wstring path = target.path.wstring();
     if (path.empty() || !is_separator(path.back())) path += static_cast<wchar_t>(92);
-    const int required = ::WideCharToMultiByte(CP_ACP, 0, path.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    const bool utf8 = ::GetACP() == CP_UTF8;
+    const DWORD flags = utf8 ? 0 : WC_NO_BEST_FIT_CHARS;
+    BOOL used_default = FALSE;
+    BOOL* const used_default_ptr = utf8 ? nullptr : &used_default;
+    const int required = ::WideCharToMultiByte(CP_ACP, flags, path.c_str(), -1, nullptr, 0, nullptr, used_default_ptr);
     if (!required) return 0;
+    if (used_default) {
+        ::SetLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return 0;
+    }
     if (size < static_cast<DWORD>(required)) return static_cast<DWORD>(required);
-    narrow_ansi(path, buffer, size);
+    if (!::WideCharToMultiByte(CP_ACP, flags, path.c_str(), -1, buffer, required, nullptr, used_default_ptr)) return 0;
+    if (used_default) {
+        ::SetLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return 0;
+    }
     return static_cast<DWORD>(required - 1);
 }
 

@@ -393,6 +393,12 @@ void run_checks(const std::filesystem::path& root) {
             const auto unicode_scratch = unicode_overlay / L".gta6rt-temp";
             std::filesystem::create_directories(unicode_scratch);
             rt::fs::configure(package, unicode_overlay);
+            char unicode_path[MAX_PATH]{};
+            ::SetLastError(0);
+            const DWORD path_result = pa(MAX_PATH, unicode_path);
+            const DWORD path_error = ::GetLastError();
+            check(!path_result && path_error == ERROR_NO_UNICODE_TRANSLATION,
+                  "GetTempPathA rejects an unrepresentable overlay path");
             char unicode_name[MAX_PATH]{};
             ::SetLastError(0);
             const UINT unicode_result = na("T:\\", "uni", 0, unicode_name);
