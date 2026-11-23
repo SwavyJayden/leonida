@@ -1065,6 +1065,7 @@ struct PreparedDraw {
     VkBuffer index_buffer = VK_NULL_HANDLE;
     VkDeviceSize index_offset = 0;
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
+    std::uint32_t index_first = 0;  // firstIndex to draw with: the draw's, or 0 on the zero page (see prepare)
     VkExtent2D area{};
     std::uint32_t layers = 1;  // the fewest layers any bound attachment view has
 
@@ -1081,6 +1082,7 @@ struct PreparedDraw {
         index_buffer = VK_NULL_HANDLE;
         index_offset = 0;
         index_type = VK_INDEX_TYPE_UINT16;
+        index_first = 0;
         area = {};
         layers = 1;
     }
@@ -2197,14 +2199,30 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         if (draw.index.format == 57) p.index_type = VK_INDEX_TYPE_UINT16;
         else if (draw.index.format == 42) p.index_type = VK_INDEX_TYPE_UINT32;
         else if (draw.index.va) return ReplayResult::unsupported;
-        if (!draw.index.va) {  // no index buffer: every index reads 0
-            if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
-            p.index_buffer = vk.zero_buffer;
-            p.index_offset = vk.zero_offset;
-        } else {
+        p.index_first = draw.first;
+        // Index fetches outside the view read 0 in D3D12, but vkCmdBindIndexBuffer binds to the end of the buffer
+        // (the layer's device does not enable VK_KHR_maintenance5 for a bind size). So the view's size decides
+        // here: a draw wholly inside binds the buffer, one wholly outside binds the zero page, and one that
+        // straddles the end is refused rather than reading bytes the view does not cover.
+        const std::uint64_t index_bytes = p.index_type == VK_INDEX_TYPE_UINT32 ? 4 : 2;
+        std::uint64_t view_indices = 0;
+        bool resolved = false;
+        if (draw.index.va) {
             std::uint64_t size = draw.index.size;
             if (!vk.buffer_at(draw.index.va, size, p.index_buffer, p.index_offset))
                 return ReplayResult::unresolved_resource;
+            view_indices = size / index_bytes;  // size is the view's, cut at the buffer's end
+            resolved = true;
+        }
+        const std::uint64_t last = std::uint64_t(draw.first) + draw.count;  // one past the last index fetched
+        if (resolved && draw.count > 0 && last > view_indices && draw.first < view_indices)
+            return ReplayResult::unsupported;
+        if (!resolved || (draw.count > 0 && draw.first >= view_indices)) {  // every index reads 0
+            if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
+            if (resolved && std::uint64_t(draw.count) * index_bytes > vk.zero_size) return ReplayResult::unsupported;
+            p.index_buffer = vk.zero_buffer;
+            p.index_offset = vk.zero_offset;
+            p.index_first = 0;
         }
     }
     return ReplayResult::success;
@@ -4209,7 +4227,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
             } else if (draw->indexed) {
                 vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
-                vk.draw_indexed(command_buffer, draw->count, draw->instances, draw->first, draw->base_vertex,
+                vk.draw_indexed(command_buffer, draw->count, draw->instances, d.index_first, draw->base_vertex,
                                 draw->first_instance);
             } else {
                 vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
