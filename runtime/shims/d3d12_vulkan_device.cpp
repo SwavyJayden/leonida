@@ -1313,6 +1313,10 @@ struct DeviceState {
                 reduction.reductionMode = g::vulkan_reduction_mode(sampler.filter_mode);
                 reduction.pNext = sampler_info.pNext;
                 sampler_info.pNext = &reduction;
+                if (!info.sampler_filter_minmax_component_mapping)
+                    log_once("minimum/maximum filter sampler without filterMinmaxImageComponentMapping; only R is "
+                             "defined, mode",
+                             int(sampler.filter_mode));
             } else {
                 log_once("minimum/maximum filter sampler without samplerFilterMinmax; blended instead, mode",
                          int(sampler.filter_mode));
@@ -9569,6 +9573,13 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     info.sampler_anisotropy = chosen_features.samplerAnisotropy;
     info.sampler_mirror_clamp_to_edge = chosen12.samplerMirrorClampToEdge;
     info.sampler_filter_minmax = chosen12.samplerFilterMinmax;
+    if (info.sampler_filter_minmax) {
+        VkPhysicalDeviceSamplerFilterMinmaxProperties minmax{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_FILTER_MINMAX_PROPERTIES};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &minmax};
+        vkGetPhysicalDeviceProperties2(info.physical, &properties);
+        info.sampler_filter_minmax_component_mapping = minmax.filterMinmaxImageComponentMapping == VK_TRUE;
+    }
     enable12.runtimeDescriptorArray = info.bindless;
     enable12.descriptorBindingSampledImageUpdateAfterBind = info.bindless;
     enable12.descriptorBindingStorageImageUpdateAfterBind = info.bindless;

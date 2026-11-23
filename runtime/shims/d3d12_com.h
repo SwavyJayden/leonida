@@ -107,6 +107,10 @@ struct VulkanDeviceInfo {
     bool sampler_anisotropy = false;
     bool sampler_mirror_clamp_to_edge = false;
     bool sampler_filter_minmax = false;
+    // VkPhysicalDeviceSamplerFilterMinmaxProperties::filterMinmaxImageComponentMapping. Without it a minimum/maximum
+    // reduction defines only the R component of a sample, and only through an identity-swizzled view (Vulkan
+    // specification, Texel Filtering); G, B and A are undefined (D3D-994: Polaris on the AMD Windows driver).
+    bool sampler_filter_minmax_component_mapping = false;
     // VK_KHR_calibrated_timestamps or VK_EXT_calibrated_timestamps is enabled on `device` (QueueClock).
     bool calibrated_timestamps = false;
     // VK_EXT_conditional_rendering (with its conditionalRendering feature) is enabled: SetPredication works, and

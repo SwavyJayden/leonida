@@ -102,6 +102,7 @@ public:
     bool partially_bound = false;  // and its slots can stay empty
     bool image_view_min_lod = false;
     bool sampler_filter_minmax = false;
+    bool sampler_filter_minmax_component_mapping = false;  // filterMinmaxImageComponentMapping (D3D-994)
     bool vertex_attribute_divisor = false;
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
@@ -398,6 +399,13 @@ public:
         enable12.descriptorBindingPartiallyBound = partially_bound;
         sampler_filter_minmax = features12.samplerFilterMinmax == VK_TRUE;
         enable12.samplerFilterMinmax = sampler_filter_minmax;
+        if (sampler_filter_minmax) {
+            VkPhysicalDeviceSamplerFilterMinmaxProperties minmax{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_FILTER_MINMAX_PROPERTIES};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &minmax};
+            instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(physical, &properties);
+            sampler_filter_minmax_component_mapping = minmax.filterMinmaxImageComponentMapping == VK_TRUE;
+        }
         enable12.bufferDeviceAddress = VK_TRUE;
 
         const std::uint32_t graphics_count = std::max(1u, std::min(queue_count_wanted, family_queue_count));

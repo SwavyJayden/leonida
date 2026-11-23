@@ -338,6 +338,7 @@ int main() {
         info.bindless_partially_bound = d.partially_bound;
         info.image_view_min_lod = d.image_view_min_lod;
         info.sampler_filter_minmax = d.sampler_filter_minmax;
+        info.sampler_filter_minmax_component_mapping = d.sampler_filter_minmax_component_mapping;
         info.custom_border_color = d.custom_border_color;
         info.custom_border_color_without_format = d.custom_border_color_without_format;
         ID3D12Device* inner = nullptr;
@@ -2558,24 +2559,28 @@ int main() {
                 (bc1_props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT) != 0;
             constexpr std::array<std::uint8_t, 4> want_min{16, 16, 16, 255};
             constexpr std::array<std::uint8_t, 4> want_max{240, 240, 240, 255};
+            // Without filterMinmaxImageComponentMapping only R of a reduced sample is defined (D3D-994): compare R
+            // there, all four channels where the device maps every component.
+            const std::size_t mm_compared = d.sampler_filter_minmax_component_mapping ? 4 : 1;
             UINT min_matches = 0, max_matches = 0, blend_diff_min = 0, blend_diff_max = 0;
             for (UINT i = 0; i < texels; ++i) {
                 const auto* got_min = &mm_pixels[0 * bytes + i * 4];
                 const auto* got_max = &mm_pixels[1 * bytes + i * 4];
                 const auto* got_blend = &mm_pixels[2 * bytes + i * 4];
                 if (rgba8_minmax) {
-                    min_matches += std::memcmp(got_min, want_min.data(), 4) == 0;
-                    max_matches += std::memcmp(got_max, want_max.data(), 4) == 0;
-                    blend_diff_min += std::memcmp(got_blend, want_min.data(), 4) != 0;
-                    blend_diff_max += std::memcmp(got_blend, want_max.data(), 4) != 0;
+                    min_matches += std::memcmp(got_min, want_min.data(), mm_compared) == 0;
+                    max_matches += std::memcmp(got_max, want_max.data(), mm_compared) == 0;
+                    blend_diff_min += std::memcmp(got_blend, want_min.data(), mm_compared) != 0;
+                    blend_diff_max += std::memcmp(got_blend, want_max.data(), mm_compared) != 0;
                 } else {
                     min_matches += std::memcmp(got_min, got_blend, 4) == 0;
                     max_matches += std::memcmp(got_max, got_blend, 4) == 0;
                 }
             }
-            std::printf("sampler reduction min/max (RGBA8=%s, BC1=%s): min %u/%u, max %u/%u (blend differed: %u/%u vs "
-                        "min, %u/%u vs max)\n",
-                        rgba8_minmax ? "yes" : "no", bc1_minmax ? "yes" : "no", min_matches, texels, max_matches,
+            std::printf("sampler reduction min/max (RGBA8=%s, BC1=%s, compared %s): min %u/%u, max %u/%u (blend "
+                        "differed: %u/%u vs min, %u/%u vs max)\n",
+                        rgba8_minmax ? "yes" : "no", bc1_minmax ? "yes" : "no", mm_compared == 4 ? "RGBA" : "R only",
+                        min_matches, texels, max_matches,
                         texels, blend_diff_min, texels, blend_diff_max, texels);
             EXPECT(min_matches == texels && max_matches == texels);
             if (rgba8_minmax) EXPECT(blend_diff_min == texels && blend_diff_max == texels);
