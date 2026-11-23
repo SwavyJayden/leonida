@@ -106,7 +106,6 @@ class TriangleSlots(unittest.TestCase):
                 self.assertAlmostEqual(-r[2], w[1], places=6)
                 self.assertAlmostEqual(-r[3], w[2], places=6)
 
-
     def test_a_nan_with_a_payload_returns_the_canonical_nan(self):
         # Every NaN word is 0xFFC00000, whatever the input's payload: 0x7FC00001 would survive a canon() that
         # passed its operand through (the KosmicKrisp workaround builds that select from bitwise ops, #6623).
