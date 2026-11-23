@@ -28,6 +28,7 @@
 #include <string>
 #include <system_error>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <XAsync.h>
@@ -986,6 +987,161 @@ bool __stdcall XPackageIsPackagedProcess() {
     return true;
 }
 
+// ---- XPackage: enumeration and installation monitors, offline ----
+//
+// A title decides at boot what is installed: it lists its packages (XPackageEnumeratePackages), opens an installation
+// monitor on its own package to see whether it is launchable and complete, and asks to be told when a package is
+// installed. Without these, every call failed and the title took the not-installed path. Offline everything the
+// title can name is installed in full and nothing ever installs, so the monitors read installed and complete and the
+// change callbacks never run. The game package is the process's; content packages come from LEONIDA_CONTENT_PACKAGES.
+
+enum class XPackageKind : uint32_t { Game = 0, Content = 1 };
+
+// XPackageDetails as the GDK reference lays it out on x64: 64 bytes.
+struct XPackageDetails {
+    const char* packageIdentifier;
+    uint64_t version;  // XVersion: four u16 (major, minor, build, revision) in one u64
+    XPackageKind kind;
+    const char* displayName;
+    const char* description;
+    const char* publisher;
+    const char* storeId;
+    bool installing;
+};
+static_assert(sizeof(XPackageDetails) == 64, "XPackageDetails layout");
+using XPackageEnumerationCallback = bool(CALLBACK*)(void* context, const XPackageDetails* details);
+
+static std::string current_package_identifier() {
+    char id[XPACKAGE_IDENTIFIER_MAX_LENGTH] = {};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_PACKAGE_ID", id, sizeof(id));
+    return (n > 0 && n < sizeof(id)) ? id : kDefaultPackageIdentifier;
+}
+
+// The identifiers of the content packages LEONIDA_CONTENT_PACKAGES ("id1=path1;id2=path2") installs, in its order.
+static std::vector<std::string> content_package_identifiers() {
+    std::vector<std::string> ids;
+    char mapping[1024] = {};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", mapping, sizeof(mapping));
+    if (n == 0 || n >= sizeof(mapping)) return ids;
+    std::string rest = mapping;
+    size_t pos = 0;
+    while (pos <= rest.size()) {
+        size_t end = rest.find(';', pos);
+        if (end == std::string::npos) end = rest.size();
+        const std::string entry = rest.substr(pos, end - pos);
+        const size_t eq = entry.find('=');
+        if (eq != std::string::npos && eq > 0) ids.push_back(entry.substr(0, eq));
+        pos = end + 1;
+    }
+    return ids;
+}
+
+// HRESULT XPackageEnumeratePackages(XPackageKind kind, XPackageEnumerationScope scope, void* context,
+//                                   XPackageEnumerationCallback* callback)
+// Synchronous: the callback runs on the calling thread for each package and stops the walk by returning false.
+HRESULT __stdcall XPackageEnumeratePackages(uint32_t kind, uint32_t /*scope*/, void* context,
+                                            XPackageEnumerationCallback callback) {
+    if (!callback) return E_INVALIDARG;
+    if (kind != static_cast<uint32_t>(XPackageKind::Game) && kind != static_cast<uint32_t>(XPackageKind::Content))
+        return E_INVALIDARG;
+    const auto k = static_cast<XPackageKind>(kind);
+    const std::vector<std::string> ids =
+        k == XPackageKind::Game ? std::vector<std::string>{current_package_identifier()} : content_package_identifiers();
+    for (const std::string& id : ids) {
+        XPackageDetails details{};
+        details.packageIdentifier = id.c_str();
+        details.kind = k;
+        details.displayName = id.c_str();
+        details.description = "";
+        details.publisher = "";
+        details.storeId = "";
+        if (!callback(context, &details)) break;
+    }
+    return S_OK;
+}
+
+// An installation monitor is only a handle that stays valid until it is closed: its progress never changes.
+struct XPackageInstallationProgress {
+    uint64_t totalBytes, installedBytes, launchBytes;
+    bool launchable, completed;
+};
+static_assert(sizeof(XPackageInstallationProgress) == 32, "XPackageInstallationProgress layout");
+struct XPackageInstallationMonitor {
+    uint32_t unused;
+};
+using XPackageInstallationMonitorHandle = XPackageInstallationMonitor*;
+
+static std::mutex s_monitor_mutex;
+static std::unordered_set<XPackageInstallationMonitorHandle> s_monitors;
+
+static bool package_is_installed(const std::string& id) {
+    if (id == current_package_identifier()) return true;
+    for (const std::string& content : content_package_identifiers())
+        if (content == id) return true;
+    return false;
+}
+
+// HRESULT XPackageCreateInstallationMonitor(const char* packageIdentifier, uint32_t selectorCount,
+//     XPackageChunkSelector* selectors, uint32_t minimumUpdateIntervalMs, XTaskQueueHandle queue,
+//     XPackageInstallationMonitorHandle* monitor)
+// A package that is not installed has no monitor: ERROR_NOT_FOUND, as XPackageMount answers.
+HRESULT __stdcall XPackageCreateInstallationMonitor(const char* packageIdentifier, uint32_t selectorCount,
+                                                    const void* selectors, uint32_t /*minimumUpdateIntervalMs*/,
+                                                    XTaskQueueHandle /*queue*/,
+                                                    XPackageInstallationMonitorHandle* monitor) {
+    if (!packageIdentifier || !monitor) return E_INVALIDARG;
+    if (selectorCount > 0 && !selectors) return E_INVALIDARG;
+    *monitor = nullptr;
+    if (!package_is_installed(packageIdentifier)) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    auto* created = new XPackageInstallationMonitor{};
+    std::lock_guard lock(s_monitor_mutex);
+    s_monitors.insert(created);
+    *monitor = created;
+    return S_OK;
+}
+
+// void XPackageCloseInstallationMonitorHandle(XPackageInstallationMonitorHandle monitor)
+void __stdcall XPackageCloseInstallationMonitorHandle(XPackageInstallationMonitorHandle monitor) {
+    {
+        std::lock_guard lock(s_monitor_mutex);
+        if (s_monitors.erase(monitor) == 0) return;
+    }
+    delete monitor;
+}
+
+// void XPackageGetInstallationProgress(monitor, XPackageInstallationProgress*): installed, launchable, complete.
+void __stdcall XPackageGetInstallationProgress(XPackageInstallationMonitorHandle, XPackageInstallationProgress* progress) {
+    if (progress) *progress = {0, 0, 0, true, true};
+}
+
+// bool XPackageUpdateInstallationMonitor(monitor): false, the progress did not change.
+bool __stdcall XPackageUpdateInstallationMonitor(XPackageInstallationMonitorHandle) { return false; }
+
+// HRESULT XPackageRegisterInstallationProgressChanged(monitor, void* context, callback, XTaskQueueRegistrationToken*)
+// and HRESULT XPackageRegisterPackageInstalled(queue, context, callback, token*): the callback never runs, since
+// nothing installs; the token is a fresh nonzero one so the title can unregister it.
+static std::atomic<uint64_t> s_package_tokens{0};
+static HRESULT give_token(void* callback, XTaskQueueRegistrationToken* token) {
+    if (!callback) return E_INVALIDARG;
+    if (!token) return E_POINTER;
+    token->token = s_package_tokens.fetch_add(1) + 1;
+    return S_OK;
+}
+HRESULT __stdcall XPackageRegisterInstallationProgressChanged(XPackageInstallationMonitorHandle monitor, void* /*context*/,
+                                                              void* callback, XTaskQueueRegistrationToken* token) {
+    if (!monitor) return E_INVALIDARG;
+    return give_token(callback, token);
+}
+HRESULT __stdcall XPackageRegisterPackageInstalled(XTaskQueueHandle /*queue*/, void* /*context*/, void* callback,
+                                                   XTaskQueueRegistrationToken* token) {
+    return give_token(callback, token);
+}
+bool __stdcall XPackageUnregisterInstallationProgressChanged(XPackageInstallationMonitorHandle, XTaskQueueRegistrationToken,
+                                                             bool) {
+    return true;
+}
+bool __stdcall XPackageUnregisterPackageInstalled(XTaskQueueRegistrationToken, bool) { return true; }
+
 // ---- XPackageImpl (asked for as IXPackageImpl3), offline ----
 //
 // libHttpClient.GDK.dll asks QueryApiImpl for XPackageImpl with IXPackageImpl3's id through 30 thunks (slots 3-19,
@@ -1111,23 +1267,44 @@ HRESULT STDMETHODCALLTYPE pkg_mount_path(void*, XPackageMountHandle mount, size_
 }
 void STDMETHODCALLTYPE pkg_close_mount(void*, XPackageMountHandle mount) { XPackageCloseMountHandle(mount); }
 
-// XPackageInstallationProgress: totalBytes, installedBytes, launchBytes (u64), launchable, completed (bool).
-struct InstallationProgress {
-    uint64_t total_bytes, installed_bytes, launch_bytes;
-    bool launchable, completed;
-};
-static_assert(sizeof(InstallationProgress) == 32, "XPackageInstallationProgress layout");
-// void XPackageGetInstallationProgress(monitor, XPackageInstallationProgress*): an offline package is installed,
-// launchable and completed, every byte present.
-void STDMETHODCALLTYPE pkg_installation_progress(void*, void*, InstallationProgress* progress) {
-    if (progress) *progress = {0, 0, 0, true, true};
+// The installation monitor, enumeration and registration slots forward to the named exports above, so both ways in
+// answer alike; the bool methods with no offline work are false (nothing changed) or true (nothing pending), as
+// Microsoft documents them (a generic E_NOTIMPL stub would read as true in all).
+HRESULT STDMETHODCALLTYPE pkg_create_monitor(void*, const char* id, uint32_t count, const void* selectors,
+                                             uint32_t interval, XTaskQueueHandle queue,
+                                             XPackageInstallationMonitorHandle* monitor) {
+    return XPackageCreateInstallationMonitor(id, count, selectors, interval, queue, monitor);
 }
-// The bool methods with no offline work, as Microsoft documents them: XPackageUpdateInstallationMonitor is false
-// (nothing changed), the two Unregister* calls are true (nothing pending), XPackageUninstallPackage is false (not
-// uninstalled). A generic E_NOTIMPL stub would read as true in al.
-bool STDMETHODCALLTYPE pkg_update_monitor(void*, void*) { return false; }
-bool STDMETHODCALLTYPE pkg_unregister_progress(void*, void*, XTaskQueueRegistrationToken, bool) { return true; }
-bool STDMETHODCALLTYPE pkg_unregister_installed(void*, XTaskQueueRegistrationToken, bool) { return true; }
+void STDMETHODCALLTYPE pkg_close_monitor(void*, XPackageInstallationMonitorHandle monitor) {
+    XPackageCloseInstallationMonitorHandle(monitor);
+}
+void STDMETHODCALLTYPE pkg_installation_progress(void*, XPackageInstallationMonitorHandle monitor,
+                                                 XPackageInstallationProgress* progress) {
+    XPackageGetInstallationProgress(monitor, progress);
+}
+bool STDMETHODCALLTYPE pkg_update_monitor(void*, XPackageInstallationMonitorHandle monitor) {
+    return XPackageUpdateInstallationMonitor(monitor);
+}
+HRESULT STDMETHODCALLTYPE pkg_register_progress(void*, XPackageInstallationMonitorHandle monitor, void* context,
+                                                void* callback, XTaskQueueRegistrationToken* token) {
+    return XPackageRegisterInstallationProgressChanged(monitor, context, callback, token);
+}
+bool STDMETHODCALLTYPE pkg_unregister_progress(void*, XPackageInstallationMonitorHandle monitor,
+                                               XTaskQueueRegistrationToken token, bool wait) {
+    return XPackageUnregisterInstallationProgressChanged(monitor, token, wait);
+}
+HRESULT STDMETHODCALLTYPE pkg_enumerate(void*, uint32_t kind, uint32_t scope, void* context,
+                                        XPackageEnumerationCallback callback) {
+    return XPackageEnumeratePackages(kind, scope, context, callback);
+}
+HRESULT STDMETHODCALLTYPE pkg_register_installed(void*, XTaskQueueHandle queue, void* context, void* callback,
+                                                 XTaskQueueRegistrationToken* token) {
+    return XPackageRegisterPackageInstalled(queue, context, callback, token);
+}
+bool STDMETHODCALLTYPE pkg_unregister_installed(void*, XTaskQueueRegistrationToken token, bool wait) {
+    return XPackageUnregisterPackageInstalled(token, wait);
+}
+// XPackageUninstallPackage is false: nothing was uninstalled.
 bool STDMETHODCALLTYPE pkg_uninstall_package(void*, const char*) { return false; }
 
 #define PN(n) reinterpret_cast<const void*>(&package_not_implemented<n>)
@@ -1136,10 +1313,11 @@ const void* const kPackageVtable[] = {
     reinterpret_cast<const void*>(&object_release),
     reinterpret_cast<const void*>(&pkg_identifier),   // 3  XPackageGetCurrentProcessPackageIdentifier
     reinterpret_cast<const void*>(&pkg_is_packaged),  // 4  XPackageIsPackagedProcess
-    PN(5), PN(6),                                     // 5-6 installation monitor: create, close
+    reinterpret_cast<const void*>(&pkg_create_monitor),   // 5  XPackageCreateInstallationMonitor
+    reinterpret_cast<const void*>(&pkg_close_monitor),    // 6  XPackageCloseInstallationMonitorHandle (void)
     reinterpret_cast<const void*>(&pkg_installation_progress),  // 7  XPackageGetInstallationProgress (void, writes)
     reinterpret_cast<const void*>(&pkg_update_monitor),         // 8  XPackageUpdateInstallationMonitor (bool)
-    PN(9),                                                      // 9  XPackageRegisterInstallationProgressChanged
+    reinterpret_cast<const void*>(&pkg_register_progress),      // 9  XPackageRegisterInstallationProgressChanged
     reinterpret_cast<const void*>(&pkg_unregister_progress),    // 10 ...UnregisterInstallationProgressChanged (bool)
     reinterpret_cast<const void*>(&pkg_user_locale),  // 11 XPackageGetUserLocale
     PN(12), PN(13), PN(14), PN(15), PN(16), PN(17),   // 12-19 chunks: find / enumerate availability, change order,
@@ -1150,8 +1328,10 @@ const void* const kPackageVtable[] = {
     reinterpret_cast<const void*>(&pkg_mount_path_size),  // 24 XPackageGetMountPathSize
     reinterpret_cast<const void*>(&pkg_mount_path),       // 25 XPackageGetMountPath
     reinterpret_cast<const void*>(&pkg_close_mount),      // 26 XPackageCloseMountHandle
-    PN(27), PN(28), PN(29), PN(30), PN(31),           // 27 _unknown_, 28 EnumeratePackages, 29 RegisterPackageInstalled,
-                                                      // 30 GetWriteStats, 31 _unknown_
+    PN(27),                                           // 27 _unknown_
+    reinterpret_cast<const void*>(&pkg_enumerate),           // 28 XPackageEnumeratePackages
+    reinterpret_cast<const void*>(&pkg_register_installed),  // 29 XPackageRegisterPackageInstalled
+    PN(30), PN(31),                                   // 30 GetWriteStats, 31 _unknown_
     PN(32), PN(33),                                   // 32 UninstallUWPInstance, 33 EnumerateFeatures
     reinterpret_cast<const void*>(&pkg_uninstall_package),     // 34 XPackageUninstallPackage (bool)
     PN(35), PN(36), PN(37), PN(38),                   // IXPackageImpl2: EnumeratePackages, RegisterPackageInstalled,
@@ -1382,6 +1562,15 @@ SHIM_TABLE(xgameruntime,
     XGR(XPackageGetMountPathSize),
     XGR(XPackageGetMountPath),
     XGR(XPackageIsPackagedProcess),
+    XGR(XPackageEnumeratePackages),
+    XGR(XPackageCreateInstallationMonitor),
+    XGR(XPackageCloseInstallationMonitorHandle),
+    XGR(XPackageGetInstallationProgress),
+    XGR(XPackageUpdateInstallationMonitor),
+    XGR(XPackageRegisterInstallationProgressChanged),
+    XGR(XPackageUnregisterInstallationProgressChanged),
+    XGR(XPackageRegisterPackageInstalled),
+    XGR(XPackageUnregisterPackageInstalled),
     // XTaskQueue (third_party/xtaskqueue)
     XGR(XTaskQueueCreate),
     XGR(XTaskQueueCreateComposite),

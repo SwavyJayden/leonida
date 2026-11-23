@@ -6,6 +6,7 @@
 // the process queue, drive a custom XAsyncBegin provider to a result, then uninitialize. No game data; nothing
 // online.
 #include <windows.h>
+#include <vector>
 
 #include <atomic>
 #include <cstdint>
@@ -812,10 +813,108 @@ void check_run_time_load() {
         reinterpret_cast<CloseMount>(slot(pk, 26))(pk, handle);
         check(reinterpret_cast<PathSize>(slot(pk, 24))(pk, handle, &need) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
               "slot 26 (XPackageCloseMountHandle) closes the handle");
+        // Enumeration and installation monitors: what a title asks at boot to learn what is installed. The game
+        // package is the process's own; content packages are the ones LEONIDA_CONTENT_PACKAGES installs.
+        {
+            struct Seen {
+                std::vector<std::string> ids;
+                std::vector<uint32_t> kinds;
+                size_t stop_after = ~size_t(0);
+            };
+            struct Details {
+                const char* id;
+                uint64_t version;
+                uint32_t kind;
+                const char* name;
+                const char* description;
+                const char* publisher;
+                const char* store_id;
+                bool installing;
+            };
+            static_assert(sizeof(Details) == 64, "XPackageDetails is 64 bytes");
+            using Callback = bool(CALLBACK*)(void*, const Details*);
+            using Enumerate = HRESULT(__stdcall*)(uint32_t, uint32_t, void*, Callback);
+            static int dummy_callback = 0;
+            const auto collect = [](void* ctx, const Details* d) -> bool {
+                auto* seen = static_cast<Seen*>(ctx);
+                seen->ids.push_back(d->id);
+                seen->kinds.push_back(d->kind);
+                return seen->ids.size() < seen->stop_after;
+            };
+            const auto enumerate = reinterpret_cast<Enumerate>(rt::shims::find("xgameruntime.dll", "XPackageEnumeratePackages"));
+            check(enumerate != nullptr, "XPackageEnumeratePackages is exported");
+            if (enumerate) {
+                SetEnvironmentVariableA("LEONIDA_PACKAGE_ID", "ENUMGAME_12345678901234567890123");
+                SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", "DLCONE=C:\\one;DLCTWO=C:\\two");
+                Seen game, content, stopped;
+                check(enumerate(0, 0, &game, collect) == S_OK && game.ids.size() == 1 &&
+                          game.ids[0] == "ENUMGAME_12345678901234567890123" && game.kinds[0] == 0,
+                      "enumerating Game lists the process's own package, once");
+                check(enumerate(1, 1, &content, collect) == S_OK && content.ids.size() == 2 && content.ids[0] == "DLCONE" &&
+                          content.ids[1] == "DLCTWO" && content.kinds[0] == 1,
+                      "enumerating Content lists the installed content packages in order");
+                stopped.stop_after = 1;
+                check(enumerate(1, 0, &stopped, collect) == S_OK && stopped.ids.size() == 1,
+                      "a callback that returns false stops the enumeration");
+                check(enumerate(7, 0, &game, collect) == E_INVALIDARG && enumerate(0, 0, &game, nullptr) == E_INVALIDARG,
+                      "an unknown package kind or no callback is E_INVALIDARG");
+                // The slot (28) answers the same as the export.
+                using EnumSlot = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t, void*, Callback);
+                Seen via_slot;
+                check(reinterpret_cast<EnumSlot>(slot(pk, 28))(pk, 1, 0, &via_slot, collect) == S_OK && via_slot.ids == content.ids,
+                      "slot 28 enumerates as the export does");
+
+                using Create = HRESULT(__stdcall*)(const char*, uint32_t, const void*, uint32_t, void*, void**);
+                using Close = void(__stdcall*)(void*);
+                using GetProgress = void(__stdcall*)(void*, void*);
+                using Register = HRESULT(__stdcall*)(void*, void*, void*, XTaskQueueRegistrationToken*);
+                using Unregister = bool(__stdcall*)(void*, XTaskQueueRegistrationToken, bool);
+                const auto create = reinterpret_cast<Create>(rt::shims::find("xgameruntime.dll", "XPackageCreateInstallationMonitor"));
+                const auto close = reinterpret_cast<Close>(rt::shims::find("xgameruntime.dll", "XPackageCloseInstallationMonitorHandle"));
+                const auto progress_of = reinterpret_cast<GetProgress>(rt::shims::find("xgameruntime.dll", "XPackageGetInstallationProgress"));
+                const auto reg = reinterpret_cast<Register>(rt::shims::find("xgameruntime.dll", "XPackageRegisterInstallationProgressChanged"));
+                const auto unreg = reinterpret_cast<Unregister>(rt::shims::find("xgameruntime.dll", "XPackageUnregisterInstallationProgressChanged"));
+                check(create && close && progress_of && reg && unreg, "the installation monitor calls are exported");
+                if (create && close && progress_of && reg && unreg) {
+                    void* monitor = nullptr;
+                    check(create("ENUMGAME_12345678901234567890123", 0, nullptr, 1000, nullptr, &monitor) == S_OK && monitor,
+                          "a monitor opens on the game's own package");
+                    struct Progress {
+                        uint64_t total, installed, launch;
+                        bool launchable, completed;
+                    } progress{1, 2, 3, false, false};
+                    progress_of(monitor, &progress);
+                    check(progress.launchable && progress.completed && progress.installed == progress.total,
+                          "its progress reads installed, launchable and completed");
+                    XTaskQueueRegistrationToken token{};
+                    check(reg(monitor, nullptr, static_cast<void*>(&dummy_callback), &token) == S_OK && token.token != 0 &&
+                              unreg(monitor, token, true),
+                          "a progress-changed registration gets a token and unregisters");
+                    void* other = nullptr;
+                    check(create("DLCTWO", 0, nullptr, 1000, nullptr, &other) == S_OK && other && other != monitor,
+                          "a monitor opens on an installed content package, and is a different handle");
+                    close(monitor);
+                    close(other);
+                    void* missing = &monitor;
+                    check(create("NOT_INSTALLED", 0, nullptr, 1000, nullptr, &missing) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND) &&
+                              missing == nullptr,
+                          "a package that is not installed has no monitor (ERROR_NOT_FOUND, handle cleared)");
+                    close(monitor);  // closing twice is harmless
+                }
+                using RegInstalled = HRESULT(__stdcall*)(void*, void*, void*, XTaskQueueRegistrationToken*);
+                const auto reg_installed = reinterpret_cast<RegInstalled>(rt::shims::find("xgameruntime.dll", "XPackageRegisterPackageInstalled"));
+                XTaskQueueRegistrationToken t1{}, t2{};
+                check(reg_installed && reg_installed(nullptr, nullptr, static_cast<void*>(&dummy_callback), &t1) == S_OK &&
+                          reg_installed(nullptr, nullptr, static_cast<void*>(&dummy_callback), &t2) == S_OK && t1.token != 0 &&
+                          t1.token != t2.token,
+                      "package-installed registrations get distinct tokens");
+                SetEnvironmentVariableA("LEONIDA_PACKAGE_ID", nullptr);
+            }
+        }
         SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", nullptr);
         using Stub = HRESULT(STDMETHODCALLTYPE*)(void*);
-        check(reinterpret_cast<Stub>(slot(pk, 5))(pk) == E_NOTIMPL && reinterpret_cast<Stub>(slot(pk, 40))(pk) == E_NOTIMPL,
-              "the slots without an offline answer (5, 40) are E_NOTIMPL");
+        check(reinterpret_cast<Stub>(slot(pk, 27))(pk) == E_NOTIMPL && reinterpret_cast<Stub>(slot(pk, 40))(pk) == E_NOTIMPL,
+              "the slots without an offline answer (27, 40) are E_NOTIMPL");
         struct Progress {
             uint64_t total, installed, launch;
             bool launchable, completed;
