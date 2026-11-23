@@ -2222,12 +2222,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
             view_indices = size / index_bytes;  // size is the view's, cut at the buffer's end
         }
         const std::uint64_t last = std::uint64_t(draw.first) + draw.count;  // one past the last index fetched
-        if (!draw.index.va) {
-            if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
-            p.index_buffer = vk.zero_buffer;
-            p.index_offset = vk.zero_offset;
-            p.index_first = 0;
-        } else if (draw.count > 0 && last > view_indices) {
+        if (!draw.index.va || (draw.count > 0 && last > view_indices)) {
             const std::uint64_t inside = draw.first < view_indices ? view_indices - draw.first : 0;
             const std::uint64_t bytes = std::uint64_t(draw.count) * index_bytes;
             if (inside == 0 && vk.zero_buffer && bytes <= vk.zero_size) {
