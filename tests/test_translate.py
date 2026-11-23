@@ -1910,3 +1910,51 @@ def test_wave64_scmp_mask_halves_and_scalars_validate(emulate, make_shader, monk
         assert "OpGroupNonUniform" not in spv
     else:
         assert "OpGroupNonUniformBitwiseOr" in spv
+
+
+def test_ms_misc_pos1_exports_layer_and_viewport_per_primitive(make_shader):
+    """A mesh shader whose OSG1 declares SV_RenderTargetArrayIndex and SV_ViewportArrayIndex writes z of the pos1 misc
+    vector (z[10:0] = Layer, z[19:16] = ViewportIndex) to the per-primitive Layer / ViewportIndex outputs."""
+    import re
+    dxbc = make_dxbc([mesh_psv0_chunk(), signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 4, 0x1), (2, 5, 0x1)])])
+    asm = _ms_header_asm("exp pos1 off, off, v14, off done")
+    shader = make_shader(asm, name="ms_misc_pos1", dxbc=dxbc)
+    spvasm = shader.translate()
+    shader.validate(spvasm, KNOWN_VAL_ISSUES.get("ms_tri"))
+    assert "OpCapability ShaderLayer" in spvasm
+    assert "OpCapability ShaderViewportIndex" in spvasm
+    assert "OpMemberDecorate %ms_cull_blk 1 BuiltIn Layer" in spvasm
+    assert "OpMemberDecorate %ms_cull_blk 1 PerPrimitiveEXT" in spvasm
+    assert "OpMemberDecorate %ms_cull_blk 2 BuiltIn ViewportIndex" in spvasm
+    assert "OpMemberDecorate %ms_cull_blk 2 PerPrimitiveEXT" in spvasm
+    assert "%ms_cull_blk = OpTypeStruct %bool %int %int" in spvasm
+    # decode: Layer = z & 0x7FF, ViewportIndex = (z >> 16) & 0xF
+    assert re.search(r"OpBitwiseAnd %uint %\w+ %c7ff", spvasm)
+    assert re.search(r"OpShiftRightLogical %uint %\w+ %c10", spvasm)
+    # written to the primitive output at the local index
+    assert "OpAccessChain %_ptr_Out_int_ms %ms_cull %mli %c1" in spvasm
+    assert "OpAccessChain %_ptr_Out_int_ms %ms_cull %mli %c2" in spvasm
+    meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spvasm)
+    assert "shaderOutputLayer" in meta["features"]
+    assert "shaderOutputViewportIndex" in meta["features"]
+
+
+def test_ms_misc_pos1_layer_only_has_no_viewport_member(make_shader):
+    dxbc = make_dxbc([mesh_psv0_chunk(), signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 4, 0x1)])])
+    shader = make_shader(_ms_header_asm("exp pos1 off, off, v14, off done"), name="ms_misc_layer", dxbc=dxbc)
+    spvasm = shader.translate()
+    shader.validate(spvasm, KNOWN_VAL_ISSUES.get("ms_tri"))
+    assert "%ms_cull_blk = OpTypeStruct %bool %int\n" in spvasm
+    assert "BuiltIn ViewportIndex" not in spvasm
+    assert "OpCapability ShaderViewportIndex" not in spvasm
+
+
+def test_ms_without_misc_outputs_keeps_plain_primitive_block(make_shader):
+    """Negative control: no SV_RenderTargetArrayIndex / SV_ViewportArrayIndex in OSG1, so no Layer / ViewportIndex."""
+    dxbc = make_dxbc([mesh_psv0_chunk(), signature_chunk(b"OSG1", [(0, 1, 0xF)])])
+    shader = make_shader(_ms_header_asm("exp pos1 off, off, v14, off done"), name="ms_no_misc", dxbc=dxbc)
+    spvasm = shader.translate()
+    shader.validate(spvasm, KNOWN_VAL_ISSUES.get("ms_tri"))
+    assert "%ms_cull_blk = OpTypeStruct %bool\n" in spvasm
+    assert "BuiltIn Layer" not in spvasm and "BuiltIn ViewportIndex" not in spvasm
+    assert "OpCapability ShaderLayer" not in spvasm
