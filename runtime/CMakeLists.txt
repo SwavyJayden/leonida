@@ -1884,6 +1884,14 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_texture1d COMMAND d3d12_texture1d_test)
     set_tests_properties(d3d12_texture1d PROPERTIES SKIP_RETURN_CODE 77)
 
+    add_executable(d3d12_srv_validation_test test/d3d12_srv_validation_test.cpp)
+    target_link_libraries(d3d12_srv_validation_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_srv_validation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_srv_validation_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_srv_validation COMMAND d3d12_srv_validation_test)
+    set_tests_properties(d3d12_srv_validation PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+
     # Placed 1D and 3D textures against the host runtime and WARP, and a copy round trip through them.
     add_executable(d3d12_placed_dimensions_test test/d3d12_placed_dimensions_test.cpp)
     target_link_libraries(d3d12_placed_dimensions_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)

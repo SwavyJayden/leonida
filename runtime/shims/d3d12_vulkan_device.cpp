@@ -43,6 +43,7 @@
 #include <bit>
 #include <cctype>
 #include <climits>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -4662,11 +4663,28 @@ private:
     std::shared_ptr<ShaderCacheStore> store_;
 };
 
+bool valid_shader_4_component_mapping(UINT mapping) {
+    if ((mapping >> 12) != 1) return false;
+    for (UINT i = 0; i < 4; ++i) {
+        if (D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, mapping) > D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1)
+            return false;
+    }
+    return true;
+}
+
 // The T# of a view: what the shader gets to know about it, in the structure the console's shaders read.
 // False (with a log) for a view set 0 cannot show yet.
 bool image_descriptor(const Resource& resource, const TextureView& view, leonida::gfx10::Image& out) {
     namespace g = leonida::gfx10;
     const D3D12_RESOURCE_DESC& desc = resource.desc();
+    if (!valid_shader_4_component_mapping(view.mapping)) {
+        log_once("invalid shader view component mapping:", int(view.mapping));
+        return false;
+    }
+    if (std::isnan(view.min_lod) || view.min_lod < 0.0f) {
+        log_once("invalid shader view ResourceMinLODClamp; first mip", int(view.first_mip));
+        return false;
+    }
     // Plane 1 of a depth-stencil texture is its stencil, viewed as X24_TYPELESS_G8_UINT (D24S8) or
     // X32_TYPELESS_G8X24_UINT (D32S8): eight unsigned bits in G, as D3D12 returns them. The T# is 8_UINT, the
     // format of the console's separate stencil surface, and bind_image views the stencil aspect for it.
@@ -4704,11 +4722,6 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             log_once("multisample shader view requires a matching typed colour format:", int(desc.Format));
             return false;
         }
-        // Four 3-bit selectors followed by D3D12's always-set bit.
-        if ((view.mapping >> 12) != 1) {
-            log_once("invalid multisample shader view component mapping:", int(view.mapping));
-            return false;
-        }
     }
     const VkFormat resource_format = resource.uint_backed() ? resource.uint_backed() : resource.format();
     VkFormat named = resource_format;
@@ -4744,6 +4757,16 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS && view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS);
         if (!depth_format_fits) {
             log_once("incompatible depth shader-resource view format:", int(view.format));
+            return false;
+        }
+    }
+    if (!stencil && !depth_plane) {
+        if (view.format == DXGI_FORMAT_UNKNOWN && vulkan_format(desc.Format, false).typeless) {
+            log_once("typeless texture view requires a concrete view format:", int(desc.Format));
+            return false;
+        }
+        if (view.format != DXGI_FORMAT_UNKNOWN && vulkan_format(view.format, false).typeless) {
+            log_once("view format cannot be typeless:", int(view.format));
             return false;
         }
     }
@@ -4803,8 +4826,12 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         log_once("view starts past the texture's mips or layers; first mip", int(view.first_mip));
         return false;
     }
-    if (msaa && view.layer_count != UINT_MAX && view.layer_count > UINT(desc.DepthOrArraySize) - view.first_layer) {
-        log_once("multisample shader view ends past the texture array; layers", int(view.layer_count));
+    if (view.mip_count != UINT_MAX && view.mip_count > UINT(desc.MipLevels) - view.first_mip) {
+        log_once("shader view ends past the texture mips; mips", int(view.mip_count));
+        return false;
+    }
+    if (view.layer_count != UINT_MAX && view.layer_count > layers - view.first_layer) {
+        log_once("shader view ends past the texture array; layers", int(view.layer_count));
         return false;
     }
     out = {};
@@ -4842,10 +4869,6 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     else if (alpha_unused(view.format != DXGI_FORMAT_UNKNOWN ? view.format : desc.Format)) channels[3] = g::select_one;
     for (UINT i = 0; i < 4; ++i) {
         const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, view.mapping);
-        if (msaa && from > D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1) {
-            log_once("invalid multisample shader view component selector:", from);
-            return false;
-        }
         out.swizzle[i] = from < 4 ? channels[from]
                                   : from == D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0 ? g::select_zero : g::select_one;
     }
@@ -6443,6 +6466,10 @@ public:
                 log_once("shader-resource view dimension not supported for buffer:", desc->ViewDimension);
                 return;
             }
+            if (!valid_shader_4_component_mapping(desc->Shader4ComponentMapping)) {
+                log_once("invalid buffer shader-resource view component mapping:", int(desc->Shader4ComponentMapping));
+                return;
+            }
             const UINT64 base_va = const_cast<Resource*>(r)->GetGPUVirtualAddress();
             const UINT64 width = r->desc().Width;
             if (!base_va || !desc->Buffer.NumElements || (desc->Buffer.Flags & ~D3D12_BUFFER_SRV_FLAG_RAW)) return;
@@ -6572,7 +6599,9 @@ public:
                 view.first_mip = desc->TextureCubeArray.MostDetailedMip;
                 view.mip_count = desc->TextureCubeArray.MipLevels;
                 view.first_layer = desc->TextureCubeArray.First2DArrayFace;
-                view.layer_count = desc->TextureCubeArray.NumCubes < ~0u / 6 ? desc->TextureCubeArray.NumCubes * 6 : ~0u;
+                view.layer_count = desc->TextureCubeArray.NumCubes == ~0u ? ~0u
+                                 : desc->TextureCubeArray.NumCubes < ~0u / 6 ? desc->TextureCubeArray.NumCubes * 6
+                                                                             : 0u;
                 view.min_lod = desc->TextureCubeArray.ResourceMinLODClamp;
                 break;
             default:
