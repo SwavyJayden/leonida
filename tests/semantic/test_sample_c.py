@@ -1,10 +1,10 @@
-"""image_sample_c and image_sample_c_b (and their _o forms): depth-compare samples with implicit LOD / bias.
+"""Depth-compare samples: image_sample_c, image_sample_c_b and image_sample_c_lz, including their _o forms.
 
 Standard library only (spirv-val is used when it is on PATH); no GPU, no LLVM, no game files.
 
-The GPU fixtures are runtime/test/shaders/ps_sample_c.asm and ps_sample_c_b.asm (vk_texture_test dref_c, dref_c_b). Here:
-the shape of the SPIR-V in a pixel shader (OpImageSampleDrefImplicitLod, a Bias operand for _c_b, the Offset for _o),
-LOD 0 for _c and explicit bias LOD for _c_b outside the pixel stage, d16 and a16 forms, and that the module validates.
+The GPU fixtures are runtime/test/shaders/ps_sample_c*.asm. Here: the shape of the SPIR-V in a pixel shader
+(OpImageSampleDrefImplicitLod, a Bias operand for _c_b, the Offset for _o), LOD 0 for _c and explicit bias LOD for
+_c_b outside the pixel stage, d16 and a16 forms, the 3D _c_lz refusals, and that the supported modules validate.
 """
 import os
 import re
@@ -13,6 +13,7 @@ import struct
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 
 import support
 
@@ -92,12 +93,32 @@ class SampleC(unittest.TestCase):
             return None
         self.assertEqual((loaded_from(bias), loaded_from(ref)), (4, 5))
 
+    def test_3d_c_lz_forms_are_refused(self):
+        for op, fixture_name in (("image_sample_c_lz", "dref_3d_c_lz.asm"),
+                                 ("image_sample_c_lz_o", "dref_3d_c_lz_o.asm")):
+            fixture = Path(__file__).with_name("fixtures") / fixture_name
+            with self.subTest(op=op), self.assertRaisesRegex(support.rdna2spirv.Unsupported,
+                                                               op + " 3D depth comparison"):
+                support.translate_lines("ps_dref3d", fixture.read_text(encoding="utf-8").splitlines())
+
+    def test_c_lz_supported_dimensions_remain_accepted(self):
+        for op, regs, dim in (("image_sample_c_lz", "v[4:6]", "2D"),
+                              ("image_sample_c_lz_o", "v[4:7]", "2D"),
+                              ("image_sample_c_lz", "v[4:7]", "2D_ARRAY"),
+                              ("image_sample_c_lz_o", "v[4:8]", "2D_ARRAY")):
+            with self.subTest(op=op, dim=dim):
+                spv = translate("ps_sampleclz", f"{op} v9, {regs}, {DESC} dmask:0x1 dim:SQ_RSRC_IMG_{dim}")
+                self.assertIn("OpImageSampleDrefExplicitLod", spv)
+
     @unittest.skipUnless(shutil.which("spirv-as") and shutil.which("spirv-val"), "needs spirv-as and spirv-val on PATH")
     def test_modules_validate(self):
-        for op, regs in (("image_sample_c", "v[4:6]"), ("image_sample_c_b", "v[4:7]"), ("image_sample_c_o", "v[4:7]"),
-                         ("image_sample_c_b_o", "v[4:8]")):
-            with self.subTest(op=op):
-                spv = translate("ps_sampleval", f"{op} v9, {regs}, {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D")
+        for op, regs, dim in (("image_sample_c", "v[4:6]", "2D"), ("image_sample_c_b", "v[4:7]", "2D"),
+                              ("image_sample_c_o", "v[4:7]", "2D"), ("image_sample_c_b_o", "v[4:8]", "2D"),
+                              ("image_sample_c_lz", "v[4:6]", "2D"), ("image_sample_c_lz_o", "v[4:7]", "2D"),
+                              ("image_sample_c_lz", "v[4:7]", "2D_ARRAY"),
+                              ("image_sample_c_lz_o", "v[4:8]", "2D_ARRAY")):
+            with self.subTest(op=op, dim=dim):
+                spv = translate("ps_sampleval", f"{op} v9, {regs}, {DESC} dmask:0x1 dim:SQ_RSRC_IMG_{dim}")
                 with tempfile.TemporaryDirectory() as tmp:
                     a, b = os.path.join(tmp, "m.spvasm"), os.path.join(tmp, "m.spv")
                     with open(a, "w", encoding="utf-8", newline="\n") as f:
