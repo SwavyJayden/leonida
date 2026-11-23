@@ -29,7 +29,12 @@ def run_fixture(exe, *args):
                 except ProcessLookupError:
                     pass
             process.kill()
-            process.wait()
+            # Finish the communication, as the subprocess docs advise after a timeout, so the pipes are drained and
+            # closed; the bound keeps a stray process that still holds them (a runner without a group) from blocking.
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
             raise SystemExit(f"{' '.join([exe, *args])}: no exit within {timeout}s") from None
     if process.returncode:
         raise SystemExit(f"{exe} exited with {process.returncode}\n{stdout}{stderr}")
