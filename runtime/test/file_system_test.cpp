@@ -224,6 +224,17 @@ void run_checks(const std::filesystem::path& root) {
 
     {
         const auto info = resolve<decltype(&::GetVolumeInformationW)>("kernel32.dll", "GetVolumeInformationW");
+        const auto missing_overlay = root / "missing-overlay" / "child";
+        rt::fs::configure(package, missing_overlay);
+        check(info && info(L"GAME:\\", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
+              !std::filesystem::exists(missing_overlay.parent_path()),
+              "volume query falls back to the package without creating the overlay");
+        const auto missing_game = root / "missing-game";
+        rt::fs::configure(missing_game, missing_overlay);
+        check(info && !info(L"GAME:\\", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
+              !std::filesystem::exists(missing_game) && !std::filesystem::exists(missing_overlay.parent_path()),
+              "volume query does not recreate a missing game or overlay");
+        rt::fs::configure(package, overlay);
         const auto path = resolve<decltype(&::GetVolumePathNameW)>("kernel32.dll", "GetVolumePathNameW");
         wchar_t fs[MAX_PATH]{}, actual[MAX_PATH]{}, expected[MAX_PATH]{};
         check(info && info(L"GAME:\\", nullptr, 0, nullptr, nullptr, nullptr, fs, MAX_PATH) && fs[0],
@@ -234,6 +245,14 @@ void run_checks(const std::filesystem::path& root) {
         check(path && host_ok && path(package.c_str(), actual, MAX_PATH) && std::wstring(actual) == expected,
               "GetVolumePathNameW preserves host paths");
         const auto info_a = resolve<decltype(&::GetVolumeInformationA)>("kernelbase.dll", "GetVolumeInformationA");
+        char ansi_label[MAX_PATH]{}, ansi_fs[MAX_PATH]{};
+        wchar_t wide_label[MAX_PATH]{}, wide_fs[MAX_PATH]{};
+        check(info && info_a && info(L"GAME:\\", wide_label, MAX_PATH, nullptr, nullptr, nullptr, wide_fs, MAX_PATH) &&
+              info_a("GAME:\\", ansi_label, MAX_PATH, nullptr, nullptr, nullptr, ansi_fs, MAX_PATH),
+              "both volume query variants return strings");
+        char expected_fs[MAX_PATH]{};
+        check(::WideCharToMultiByte(CP_ACP, 0, wide_fs, -1, expected_fs, MAX_PATH, nullptr, nullptr) &&
+              std::string(ansi_fs) == expected_fs, "ANSI volume filesystem matches the converted wide result");
         const auto path_a = resolve<decltype(&::GetVolumePathNameA)>("kernelbase.dll", "GetVolumePathNameA");
         char fs_a[MAX_PATH]{}, actual_a[MAX_PATH]{};
         for (const char* drive : {"GAME:\\", "G:\\", "T:\\"}) {

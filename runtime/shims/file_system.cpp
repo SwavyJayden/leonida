@@ -1396,11 +1396,11 @@ BOOL WINAPI set_file_attributes_a(LPCSTR name, DWORD attributes) {
 // Resolve the backing volume without exposing its host root to the title.
 bool volume_host_root(std::wstring& result) {
     const Roots r = roots();
-    const auto dir = r.overlay.empty() ? r.game : r.overlay;
-    if (dir.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    if (ec) return fail_bool(static_cast<DWORD>(ec.value()));
+    auto dir = r.overlay;
+    const DWORD attributes = dir.empty() ? INVALID_FILE_ATTRIBUTES : ::GetFileAttributesW(dir.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) dir = r.game;
+    if (dir.empty() || ::GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES)
+        return fail_bool(ERROR_PATH_NOT_FOUND);
     wchar_t root[MAX_PATH]{};
     if (!::GetVolumePathNameW(dir.c_str(), root, MAX_PATH)) return false;
     result = root;
@@ -1429,11 +1429,17 @@ BOOL WINAPI get_volume_information_a(LPCSTR name, LPSTR label, DWORD label_size,
     if (parsed == Parsed::Refused || !drive_root(wide, parts)) return fail_bool(ERROR_INVALID_NAME);
     std::wstring root;
     if (!volume_host_root(root)) return FALSE;
-    const int size = ::WideCharToMultiByte(CP_ACP, 0, root.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    if (!size) return FALSE;
-    std::string narrow(static_cast<size_t>(size), '\0');
-    if (!::WideCharToMultiByte(CP_ACP, 0, root.c_str(), -1, narrow.data(), size, nullptr, nullptr)) return FALSE;
-    return ::GetVolumeInformationA(narrow.c_str(), label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+    // Keep the mount path Unicode; only the two returned strings use the caller's ANSI code page.
+    wchar_t wide_label[MAX_PATH]{}, wide_filesystem[MAX_PATH]{};
+    if (!::GetVolumeInformationW(root.c_str(), label && label_size ? wide_label : nullptr,
+                                 label && label_size ? MAX_PATH : 0, serial, max_component, flags,
+                                 filesystem && filesystem_size ? wide_filesystem : nullptr,
+                                 filesystem && filesystem_size ? MAX_PATH : 0)) return FALSE;
+    if (label && label_size && !::WideCharToMultiByte(CP_ACP, 0, wide_label, -1, label,
+                                                       static_cast<int>(label_size > 0x7fffffffU ? 0x7fffffffU : label_size), nullptr, nullptr)) return FALSE;
+    if (filesystem && filesystem_size && !::WideCharToMultiByte(CP_ACP, 0, wide_filesystem, -1, filesystem,
+                                                                static_cast<int>(filesystem_size > 0x7fffffffU ? 0x7fffffffU : filesystem_size), nullptr, nullptr)) return FALSE;
+    return TRUE;
 }
 
 BOOL WINAPI get_volume_path_name_w(LPCWSTR name, LPWSTR output, DWORD size) {
