@@ -1393,6 +1393,79 @@ BOOL WINAPI set_file_attributes_a(LPCSTR name, DWORD attributes) {
     return set_file_attributes_w(wide.c_str(), attributes);
 }
 
+// Resolve the backing volume without exposing its host root to the title.
+bool volume_host_root(std::wstring& result) {
+    const Roots r = roots();
+    const auto dir = r.overlay.empty() ? r.game : r.overlay;
+    if (dir.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) return fail_bool(static_cast<DWORD>(ec.value()));
+    wchar_t root[MAX_PATH]{};
+    if (!::GetVolumePathNameW(dir.c_str(), root, MAX_PATH)) return false;
+    result = root;
+    return true;
+}
+
+BOOL WINAPI get_volume_information_w(LPCWSTR name, LPWSTR label, DWORD label_size, LPDWORD serial,
+                                     LPDWORD max_component, LPDWORD flags, LPWSTR filesystem, DWORD filesystem_size) {
+    if (!name) return ::GetVolumeInformationW(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(name, parts);
+    if (parsed == Parsed::Host) return ::GetVolumeInformationW(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+    if (parsed == Parsed::Refused || !drive_root(name, parts)) return fail_bool(ERROR_INVALID_NAME);
+    std::wstring root;
+    if (!volume_host_root(root)) return FALSE;
+    return ::GetVolumeInformationW(root.c_str(), label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+}
+
+BOOL WINAPI get_volume_information_a(LPCSTR name, LPSTR label, DWORD label_size, LPDWORD serial,
+                                     LPDWORD max_component, LPDWORD flags, LPSTR filesystem, DWORD filesystem_size) {
+    if (!name) return ::GetVolumeInformationA(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+    const std::wstring wide = widen_ansi(name);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(wide, parts);
+    if (parsed == Parsed::Host) return ::GetVolumeInformationA(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+    if (parsed == Parsed::Refused || !drive_root(wide, parts)) return fail_bool(ERROR_INVALID_NAME);
+    std::wstring root;
+    if (!volume_host_root(root)) return FALSE;
+    const int size = ::WideCharToMultiByte(CP_ACP, 0, root.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (!size) return FALSE;
+    std::string narrow(static_cast<size_t>(size), '\0');
+    if (!::WideCharToMultiByte(CP_ACP, 0, root.c_str(), -1, narrow.data(), size, nullptr, nullptr)) return FALSE;
+    return ::GetVolumeInformationA(narrow.c_str(), label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+}
+
+BOOL WINAPI get_volume_path_name_w(LPCWSTR name, LPWSTR output, DWORD size) {
+    if (!name) return ::GetVolumePathNameW(name, output, size);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(name, parts);
+    if (parsed == Parsed::Host) return ::GetVolumePathNameW(name, output, size);
+    if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
+    size_t prefix = 0;
+    console_drive(name, prefix);
+    const std::wstring root = std::wstring(name, prefix) + L"\\";
+    if (!output || size <= root.size()) return fail_bool(ERROR_FILENAME_EXCED_RANGE);
+    std::wmemcpy(output, root.c_str(), root.size() + 1);
+    return TRUE;
+}
+
+BOOL WINAPI get_volume_path_name_a(LPCSTR name, LPSTR output, DWORD size) {
+    if (!name) return ::GetVolumePathNameA(name, output, size);
+    const std::wstring wide = widen_ansi(name);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(wide, parts);
+    if (parsed == Parsed::Host) return ::GetVolumePathNameA(name, output, size);
+    if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
+    size_t prefix = 0;
+    console_drive(wide, prefix);
+    if (!output || size <= prefix + 1) return fail_bool(ERROR_FILENAME_EXCED_RANGE);
+    std::memcpy(output, name, prefix);
+    output[prefix] = '\\';
+    output[prefix + 1] = '\0';
+    return TRUE;
+}
+
 }  // namespace rt::fs
 
 namespace {
@@ -1402,6 +1475,10 @@ using namespace rt::fs;
 // imports and through the api sets a GDK title is linked against (file-l1-1-0 for the find and attribute calls,
 // file-l1-2-0 and file-l2-1-0 for CreateFile).
 #define FILE_API(dll)                                                                                    \
+    {dll, "GetVolumeInformationA", reinterpret_cast<void*>(&get_volume_information_a)},                   \
+        {dll, "GetVolumeInformationW", reinterpret_cast<void*>(&get_volume_information_w)},             \
+        {dll, "GetVolumePathNameA", reinterpret_cast<void*>(&get_volume_path_name_a)},                   \
+        {dll, "GetVolumePathNameW", reinterpret_cast<void*>(&get_volume_path_name_w)},                   \
     {dll, "CreateFileA", reinterpret_cast<void*>(&create_file_a)},                                       \
         {dll, "CreateFileW", reinterpret_cast<void*>(&create_file_w)},                                   \
         {dll, "CreateFile2", reinterpret_cast<void*>(&create_file2)},                                    \

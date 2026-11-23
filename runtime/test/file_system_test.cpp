@@ -222,6 +222,32 @@ void run_checks(const std::filesystem::path& root) {
     check(rt::fs::game_dir() == package, "configure() sets the game folder");
     check(rt::fs::overlay_dir() == overlay, "configure() sets the overlay folder");
 
+    {
+        const auto info = resolve<decltype(&::GetVolumeInformationW)>("kernel32.dll", "GetVolumeInformationW");
+        const auto path = resolve<decltype(&::GetVolumePathNameW)>("kernel32.dll", "GetVolumePathNameW");
+        wchar_t fs[MAX_PATH]{}, actual[MAX_PATH]{}, expected[MAX_PATH]{};
+        check(info && info(L"GAME:\\", nullptr, 0, nullptr, nullptr, nullptr, fs, MAX_PATH) && fs[0],
+              "GetVolumeInformationW returns the GAME filesystem");
+        check(path && path(L"GAME:\\sub\\f.bin", actual, MAX_PATH) && std::wstring(actual) == L"GAME:\\",
+              "GetVolumePathNameW returns the virtual root");
+        const BOOL host_ok = ::GetVolumePathNameW(package.c_str(), expected, MAX_PATH);
+        check(path && host_ok && path(package.c_str(), actual, MAX_PATH) && std::wstring(actual) == expected,
+              "GetVolumePathNameW preserves host paths");
+        const auto info_a = resolve<decltype(&::GetVolumeInformationA)>("kernelbase.dll", "GetVolumeInformationA");
+        const auto path_a = resolve<decltype(&::GetVolumePathNameA)>("kernelbase.dll", "GetVolumePathNameA");
+        char fs_a[MAX_PATH]{}, actual_a[MAX_PATH]{};
+        for (const char* drive : {"GAME:\\", "G:\\", "T:\\"}) {
+            check(info_a && info_a(drive, nullptr, 0, nullptr, nullptr, nullptr, fs_a, MAX_PATH) && fs_a[0],
+                  "GetVolumeInformationA returns the virtual drive filesystem");
+            check(path_a && path_a(drive, actual_a, MAX_PATH) && std::string(actual_a) == drive,
+                  "GetVolumePathNameA returns the virtual drive root");
+        }
+        check(path && path(L"G:\\sub\\f.bin", actual, MAX_PATH) && std::wstring(actual) == L"G:\\" &&
+              path(L"T:\\sub\\f.bin", actual, MAX_PATH) && std::wstring(actual) == L"T:\\",
+              "GetVolumePathNameW returns G and T roots");
+        check(path && !path(L"GAME:\\sub", actual, 2), "GetVolumePathNameW rejects a short buffer");
+    }
+
     // The table the runtime installs: kernel32 and the api sets a GDK title links against.
     const auto create_w = resolve<CreateFileWFn>("kernel32.dll", "CreateFileW");
     const auto create_a = resolve<CreateFileAFn>("kernelbase.dll", "CreateFileA");
