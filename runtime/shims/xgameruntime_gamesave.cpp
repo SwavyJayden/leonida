@@ -376,12 +376,31 @@ HRESULT commit(XGameSaveUpdate* u) {
     XGameSaveContainer* c = u->container;
     const fs::path dir = c->dir();
     // The quota: what the container holds after the update, plus every other container.
+    // Subtract each existing on-disk file at most once: on case-insensitive volumes (NTFS), two blob names differing
+    // only in ASCII case refer to the same file, and subtracting its size twice underflows uint64_t.
     uint64_t after = used_bytes(c->user_dir);
+    std::vector<fs::path> accounted;
     for (const auto& [name, op] : u->ops) {
-        std::error_code ec;
+        std::error_code size_ec;
         const fs::path p = dir / widen(encode_name(name));
-        const uint64_t old = fs::is_regular_file(p, ec) ? static_cast<uint64_t>(fs::file_size(p, ec)) : 0;
-        after = after - old + (op.write ? op.data.size() : 0);
+        if (fs::is_regular_file(p, size_ec) && !size_ec) {
+            const uintmax_t sz = fs::file_size(p, size_ec);
+            if (!size_ec && sz != static_cast<uintmax_t>(-1)) {
+                const bool seen = std::any_of(accounted.begin(), accounted.end(), [&](const fs::path& prev) {
+                    std::error_code eq_ec;
+                    return fs::equivalent(prev, p, eq_ec) && !eq_ec;
+                });
+                if (!seen) {
+                    accounted.push_back(p);
+                    const uint64_t old = static_cast<uint64_t>(sz);
+                    after = old <= after ? after - old : 0;
+                }
+            }
+        }
+        if (op.write) {
+            const uint64_t add = static_cast<uint64_t>(op.data.size());
+            after = add > UINT64_MAX - after ? UINT64_MAX : after + add;
+        }
     }
     if (after > kQuotaBytes) return E_GS_QUOTA_EXCEEDED;
 
