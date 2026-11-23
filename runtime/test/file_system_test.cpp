@@ -444,6 +444,11 @@ void run_checks(const std::filesystem::path& root) {
         check(pa(MAX_PATH, a_path) && std::filesystem::path(a_path).parent_path() == scratch,
               "GetTempPathA resolves console path");
         check(pa(0, nullptr) == std::strlen(a_path) + 1, "GetTempPathA reports required size including terminator");
+        const DWORD a_length = static_cast<DWORD>(std::strlen(a_path));
+        char exact_buffer[MAX_PATH];
+        std::memset(exact_buffer, 0x5a, sizeof(exact_buffer));
+        check(pa(a_length, exact_buffer) == a_length && exact_buffer[a_length] == 0x5a,
+              "GetTempPathA returns path length when capacity excludes the terminator");
         check(na("GAME:\\", "abcdef", 0x1234, a_name) == 0x1234 &&
                   std::filesystem::path(a_name).parent_path() == scratch &&
                   !std::filesystem::exists(a_name) &&

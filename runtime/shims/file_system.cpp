@@ -1557,7 +1557,8 @@ DWORD WINAPI get_temp_path_a(DWORD size, LPSTR buffer) {
         ::SetLastError(ERROR_NO_UNICODE_TRANSLATION);
         return 0;
     }
-    if (size < static_cast<DWORD>(required)) return static_cast<DWORD>(required);
+    if (size < static_cast<DWORD>(required))
+        return size && size == static_cast<DWORD>(required - 1) ? size : static_cast<DWORD>(required);
     if (!::WideCharToMultiByte(CP_ACP, flags, path.c_str(), -1, buffer, required, nullptr, used_default_ptr)) return 0;
     if (used_default) {
         ::SetLastError(ERROR_NO_UNICODE_TRANSLATION);
