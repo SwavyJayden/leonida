@@ -767,10 +767,12 @@ class PipelineAndEmissionTests(unittest.TestCase):
         self.assertIn("OpISub %uint", emitted)
         self.assertIn("OpULessThan %bool", emitted)
         self.assertIn("OpSelect %uint", emitted)
-        self.assertIn("OpShiftRightLogical %ulong", emitted)
+        self.assertIn("OpShiftRightLogical %uint", emitted)
         self.assertIn("OpBitwiseOr %uint", emitted)
         self.assertIn("OpStore %scc", emitted)
-        self.assertTrue(g.uses_psb)
+        # SHADER-930: lowered on the dword pair, so no 64-bit type and no Int64 capability.
+        self.assertNotIn("long", emitted)
+        self.assertFalse(g.uses_psb)
 
     def test_rdna2spirv_emission_i64(self) -> None:
         g = rdna2spirv.Gen("ps")
@@ -786,10 +788,11 @@ class PipelineAndEmissionTests(unittest.TestCase):
         g.insn(ins)
         emitted = "\n".join(g.body)
 
-        self.assertIn("OpBitcast %long", emitted)
-        self.assertIn("OpShiftRightArithmetic %long", emitted)
-        self.assertIn("OpBitcast %ulong", emitted)
+        self.assertIn("OpBitFieldSExtract %uint", emitted)
+        self.assertIn("OpShiftRightArithmetic %uint", emitted)
         self.assertIn("OpStore %scc", emitted)
+        self.assertNotIn("long", emitted)       # SHADER-930: no Int64
+        self.assertFalse(g.uses_psb)
 
     def test_rdna2spirv_rejects_invalid_operands(self) -> None:
         # Non-sgpr destination
@@ -934,6 +937,18 @@ class Bfe64Tests(unittest.TestCase):
     def test_lane_mask_source_is_rejected(self):
         with self.assertRaises(rdna2spirv.Unsupported):
             run_lines(["s_mov_b32 s4, 0x100000", "s_bfe_u64 s[0:1], exec, s4"])
+
+    def test_every_offset_dword_pair(self):
+        # SHADER-930 lowers the extract on the (lo, hi) dword pair: every offset, around both dword edges of the
+        # width (and past bit 63), with the field's top bit set and clear.
+        widths = (0, 1, 2, 15, 16, 31, 32, 33, 34, 47, 62, 63, 64, 65, 127)
+        for op in OPS:
+            for x in (0xF0E1D2C3B4A59687, 0x0F1E2D3C4B5A6978):
+                for off in range(64):
+                    for wid in widths:
+                        c = ctl(off, wid)
+                        with self.subTest(op=op, x=hex(x), off=off, wid=wid):
+                            self.assertEqual(run_op(op, x, c)[0], ref(op, x, c))
 
 
 if __name__ == "__main__":
