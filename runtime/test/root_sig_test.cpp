@@ -479,6 +479,37 @@ void test_deserializer() {
     auto deserialize = reinterpret_cast<DeserializeFn>(
         rt::shims::find("d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer"));
     check(deserialize != nullptr, "shim registry exposes d3d12_xs!D3D12CreateRootSignatureDeserializer");
+    auto versioned = reinterpret_cast<decltype(&D3D12CreateVersionedRootSignatureDeserializer)>(
+        rt::shims::find("d3d12_xs.dll", "D3D12CreateVersionedRootSignatureDeserializer"));
+    check(versioned != nullptr, "shim registry exposes the versioned deserializer");
+    check(versioned && rt::shims::find("d3d12_xs.dll", "#7") == reinterpret_cast<void*>(versioned),
+          "ordinal 7 resolves to the versioned deserializer");
+    if (versioned) {
+        ID3D12VersionedRootSignatureDeserializer* de = nullptr;
+        auto bad_checksum = tampered;
+        bad_checksum[4] ^= 1;
+        HRESULT bad_hr = versioned(bad_checksum.data(), bad_checksum.size(), IID_PPV_ARGS(&de));
+        check(FAILED(bad_hr) && !de, "versioned shim rejects Xbox flags with corrupt checksum");
+        if (de) de->Release();
+        de = nullptr;
+        HRESULT versioned_hr = versioned(tampered.data(), tampered.size(), IID_PPV_ARGS(&de));
+        check(SUCCEEDED(versioned_hr) && de, "versioned shim accepts Xbox flags");
+        if (de) {
+            const auto* desc = de->GetUnconvertedRootSignatureDesc();
+            check(desc && desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 && desc->Desc_1_0.Flags == 0,
+                  "versioned shim clears Xbox flags");
+            de->Release();
+        }
+        de = nullptr;
+        versioned_hr = versioned(bytes, size, IID_PPV_ARGS(&de));
+        check(SUCCEEDED(versioned_hr) && de, "versioned shim accepts clean blob");
+        if (de) de->Release();
+        const uint8_t garbage[] = {1, 2, 3, 4};
+        de = nullptr;
+        versioned_hr = versioned(garbage, sizeof(garbage), IID_PPV_ARGS(&de));
+        check(FAILED(versioned_hr), "versioned shim rejects garbage");
+        if (de) de->Release();
+    }
     if (!deserialize) return;
 
     ID3D12RootSignatureDeserializer* shim_de = nullptr;

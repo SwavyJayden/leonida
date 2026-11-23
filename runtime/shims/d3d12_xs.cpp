@@ -34,6 +34,7 @@ FARPROC host(const char* name) {
 
 using SerializeFn = decltype(&::D3D12SerializeVersionedRootSignature);
 using DeserializerFn = decltype(&::D3D12CreateRootSignatureDeserializer);
+using VersionedDeserializerFn = decltype(&::D3D12CreateVersionedRootSignatureDeserializer);
 using LegacySerializeFn = decltype(&::D3D12SerializeRootSignature);
 using CreateDeviceFn = decltype(&::D3D12CreateDevice);
 
@@ -112,6 +113,24 @@ HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size,
     // the serializer applies to descriptors).
     std::vector<uint8_t> cleared;
     if (rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(data, static_cast<size_t>(size), cleared)) {
+        return fn(cleared.data(), cleared.size(), iid, out);
+    }
+    return fn(data, size, iid, out);
+}
+
+HRESULT WINAPI create_versioned_root_signature_deserializer(const void* data, SIZE_T size, REFIID iid, void** out) {
+    static auto fn = reinterpret_cast<VersionedDeserializerFn>(host("D3D12CreateVersionedRootSignatureDeserializer"));
+    if (!fn) return E_NOTIMPL;
+
+    std::vector<uint8_t> cleared;
+    if (rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(data, static_cast<size_t>(size), cleared)) {
+        uint32_t hash[4];
+        const auto* bytes = static_cast<const uint8_t*>(data);
+        rt::d3d12_xs::dxbc_checksum(bytes, static_cast<size_t>(size), hash);
+        if (std::memcmp(bytes + 4, hash, sizeof(hash)) != 0) {
+            if (out) *out = nullptr;
+            return E_INVALIDARG;
+        }
         return fn(cleared.data(), cleared.size(), iid, out);
     }
     return fn(data, size, iid, out);
@@ -215,6 +234,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
 
 static_assert(std::is_same_v<decltype(&serialize_root_signature), SerializeFn>);
 static_assert(std::is_same_v<decltype(&create_root_signature_deserializer), DeserializerFn>);
+static_assert(std::is_same_v<decltype(&create_versioned_root_signature_deserializer), VersionedDeserializerFn>);
 static_assert(std::is_same_v<decltype(&serialize_root_signature_legacy), LegacySerializeFn>);
 
 // Measured call (RT-5, 1.0.2.1): the title calls it once at startup with one pointer to a zeroed 32-byte block whose
@@ -229,6 +249,9 @@ SHIM_TABLE(d3d12_xs,
     {"d3d12_xs.dll", "D3D12SerializeRootSignature", reinterpret_cast<void*>(&serialize_root_signature_legacy)},
     {"d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer",
      reinterpret_cast<void*>(&create_root_signature_deserializer)},
+    {"d3d12_xs.dll", "D3D12CreateVersionedRootSignatureDeserializer",
+     reinterpret_cast<void*>(&create_versioned_root_signature_deserializer)},
+    {"d3d12_xs.dll", "#7", reinterpret_cast<void*>(&create_versioned_root_signature_deserializer)},
     {"d3d12_xs.dll", "D3D12XboxCreateDevice", reinterpret_cast<void*>(&D3D12XboxCreateDevice)},
     {"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", reinterpret_cast<void*>(&configure_virtual_memory)},
 );
