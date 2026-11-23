@@ -355,6 +355,10 @@ std::vector<std::wstring> parent_of(const std::vector<std::wstring>& parts) {
     return parts.empty() ? parts : std::vector<std::wstring>(parts.begin(), parts.end() - 1);
 }
 
+DWORD missing_error(const Roots& r, const std::vector<std::wstring>& parts) {
+    return is_folder(r, parent_of(parts)) ? ERROR_FILE_NOT_FOUND : ERROR_PATH_NOT_FOUND;
+}
+
 // Whether a folder has nothing in the title's view: no overlay entry and no package entry that is not deleted.
 bool empty_in_view(const Roots& r, const std::vector<std::wstring>& parts) {
     std::error_code ec;
@@ -989,10 +993,7 @@ BOOL WINAPI delete_file_w(LPCWSTR name) {
             removed = true;
         }
     }
-    if (!removed) {
-        SetLastError(ERROR_FILE_NOT_FOUND);
-        return FALSE;
-    }
+    if (!removed) return fail_bool(missing_error(r, parts));
     return TRUE;
 }
 
@@ -1081,7 +1082,7 @@ BOOL WINAPI remove_directory_w(LPCWSTR name) {
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (drive_root(name, parts)) return fail_bool(ERROR_ACCESS_DENIED);  // "GAME:" and "T:" themselves stay
     const View v = view(r, parts);
-    if (v.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
+    if (v.kind == Kind::None) return fail_bool(missing_error(r, parts));
     if (v.kind == Kind::File) return fail_bool(ERROR_DIRECTORY);
     if (!empty_in_view(r, parts)) return fail_bool(ERROR_DIR_NOT_EMPTY);
 
@@ -1118,7 +1119,7 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (drive_root(from, src) || drive_root(to, dst)) return fail_bool(ERROR_ACCESS_DENIED);
     const View from_view = view(r, src);
-    if (from_view.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
+    if (from_view.kind == Kind::None) return fail_bool(missing_error(r, src));
     const std::filesystem::path overlay_from = disk_path(r.overlay, src), overlay_to = disk_path(r.overlay, dst);
     if (same_entry(src, dst)) {
         // The destination is the source, so it is not "already there". The host succeeds at a move onto the same
@@ -1369,7 +1370,7 @@ BOOL WINAPI set_file_attributes_w(LPCWSTR name, DWORD attributes) {
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (parts.empty()) return fail_bool(ERROR_ACCESS_DENIED);
     const View v = view(r, parts);
-    if (v.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
+    if (v.kind == Kind::None) return fail_bool(missing_error(r, parts));
 
     // The attributes belong to the overlay copy: a package file is copied up and a package folder mirrored first,
     // so the package keeps its own attributes and reads, which prefer the overlay, see the new ones.
