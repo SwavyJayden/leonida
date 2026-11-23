@@ -567,9 +567,10 @@ int main() {
                 {strip_off_pso.p, {upload_va + 3072, 8, DXGI_FORMAT_R16_UINT}, 4, &view_out_pixels, 4},
                 // Negative control: the view covers the 8 indices, the same draw reads the quad.
                 {strip_off_pso.p, {upload_va + 3072, 16, DXGI_FORMAT_R16_UINT}, 4, &view_in_pixels, 4},
-                // Indices 2..5 cross the view's end: refused, nothing is read outside the view.
-                {strip_off_pso.p, {upload_va + 3072, 8, DXGI_FORMAT_R16_UINT}, 4, &view_straddle_pixels, 2,
-                 leonida::ReplayResult::unsupported},
+                // Indices 2..5 cross the view's end: 2 and 3 are read, 4 and 5 are outside and read 0, so the strip is
+                // (2, 3, 0, 0): one triangle (2, 3, 0) of the top-left quad. Without the cut the buffer's 0, 1 would
+                // give (2, 3, 0, 1), the whole quad.
+                {strip_off_pso.p, {upload_va + 3072, 8, DXGI_FORMAT_R16_UINT}, 4, &view_straddle_pixels, 2},
             };
             UINT64 strip_fence = 10;
             for (const auto& sp : strip_passes) {
@@ -1132,6 +1133,11 @@ int main() {
         }
     }
     EXPECT(view_out_red == 0);
+    // Straddling draw: the strip is (2, 3, 0, 0), the lower-left half of the quad; the buffer's own 0, 1 would also
+    // paint the upper-right half.
+    const auto straddle_px = [&](UINT col, UINT row) { return view_straddle_pixels.data() + row * 256 + col * 4; };
+    EXPECT(straddle_px(4, 28)[0] == 255 && straddle_px(4, 28)[2] == 0);  // lower-left corner of the quad: drawn
+    EXPECT(straddle_px(28, 4)[0] == 0 && straddle_px(28, 4)[2] == 255);   // upper-right corner: blue
     EXPECT(view_in_tl_red == (size / 2) * (size / 2));
     std::printf("index view size: draw past the view painted %u red pixels (want 0); view covering the draw painted "
                 "%u of %u top-left pixels\n", view_out_red, view_in_tl_red, (size / 2) * (size / 2));
