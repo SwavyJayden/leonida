@@ -283,6 +283,8 @@ def read_png(path):
     seen = set()
     idat_finished = False
     for kind, data in chunks:
+        if not kind.isalpha():
+            raise ToolError(f"'{path}': invalid PNG chunk type {kind!r}; expected four ASCII letters")
         if not (kind[0] & 32) and kind not in (b"IHDR", b"PLTE", b"IDAT", b"IEND"):
             raise ToolError(f"'{path}': unknown critical chunk {kind!r}")
         if kind in (b"IHDR", b"PLTE") and kind in seen:
