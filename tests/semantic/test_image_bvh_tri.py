@@ -38,7 +38,7 @@ def u2f(w):
     return struct.unpack("<f", struct.pack("<I", w))[0]
 
 
-def run(node_type, tri_id, x, y, slots=SLOTS):
+def run(node_type, tri_id, x, y, slots=SLOTS, poke=None):
     lines = []
     mov = lambda r, v: lines.append(f"v_mov_b32_e32 v{r}, 0x{v:x}")   # noqa: E731
     mov(1, 0x08 | node_type)
@@ -55,6 +55,9 @@ def run(node_type, tri_id, x, y, slots=SLOTS):
         for c in range(3):
             mem[NODE + 12 * s + 4 * c] = f2u(v[c])
     mem[NODE + 60] = tri_id
+    if poke is not None:                                               # raw words, e.g. a NaN with a payload
+        mem.update(poke)
+        return mrt0_words(spv, memory=mem)
     return [u2f(w) for w in mrt0_words(spv, memory=mem)]
 
 
@@ -102,6 +105,16 @@ class TriangleSlots(unittest.TestCase):
                 self.assertEqual(r[:2], [-INF, -1.0])                 # copysign(inf, det), det
                 self.assertAlmostEqual(-r[2], w[1], places=6)
                 self.assertAlmostEqual(-r[3], w[2], places=6)
+
+
+    def test_a_nan_with_a_payload_returns_the_canonical_nan(self):
+        # Every NaN word is 0xFFC00000, whatever the input's payload: 0x7FC00001 would survive a canon() that
+        # passed its operand through (the KosmicKrisp workaround builds that select from bitwise ops, #6623).
+        # det is NaN, so word 0 is copysign(inf, det) with the canonical NaN's sign.
+        for nan in (0x7FC00001, 0x7F800001, 0xFFC12345):
+            with self.subTest(nan=hex(nan)):
+                self.assertEqual(run(0, 0x09, 0.2, 0.3, poke={NODE: nan}),
+                                 [0xFF800000, 0xFFC00000, 0xFFC00000, 0xFFC00000])
 
 
 class RemapByte(unittest.TestCase):
