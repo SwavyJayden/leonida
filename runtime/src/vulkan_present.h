@@ -375,15 +375,27 @@ public:
     // holds back the queue's own work; with nothing held this is the plain path. A blank present reads nothing and
     // is only ordered behind earlier presents. Waiting instead was rejected: the Signal that releases the work may
     // be one the application's own thread makes after Present returns. Like a full frame-latency queue, a Present that
-    // finds max_deferred_presents queued ahead of it does wait, for held work to release (logged once; set_abort ends
-    // the wait), so the queue behind never-released work is bounded. A queued Present reports its tear as false
-    // (last_present_tore()): the frame pacer's default sync.
+    // finds max_deferred_presents queued ahead of it waits for held work to release (logged once). If set_abort
+    // interrupts that wait, the present returns VK_NOT_READY before joining the queue. A queued Present reports its
+    // tear as false (last_present_tore()): the frame pacer's default sync.
     static constexpr std::size_t max_deferred_presents = 8;
 
     VkResult submit(const ResourceBinding* binding, ResourceId source, bool vsync, const PresentRect* source_rect,
                     bool srgb, bool tear = false, const PresentPlanes* planes = nullptr) {
-        wait_for_room();
-        std::lock_guard lock(present_mutex_);
+        std::unique_lock lock(present_mutex_);
+        if (deferred_.size() >= max_deferred_presents) {
+            // Release the lock while waiting so the thread draining the deferred queue can take it.
+            lock.unlock();
+            std::fprintf(stderr, "[rt] d3d12: %zu Presents are queued behind held work; this one waits for it\n",
+                         max_deferred_presents);
+            for (;;) {
+                if (should_abort()) return VK_NOT_READY;
+                lock.lock();
+                if (deferred_.size() < max_deferred_presents) break;
+                lock.unlock();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
         // `binding` null and `planes` null: clear instead of blit; `planes`: compose them (`binding`, `source`,
         // `source_rect` unused). Only a present that reads a texture waits for held work.
         if (deferred_.empty() && !((binding || planes) && context_.holds().any_held()))
@@ -406,24 +418,6 @@ private:
             abort = abort_;
         }
         return abort && abort();
-    }
-
-    // Called without present_mutex_: the thread that releases the queued presents needs it.
-    void wait_for_room() {
-        bool logged = false;
-        for (;;) {
-            {
-                std::lock_guard lock(present_mutex_);
-                if (deferred_.size() < max_deferred_presents) return;
-            }
-            if (!logged) {
-                logged = true;
-                std::fprintf(stderr, "[rt] d3d12: %zu Presents are queued behind held work; this one waits for it\n",
-                             max_deferred_presents);
-            }
-            if (should_abort()) return;
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
     }
 
     struct PendingPresent {
