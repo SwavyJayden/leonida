@@ -15,6 +15,7 @@
 #include <fstream>
 #include <sstream>
 #include <initializer_list>
+#include <iterator>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -352,6 +353,8 @@ void run_checks(const std::filesystem::path& root) {
         if (!na) na = ::GetTempFileNameA;
         wchar_t old_tmp[32768]{};
         DWORD old_len = ::GetEnvironmentVariableW(L"TMP", old_tmp, 32768);
+        wchar_t old_temp[32768]{};
+        DWORD old_temp_len = ::GetEnvironmentVariableW(L"TEMP", old_temp, 32768);
         wchar_t host[MAX_PATH]{}, actual[MAX_PATH]{}, filename[MAX_PATH]{}, second[MAX_PATH]{};
         ::GetTempPathW(MAX_PATH, host);
         check(pw(MAX_PATH, actual) && std::wstring(actual) == host, "host temporary path passes through unchanged");
@@ -360,6 +363,40 @@ void run_checks(const std::filesystem::path& root) {
         check(nw(host, L"hst", 0x1234, shim_name) == host_id && std::wstring(host_name) == shim_name,
               "host temporary file name passes through unchanged");
         const auto scratch = overlay / L".gta6rt-temp";
+        const auto subdir = scratch / L"existing";
+        std::filesystem::create_directories(subdir);
+        ::SetEnvironmentVariableW(L"TMP", L"T:\\existing");
+        check(pw(MAX_PATH, actual) && std::wstring(actual) == subdir.wstring() + L"\\",
+              "GetTempPathW preserves the configured subdirectory");
+        char sub_path[MAX_PATH]{};
+        check(pa(MAX_PATH, sub_path) && std::filesystem::path(sub_path).parent_path() == subdir,
+              "GetTempPathA preserves the configured subdirectory");
+        ::SetEnvironmentVariableW(L"TMP", nullptr);
+        ::SetEnvironmentVariableW(L"TEMP", L"GAME:\\existing");
+        check(pw(MAX_PATH, actual) && std::wstring(actual) == subdir.wstring() + L"\\",
+              "GetTempPathW preserves the TEMP subdirectory when TMP is absent");
+        check(nw(L"T:\\existing", L"sub", 0, filename) &&
+                  std::filesystem::path(filename).parent_path() == subdir && std::filesystem::exists(filename),
+              "GetTempFileNameW creates the file in the requested subdirectory");
+        char sub_name[MAX_PATH]{};
+        check(na("T:\\existing", "sub", 0, sub_name) &&
+                  std::filesystem::path(sub_name).parent_path() == subdir && std::filesystem::exists(sub_name),
+              "GetTempFileNameA creates the file in the requested subdirectory");
+        ::SetLastError(0);
+        const UINT missing = nw(L"T:\\missing", L"sub", 0, filename);
+        const DWORD missing_error = ::GetLastError();
+        if (missing || missing_error != ERROR_PATH_NOT_FOUND)
+            std::printf("NOTE missing temporary directory: result %u, error %lu\n", missing, missing_error);
+        check(!missing && missing_error == ERROR_PATH_NOT_FOUND && !std::filesystem::exists(scratch / L"missing"),
+              "a missing temporary subdirectory fails without creating it");
+        const auto entries_before = std::distance(std::filesystem::recursive_directory_iterator(scratch),
+                                                  std::filesystem::recursive_directory_iterator());
+        ::SetLastError(0);
+        const UINT refused = nw(L"GAME:\\..\\outside", L"bad", 0, filename);
+        check(!refused && ::GetLastError() == ERROR_INVALID_NAME && !std::filesystem::exists(overlay / L"outside") &&
+                  entries_before == std::distance(std::filesystem::recursive_directory_iterator(scratch),
+                                                  std::filesystem::recursive_directory_iterator()),
+              "a refused temporary path fails without creating a file");
         for (const wchar_t* drive : {L"GAME:\\", L"G:\\", L"T:\\"}) {
             ::SetEnvironmentVariableW(L"TMP", drive);
             DWORD host_result = ::GetTempPathW(MAX_PATH, host);
@@ -388,6 +425,7 @@ void run_checks(const std::filesystem::path& root) {
               "GetTempFileNameA honours the prefix and nonzero unique value");
         check(!std::filesystem::exists(package / L".gta6rt-temp"), "temporary files never enter the package");
         ::SetEnvironmentVariableW(L"TMP", old_len && old_len < 32768 ? old_tmp : nullptr);
+        ::SetEnvironmentVariableW(L"TEMP", old_temp_len && old_temp_len < 32768 ? old_temp : nullptr);
     }
 
     // A read of a package file, through the mixed-case prefix and through forward slashes.

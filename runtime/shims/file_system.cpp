@@ -1487,7 +1487,8 @@ BOOL WINAPI get_volume_path_name_a(LPCSTR name, LPSTR output, DWORD size) {
 // Console temporary directories always live in the writable overlay, independent of the package tree.
 static Target temp_directory(const std::wstring& path, bool& console) {
     size_t prefix_length = 0;
-    console = console_drive(path, prefix_length) != Drive::None;
+    const Drive drive = console_drive(path, prefix_length);
+    console = drive != Drive::None;
     if (!console) return {};
     std::vector<std::wstring> parts;
     if (parse_console(path, parts) == Parsed::Refused) return fail(ERROR_INVALID_NAME);
@@ -1498,7 +1499,8 @@ static Target temp_directory(const std::wstring& path, bool& console) {
     std::filesystem::create_directories(scratch, ec);
     if (ec) return fail(static_cast<DWORD>(ec.value()));
     Target target;
-    target.path = scratch;
+    if (drive == Drive::Scratch) parts.erase(parts.begin());
+    target.path = join(scratch, parts);
     return target;
 }
 
@@ -1511,6 +1513,18 @@ static std::wstring temp_environment() {
         if (length && length < size) return std::wstring(value.data(), length);
     }
     return {};
+}
+
+static void temp_name_error(const std::filesystem::path& directory) {
+    const DWORD error = ::GetLastError();
+    if (::GetFileAttributesW(directory.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        const DWORD attributes_error = ::GetLastError();
+        if (attributes_error == ERROR_FILE_NOT_FOUND || attributes_error == ERROR_PATH_NOT_FOUND) {
+            ::SetLastError(ERROR_PATH_NOT_FOUND);
+            return;
+        }
+    }
+    ::SetLastError(error);
 }
 
 DWORD WINAPI get_temp_path_w(DWORD size, LPWSTR buffer) {
@@ -1546,7 +1560,9 @@ UINT WINAPI get_temp_file_name_w(LPCWSTR path, LPCWSTR prefix, UINT unique, LPWS
     const Target target = temp_directory(path, console);
     if (!console) return ::GetTempFileNameW(path, prefix, unique, name);
     if (target.error) return fail_bool(target.error);
-    return ::GetTempFileNameW(target.path.c_str(), prefix, unique, name);
+    const UINT result = ::GetTempFileNameW(target.path.c_str(), prefix, unique, name);
+    if (!result) temp_name_error(target.path);
+    return result;
 }
 
 UINT WINAPI get_temp_file_name_a(LPCSTR path, LPCSTR prefix, UINT unique, LPSTR name) {
@@ -1560,7 +1576,9 @@ UINT WINAPI get_temp_file_name_a(LPCSTR path, LPCSTR prefix, UINT unique, LPSTR 
     if (!length) return 0;
     std::vector<char> ansi(static_cast<size_t>(length));
     narrow_ansi(wide, ansi.data(), ansi.size());
-    return ::GetTempFileNameA(ansi.data(), prefix, unique, name);
+    const UINT result = ::GetTempFileNameA(ansi.data(), prefix, unique, name);
+    if (!result) temp_name_error(target.path);
+    return result;
 }
 
 }  // namespace rt::fs
