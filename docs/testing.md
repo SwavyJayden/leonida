@@ -508,8 +508,12 @@ also advertises the feature but returns a wrong third `BaryCoordKHR` component, 
 expected (#5933: Vega 8, PCI 1002:15E7, driver 31.0.21921.13001). `ps_bary`, `ps_persp_bary` and `ps_ij_computed`
 fail natively; through the fallback `ps_bary` and `ps_persp_bary` pass. `tools/vk_subgroup_info.py` reports
 `barycentric_fallback` for these PCI IDs under `VK_DRIVER_ID_AMD_PROPRIETARY`, so `make_game.py` and
-`run_gpu_tests.py` turn the fallback on by themselves there, with the same `LEONIDA_BARY_FALLBACK` override. RADV and
-other GCN 5 GPUs are not covered: none has been measured.
+`run_gpu_tests.py` turn the fallback on by themselves there, with the same `LEONIDA_BARY_FALLBACK` override. RADV
+(Mesa 26.2.6) on the same Vega 8 doesn't list `VK_KHR_fragment_shader_barycentric` at all, though it sets the
+`fragmentShaderBarycentric` feature, so the four raw-barycentric tests skip there and pass with
+`LEONIDA_BARY_FALLBACK=1`, and `ps_interp_f16_high` passes through the f16 fallback that `run_gpu_tests.py` turns on
+by itself ([#166 entry](https://github.com/ItsNotRexed/Leonida/issues/166#issuecomment-7109387712)). Other GCN 5 GPUs
+are not covered: none has been measured.
 
 ## Macs: 16-bit interpolation without PerVertexKHR
 

@@ -28,8 +28,10 @@ driver. Its shader compiler can crash in vkCreateComputePipelines on emulated wa
 (#857, reported on RX 5000, RX 6000 and RDNA2 iGPUs). make_game.py prefers native wave64 when the GPU can run it.
 
 per_vertex_inputs says whether the device can run a pixel shader with PerVertexKHR inputs (16-bit interpolation,
-docs/design.md): the fragmentShaderBarycentric feature, and a driver other than MoltenVK, whose SPIR-V to MSL
-conversion rejects the decoration ("PerVertexKHR decoration is not supported in MSL", MoltenVK 1.4.2). Where it is
+docs/design.md): the fragmentShaderBarycentric feature with VK_KHR_fragment_shader_barycentric in the device's
+extension list, and a driver other than MoltenVK, whose SPIR-V to MSL conversion rejects the decoration
+("PerVertexKHR decoration is not supported in MSL", MoltenVK 1.4.2). The feature alone is not enough: RADV (Mesa
+26.2.6) fills it with a one on a gfx90c iGPU (Vega 8, PCI 1002:15E7) that doesn't list the extension. Where it is
 false, the shaders are translated with --f16-interp-fallback.
 
 barycentric_fallback is true for Intel's open-source Mesa driver (ANV). SHADER-925 found that Mesa ANV 26.2.5
@@ -92,6 +94,7 @@ VK_API_VERSION_1_2 = (1 << 22) | (2 << 12)
 VK_API_VERSION_1_3 = (1 << 22) | (3 << 12)
 VK_INCOMPLETE = 5
 VULKAN_12_REQUIRED_EXTENSIONS = frozenset((b"VK_KHR_dynamic_rendering", b"VK_KHR_synchronization2"))
+FRAGMENT_SHADER_BARYCENTRIC_EXTENSION = b"VK_KHR_fragment_shader_barycentric"
 
 PROPS_SIZE = 824            # sizeof(VkPhysicalDeviceProperties) on 64-bit
 FEATURES2_SIZE = 240        # sizeof(VkPhysicalDeviceFeatures2): 16 + 55 VkBool32, padded to 8
@@ -331,7 +334,9 @@ def query(*, stage_caps=False) -> dict:
                           subgroup.subgroupSize, subgroup.supportedStages, sg.minSubgroupSize, sg.maxSubgroupSize,
                           sg.requiredSubgroupSizeStages, sg.maxComputeWorkgroupSubgroups,
                           sgc,
-                          bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
+                          # The feature counts only with its extension listed (RADV sets it on gfx90c without one).
+                          bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK
+                          and FRAGMENT_SHADER_BARYCENTRIC_EXTENSION in device_extensions(vk, d),
                           int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
                           int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16))

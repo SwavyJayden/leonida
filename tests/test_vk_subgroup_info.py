@@ -49,7 +49,8 @@ class FakeDevice:
 
     name: str | bytes = "Synthetic GPU"
     api_version: int = vk_info.VK_API_VERSION_1_3
-    extension_names: tuple[bytes, ...] = ()
+    # Listed with the fragmentShaderBarycentric feature below, as a driver that exposes barycentrics lists both.
+    extension_names: tuple[bytes, ...] = (vk_info.FRAGMENT_SHADER_BARYCENTRIC_EXTENSION,)
     device_type: int = vk_info.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
     dynamic_rendering: bool = True
     synchronization2: bool = True
@@ -831,11 +832,19 @@ class QueryTest(unittest.TestCase):
                 self.assertEqual(res["max_push_constants_size"], limit)
 
     def test_per_vertex_inputs(self):
-        """PerVertexKHR needs fragmentShaderBarycentric, and MoltenVK can't compile it to MSL either way."""
-        for label, bary, driver, want in (("amd", True, 1, True), ("no_barycentrics", False, 1, False),
-                                          ("moltenvk", True, vk_info.VK_DRIVER_ID_MOLTENVK, False)):
+        """PerVertexKHR needs fragmentShaderBarycentric with its extension listed, and MoltenVK can't compile it to MSL
+        either way. RADV (Mesa 26.2.6) sets the feature on a gfx90c iGPU that doesn't list the extension."""
+        ext = (vk_info.FRAGMENT_SHADER_BARYCENTRIC_EXTENSION,)
+        for label, bary, names, driver, want in (
+            ("amd", True, ext, 1, True),
+            ("no_barycentrics", False, ext, 1, False),
+            ("moltenvk", True, ext, vk_info.VK_DRIVER_ID_MOLTENVK, False),
+            ("radv_gfx90c_feature_without_extension", True, (), 3, False),
+            ("other_extensions_only", True, (b"VK_KHR_dynamic_rendering",), 3, False),
+        ):
             with self.subTest(case=label):
-                res, _vk = self._run_query(FakeDevice(fragment_shader_barycentric=bary, driver_id=driver))
+                res, _vk = self._run_query(FakeDevice(fragment_shader_barycentric=bary, extension_names=names,
+                                                      driver_id=driver))
                 self.assertIs(res["per_vertex_inputs"], want)
 
     def test_barycentric_fallback(self):
