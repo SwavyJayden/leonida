@@ -74,7 +74,8 @@ def split_command(raw: str) -> list[str]:
     if "/" in raw or "\\" in raw:
         # A path whose extension is left out (C:\Program Files\LLVM\bin\llvm-mc): Windows finds llvm-mc.exe
         # for it, but it is no file under that exact name, so it used to be split at its spaces.
-        # On Python 3.11 Windows, shutil.which() does not append PATHEXT when a directory component is present.
+        # Fallback for interpreters before Python 3.12 on Windows, where shutil.which() does not apply PATHEXT
+        # when a directory component is present.
         if shutil.which(raw):
             return [raw]
         if os.name == "nt":
