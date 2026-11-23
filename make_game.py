@@ -61,7 +61,7 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 if __name__ == "__main__" and sys.version_info < (3, 12):   # before code an older Python can't run
     sys.exit("ERROR: Python 3.12 or newer is needed: https://www.python.org/downloads/")
@@ -2092,6 +2092,35 @@ def ttpf_manifest(pool_dir: str) -> dict | None:
     return doc
 
 
+class ExportFailed(Exception):
+    """An export step ended without its manifest; assets() turns it into the one build error."""
+
+
+def parallel_map(fn, items: list, workers: int, *, processes: bool = False, call=None, extra: tuple = (),
+                 on_done=None) -> list:
+    """Run fn(item) (or call(*item, *extra) in worker processes) for every item on up to `workers` workers and
+    return the results in item order. The first failure in item order is raised and the work not yet started is
+    dropped. One worker, or one item, runs inline: no pool, the same calls in the same order."""
+    if workers <= 1 or len(items) <= 1:
+        out = []
+        for item in items:
+            out.append(call(*item, *extra) if call else fn(item))
+            if on_done:
+                on_done()
+        return out
+    ex = (ProcessPoolExecutor if processes else ThreadPoolExecutor)(max_workers=min(workers, len(items)))
+    try:
+        futures = [ex.submit(call, *item, *extra) if call else ex.submit(fn, item) for item in items]
+        out = []
+        for fut in futures:
+            out.append(fut.result())
+            if on_done:
+                on_done()
+        return out
+    finally:
+        ex.shutdown(wait=True, cancel_futures=True)
+
+
 def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = None) -> None:
     # make_game.py also runs under python -I, which omits the script directory.
     if TOOLS not in sys.path:
@@ -2101,11 +2130,11 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
     get_exporter = functools.cache(rpf9dump)
     out = os.path.join(work, "assets")
 
-    def dump(*parts: str) -> None:
-        """Run rpf9dump; pass --jobs only when the build overlaps another CPU-heavy stage."""
+    def dump(*parts: str, jobs: int | None = None) -> None:
+        """Run rpf9dump; pass --jobs only when the build overlaps another CPU-heavy stage or runs exports side by side."""
         cmd = [get_exporter(work), *parts]
-        if dump_jobs is not None:
-            cmd.extend(["--jobs", str(dump_jobs)])
+        if jobs is not None:
+            cmd.extend(["--jobs", str(jobs)])
         run(cmd)
 
     # An export also depends on the decoder, so its digest is kept beside the manifest, written before the export
@@ -2186,30 +2215,54 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
              + int(need_wav) + int(need_xma) + int(need_xma_decode))
     progress = Progress("assets", total, every_s=2.0)
 
-    for rel, mode, folder, record, src in archive_todo:
-        log(f"assets: {mode} from {rel}")
+    # Each step below is independent of the others in its list, so it runs on up to --jobs workers. Results are
+    # taken in list order, so logs, the first failure and every output file are the same as in a serial run.
+    # rpf9dump is itself multi-threaded: the workers share the budget instead of each taking all of it.
+    def share(count: int) -> tuple[int, int | None]:
+        workers = max(1, min(jobs, count))
+        each = max(1, (dump_jobs or jobs) // workers) if workers > 1 else dump_jobs
+        return workers, each
+
+    def export_archive(item, each):
+        rel, mode, folder, record, src = item
         os.makedirs(folder, exist_ok=True)
         with open(record, "w", encoding="utf-8", newline="\n") as f:
             f.write(decoder + "\n")
-        dump(mode, src, out)
+        dump(mode, src, out, jobs=each)
         progress.tick(force=True)
-    for p, name, root, pool_dir, record in pool_todo:
-        log(f"assets: texture pool {os.path.relpath(p, game)}")
+
+    def export_pool(item, each):
+        p, name, root, pool_dir, record = item
         os.makedirs(pool_dir, exist_ok=True)
         with open(record, "w", encoding="utf-8", newline="\n") as f:
             f.write(decoder + "\n")
-        dump("ttpf", p, root)
+        dump("ttpf", p, root, jobs=each)
+        if ttpf_manifest(pool_dir) is None:
+            raise ExportFailed(f"Texture exporter did not publish a complete manifest in {pool_dir}")
+        progress.tick(force=True)
+
+    try:
+        for rel, mode, *_ in archive_todo:
+            log(f"assets: {mode} from {rel}")
+        workers, each = share(len(archive_todo))
+        parallel_map(lambda item: export_archive(item, each), archive_todo, workers)
+        for p, *_ in pool_todo:
+            log(f"assets: texture pool {os.path.relpath(p, game)}")
+        workers, each = share(len(pool_todo))
+        parallel_map(lambda item: export_pool(item, each), pool_todo, workers)
+    except ExportFailed as exc:
+        fail(str(exc))
+    for p, name, root, pool_dir, record in pool_follow:
         if ttpf_manifest(pool_dir) is None:
             fail(f"Texture exporter did not publish a complete manifest in {pool_dir}")
-        progress.tick(force=True)
-    for p, name, root, pool_dir, record in pool_follow:
-        manifest = ttpf_manifest(pool_dir)
-        if manifest is None:
-            fail(f"Texture exporter did not publish a complete manifest in {pool_dir}")
-        written, blocked = ttpf_assets.complete_pool(p, pool_dir, manifest, settings)
+    # Pure-Python decoding, so processes. The manifest is read here, the pool's files are written by the worker.
+    follow = [(p, pool_dir, ttpf_manifest(pool_dir)) for p, _, _, pool_dir, _ in pool_follow]
+    workers, _ = share(len(follow))
+    done = parallel_map(None, follow, workers, processes=True, call=ttpf_assets.complete_pool, extra=(settings,),
+                        on_done=lambda: progress.tick(force=True))
+    for (_, name, *_), (written, blocked) in zip(pool_follow, done):
         if written or blocked:
             log(f"assets: {name}: {written} full BCPack DDS written, {blocked} limited (see manifest.json)")
-        progress.tick(force=True)
     if need_audio:
         log("assets: audio banks")
         dump("audio", os.path.join(game, "audio.rpf"), out)
