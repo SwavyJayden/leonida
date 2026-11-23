@@ -1070,7 +1070,8 @@ int main() {
         list->OMSetRenderTargets(9, &rtv, TRUE, nullptr);
         EXPECT(list->Close() == E_INVALIDARG);
 
-        for (auto* r : {&vertex_buffer, &upload, &readback, &target, &uint_target}) r->reset();
+        for (auto* r : {&vertex_buffer, &upload, &readback, &target, &uint_target, &live_indices, &index_upload, &zero_indices})
+            r->reset();
         for (auto* p : {&mrt, &instanced, &refused, &unfed, &xor_pso, &fullscreen}) p->reset();
         pso.reset();
         root.reset();
