@@ -54,7 +54,8 @@ std::atomic<int> g_runtime_refs{0};
 //
 // A title linked against xgameruntime.lib doesn't import XGameRuntimeInitialize: the static library's thunks load
 // "xgameruntime.dll" and GetProcAddress these five names (measured in the package's libHttpClient.GDK.dll and
-// XCurl.dll, docs/runtime_imports.md). Signatures, the options struct and the error for an unknown class follow
+// XCurl.dll, docs/runtime_imports.md), and XGameRuntimeInitialize also looks up XErrorReport (below, next to
+// IXErrorImpl's slot 3). Signatures, the options struct and the error for an unknown class follow
 // xodus-gaming/xgameruntime-docs (GPL-3.0; facts only, nothing copied): InitializeApiImplEx2 is the one
 // XGameRuntimeInitialize[WithOptions] calls, and QueryApiImpl hands out the runtime's COM classes. XThreadingImpl,
 // XErrorImpl, XNetworkingImpl, XSystemImpl, XPackageImpl, XGameRuntimeFeatureImpl and XSystemAnalyticsImpl are
