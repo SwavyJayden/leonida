@@ -145,6 +145,52 @@ class OnlyCoherentAccessesChange(unittest.TestCase):
         self.assertEqual(m.coherent, set())
 
 
+class CoherentMipLoad(unittest.TestCase):
+    """image_load_mip glc (2D): the coherent read of mip 0 comes from the storage view; any other mip is zero."""
+
+    def mip_load(self, mods="glc dlc", dmask=0xF, regs="v[0:3]"):
+        return Module(translate([f"image_load_mip {regs}, v[4:6], s[0:7] dmask:0x{dmask:x} "
+                                 f"dim:SQ_RSRC_IMG_2D unorm {mods}"]))
+
+    def test_reads_the_coherent_storage_views_and_never_the_sampled_ones(self):
+        m = self.mip_load()
+        self.assertEqual(sorted(m.reads()), sorted((CLASS_TYPES[c], f"%stv{c}_0") for c in range(3)))
+        self.assertEqual(m.coherent, {"%stv0_0", "%stv1_0", "%stv2_0"})
+        self.assertNotIn("OpImageFetch", m.text)
+        self.assertEqual(m.chains_into("%images") + m.chains_into("%itx"), [])
+        self.assertLessEqual({"StorageImageReadWithoutFormat"}, m.caps)
+
+    def test_the_read_is_taken_only_when_the_mip_is_zero(self):
+        # v6 is the mip operand (v[4:6] = x, y, mip). The OpImageRead calls sit inside the branch taken on mip == 0.
+        m = self.mip_load()
+        zero = next(n for n, d in m.defs.items() if d == ("OpConstant", ["%uint", "0"]))
+        branch = next(i for i, (_, op, a) in enumerate(m.ops)
+                      if op == "OpBranchConditional" and m.defs.get(a[0], ("", []))[0] == "OpIEqual")
+        self.assertEqual(m.defs[m.ops[branch][2][0]][1][-1], zero)
+        merge = next(i for i, (r, op, _) in enumerate(m.ops) if op == "OpLabel" and r and r.endswith("_mipend"))
+        reads = [i for i, (_, op, _) in enumerate(m.ops) if op == "OpImageRead"]
+        self.assertEqual(len(reads), 3)
+        self.assertTrue(all(branch < i < merge for i in reads))
+
+    def test_other_mips_write_zero_to_every_result_register(self):
+        for dmask, regs, n in ((0xF, "v[0:3]", 4), (0x3, "v[0:1]", 2), (0x5, "v[0:1]", 2)):
+            with self.subTest(dmask=dmask):
+                text = self.mip_load(dmask=dmask, regs=regs).text
+                miss = text.split("_mipN = OpLabel")[1].split("_mipend = OpLabel")[0]
+                self.assertEqual(len(re.findall(r"OpStore %reg_v", miss)), n, miss)
+
+    def test_d16_packs_two_zero_halves_per_register(self):
+        m = self.mip_load("glc dlc d16", dmask=0xF, regs="v[0:1]")
+        self.assertEqual({v for _, v in m.reads()}, {"%stv0_0", "%stv1_0", "%stv2_0"})
+        self.assertNotIn("OpImageFetch", m.text)
+
+    def test_negative_control_plain_mip_load_stays_on_the_sampled_path(self):
+        m = self.mip_load(mods="")
+        self.assertEqual(m.reads(), [])
+        self.assertIn("OpImageFetch", m.text)
+        self.assertEqual(m.coherent, set())
+
+
 class UnmodelledCoherentReads(unittest.TestCase):
     def check_refused(self, line):
         with self.assertRaises(rdna2spirv.Unsupported):
@@ -156,7 +202,9 @@ class UnmodelledCoherentReads(unittest.TestCase):
 
     def test_a_coherent_load_without_a_storage_view_is_refused(self):
         self.check_refused("image_load v[0:3], v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D_MSAA unorm glc dlc")
-        self.check_refused("image_load_mip v[0:3], v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D unorm glc dlc")
+        self.check_refused("image_load_mip v[0:3], v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY unorm glc dlc")
+        self.check_refused("image_load_mip v[0:3], v[4:7], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_3D unorm glc dlc")
+        self.check_refused("image_load_mip v[0:4], v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D unorm glc tfe")
 
 
 @unittest.skipUnless(shutil.which("spirv-as") and shutil.which("spirv-val"), "needs spirv-as and spirv-val")
@@ -168,6 +216,17 @@ class Validation(unittest.TestCase):
                     sa, sv = os.path.join(tmp, f"{dim}.spvasm"), os.path.join(tmp, f"{dim}.spv")
                     with open(sa, "w", encoding="utf-8") as f:
                         f.write(rmw(dim))
+                    result = rdna2spirv.assemble_spirv(sa, sv)
+                    self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def test_spirv_val_accepts_a_coherent_mip_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, mods, regs in (("f32", "glc dlc", "v[0:3]"), ("d16", "glc dlc d16", "v[0:1]")):
+                with self.subTest(form=name):
+                    text = translate([f"image_load_mip {regs}, v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D unorm {mods}"])
+                    sa, sv = os.path.join(tmp, f"{name}.spvasm"), os.path.join(tmp, f"{name}.spv")
+                    with open(sa, "w", encoding="utf-8") as f:
+                        f.write(text)
                     result = rdna2spirv.assemble_spirv(sa, sv)
                     self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
 
