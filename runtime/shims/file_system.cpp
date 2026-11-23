@@ -184,7 +184,7 @@ Drive console_drive(const std::wstring& path, size_t& prefix_length) {
     return letter == L'g' ? Drive::Game : Drive::Scratch;
 }
 
-Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts) {
+Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts, bool create_scratch = true) {
     size_t prefix_length = 0;
     const Drive drive = console_drive(path, prefix_length);
     if (drive == Drive::None) return Parsed::Host;
@@ -194,7 +194,7 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
         const std::filesystem::path overlay = roots().overlay;
         const DWORD last_error = ::GetLastError();
         std::error_code ec;
-        if (!overlay.empty()) std::filesystem::create_directories(win32_io_path(overlay / kScratchDir), ec);
+        if (create_scratch && !overlay.empty()) std::filesystem::create_directories(win32_io_path(overlay / kScratchDir), ec);
         ::SetLastError(last_error);
     }
     const size_t floor = parts.size();  // ".." may not climb out of the drive's own root
@@ -1411,7 +1411,7 @@ BOOL WINAPI get_volume_information_w(LPCWSTR name, LPWSTR label, DWORD label_siz
                                      LPDWORD max_component, LPDWORD flags, LPWSTR filesystem, DWORD filesystem_size) {
     if (!name) return ::GetVolumeInformationW(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
     std::vector<std::wstring> parts;
-    const Parsed parsed = parse_console(name, parts);
+    const Parsed parsed = parse_console(name, parts, false);
     if (parsed == Parsed::Host) return ::GetVolumeInformationW(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
     if (parsed == Parsed::Refused || !drive_root(name, parts)) return fail_bool(ERROR_INVALID_NAME);
     std::wstring root;
@@ -1424,7 +1424,7 @@ BOOL WINAPI get_volume_information_a(LPCSTR name, LPSTR label, DWORD label_size,
     if (!name) return ::GetVolumeInformationA(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
     const std::wstring wide = widen_ansi(name);
     std::vector<std::wstring> parts;
-    const Parsed parsed = parse_console(wide, parts);
+    const Parsed parsed = parse_console(wide, parts, false);
     if (parsed == Parsed::Host) return ::GetVolumeInformationA(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
     if (parsed == Parsed::Refused || !drive_root(wide, parts)) return fail_bool(ERROR_INVALID_NAME);
     std::wstring root;
@@ -1445,7 +1445,7 @@ BOOL WINAPI get_volume_information_a(LPCSTR name, LPSTR label, DWORD label_size,
 BOOL WINAPI get_volume_path_name_w(LPCWSTR name, LPWSTR output, DWORD size) {
     if (!name) return ::GetVolumePathNameW(name, output, size);
     std::vector<std::wstring> parts;
-    const Parsed parsed = parse_console(name, parts);
+    const Parsed parsed = parse_console(name, parts, false);
     if (parsed == Parsed::Host) return ::GetVolumePathNameW(name, output, size);
     if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
     size_t prefix = 0;
@@ -1460,7 +1460,7 @@ BOOL WINAPI get_volume_path_name_a(LPCSTR name, LPSTR output, DWORD size) {
     if (!name) return ::GetVolumePathNameA(name, output, size);
     const std::wstring wide = widen_ansi(name);
     std::vector<std::wstring> parts;
-    const Parsed parsed = parse_console(wide, parts);
+    const Parsed parsed = parse_console(wide, parts, false);
     if (parsed == Parsed::Host) return ::GetVolumePathNameA(name, output, size);
     if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
     size_t prefix = 0;

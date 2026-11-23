@@ -229,6 +229,24 @@ void run_checks(const std::filesystem::path& root) {
         check(info && info(L"GAME:\\", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
               !std::filesystem::exists(missing_overlay.parent_path()),
               "volume query falls back to the package without creating the overlay");
+        const auto info_a_missing = resolve<decltype(&::GetVolumeInformationA)>("kernel32.dll", "GetVolumeInformationA");
+        const auto path_w_missing = resolve<decltype(&::GetVolumePathNameW)>("kernel32.dll", "GetVolumePathNameW");
+        const auto path_a_missing = resolve<decltype(&::GetVolumePathNameA)>("kernel32.dll", "GetVolumePathNameA");
+        wchar_t root_w[MAX_PATH]{};
+        char root_a[MAX_PATH]{};
+        check(info && !info(L"T:\\..\\bad", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
+              !std::filesystem::exists(missing_overlay.parent_path()), "rejected T: volume information W leaves overlay absent");
+        check(info_a_missing && !info_a_missing("T:\\..\\bad", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
+              !std::filesystem::exists(missing_overlay.parent_path()), "rejected T: volume information A leaves overlay absent");
+        check(path_w_missing && !path_w_missing(L"T:\\..\\bad", root_w, MAX_PATH) &&
+              !std::filesystem::exists(missing_overlay.parent_path()), "rejected T: volume path W leaves overlay absent");
+        check(path_a_missing && !path_a_missing("T:\\..\\bad", root_a, MAX_PATH) &&
+              !std::filesystem::exists(missing_overlay.parent_path()), "rejected T: volume path A leaves overlay absent");
+        check(info && info(L"T:\\", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
+              info_a_missing && info_a_missing("T:\\", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
+              path_w_missing && path_w_missing(L"T:\\file", root_w, MAX_PATH) && std::wstring(root_w) == L"T:\\" &&
+              path_a_missing && path_a_missing("T:\\file", root_a, MAX_PATH) && std::string(root_a) == "T:\\" &&
+              !std::filesystem::exists(missing_overlay.parent_path()), "valid T: volume queries succeed without creating overlay");
         const auto missing_game = root / "missing-game";
         rt::fs::configure(missing_game, missing_overlay);
         check(info && !info(L"GAME:\\", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
