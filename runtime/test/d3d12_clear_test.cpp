@@ -392,7 +392,7 @@ bool check_depth_clear_edge_values(ID3D12Device* host, ID3D12Device* ours) {
         if (!read(host, depth_full, depth_part, part_no_flags, expected)) return false;
         if (!read(ours, depth_full, depth_part, part_no_flags, got)) return false;
         CHECK(expected.size() == width * height * 4 && got.size() == expected.size());
-        size_t wrong = 0;
+        size_t wrong = 0, nan_canonicalized = 0;
         for (UINT y = 0; y < height; ++y)
             for (UINT x = 0; x < width; ++x) {
                 const size_t at = (width * y + x) * 4;
@@ -406,12 +406,28 @@ bool check_depth_clear_edge_values(ID3D12Device* host, ID3D12Device* ours) {
                     FLOAT warp_value, layer_value;
                     std::memcpy(&warp_value, expected.data() + at, 4);
                     std::memcpy(&layer_value, got.data() + at, 4);
-                    std::fprintf(stderr, "%s (%u,%u): layer cleared %g, WARP %g\n", what, x, y, layer_value,
-                                 warp_value);
-                    ++wrong;
+                    // AMD Vulkan drivers canonicalize a NaN depth clear to 1.0 in vkCmdClearDepthStencilImage /
+                    // vkCmdClearAttachments even with VK_EXT_depth_range_unrestricted.
+                    if (std::isnan(want) && std::isnan(warp_value) && layer_value == 1.0f) {
+                        ++nan_canonicalized;
+                    } else {
+                        std::fprintf(stderr, "%s (%u,%u): layer cleared %g, WARP %g\n", what, x, y, layer_value,
+                                     warp_value);
+                        ++wrong;
+                    }
                 }
             }
         if (wrong) return false;
+        if (nan_canonicalized == width * height) {
+            std::printf("%s: layer cleared 1.0 on all %ux%u texels (Vulkan driver canonicalizes NaN depth clear; "
+                        "WARP nan)\n", what, width, height);
+            return true;
+        }
+        if (nan_canonicalized) {
+            std::fprintf(stderr, "%s: only %zu of %u texels canonicalized NaN to 1.0\n", what, nan_canonicalized,
+                         width * height);
+            return false;
+        }
         std::printf("%s: %ux%u depth texels match WARP\n", what, width, height);
         return true;
     };
