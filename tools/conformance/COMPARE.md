@@ -107,7 +107,9 @@ FAIL  blend        (128,128)     expected 105,25,45,255      got 200,30,60  (0.5
 - A missing, truncated or corrupt image is one scene-level FAIL carrying the
   reader's message (path, byte offset or CRC), and the scene's declared checks
   are counted as failed in the summary.
-- Exit code is 0 only when every check passed.
+- Exit code is 0 when every check passed, 1 for a pixel-check failure, and 2
+  when an image cannot be read. If a run has both image errors and pixel-check
+  failures, it exits 2 after reporting all scenes.
 
 `expect` does not verify that the manifest's checks are the right expectations.
 That is the scene contract's job; this tool checks the pixels against whatever
