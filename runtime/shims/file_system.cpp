@@ -1394,12 +1394,15 @@ BOOL WINAPI set_file_attributes_a(LPCSTR name, DWORD attributes) {
 }
 
 // Resolve the backing volume without exposing its host root to the title.
-bool volume_host_root(std::wstring& result) {
+bool volume_host_root(const std::wstring& name, std::wstring& result) {
     const Roots r = roots();
-    auto dir = r.overlay;
+    size_t prefix = 0;
+    const Drive drive = console_drive(name, prefix);
+    const bool package_volume = drive == Drive::Game && prefix == 2;
+    auto dir = package_volume ? r.game : r.overlay;
     const DWORD attributes = dir.empty() ? INVALID_FILE_ATTRIBUTES : ::GetFileAttributesW(dir.c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES) {
-        if (r.game.empty() || ::GetFileAttributesW(r.game.c_str()) == INVALID_FILE_ATTRIBUTES)
+        if (package_volume || r.game.empty() || ::GetFileAttributesW(r.game.c_str()) == INVALID_FILE_ATTRIBUTES)
             return fail_bool(ERROR_PATH_NOT_FOUND);
         if (dir.empty()) dir = r.game;
         while (!dir.empty() && ::GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES) {
@@ -1424,7 +1427,7 @@ BOOL WINAPI get_volume_information_w(LPCWSTR name, LPWSTR label, DWORD label_siz
     if (parsed == Parsed::Host) return ::GetVolumeInformationW(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
     if (parsed == Parsed::Refused || !drive_root(name, parts)) return fail_bool(ERROR_INVALID_NAME);
     std::wstring root;
-    if (!volume_host_root(root)) return FALSE;
+    if (!volume_host_root(name, root)) return FALSE;
     return ::GetVolumeInformationW(root.c_str(), label, label_size, serial, max_component, flags, filesystem, filesystem_size);
 }
 
@@ -1437,7 +1440,7 @@ BOOL WINAPI get_volume_information_a(LPCSTR name, LPSTR label, DWORD label_size,
     if (parsed == Parsed::Host) return ::GetVolumeInformationA(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
     if (parsed == Parsed::Refused || !drive_root(wide, parts)) return fail_bool(ERROR_INVALID_NAME);
     std::wstring root;
-    if (!volume_host_root(root)) return FALSE;
+    if (!volume_host_root(wide, root)) return FALSE;
     // Keep the mount path Unicode; only the two returned strings use the caller's ANSI code page.
     wchar_t wide_label[MAX_PATH]{}, wide_filesystem[MAX_PATH]{};
     if (!::GetVolumeInformationW(root.c_str(), label && label_size ? wide_label : nullptr,
