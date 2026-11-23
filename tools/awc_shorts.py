@@ -27,7 +27,7 @@ import awc_opus as awc  # noqa: E402
 from file_mode import published_mode  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
-from report_paths import path_key  # noqa: E402
+from report_paths import path_key, same_report_path  # noqa: E402
 
 FIELDS = ("bank", "stream", "duration_s", "channels", "packets", "file")
 
@@ -157,6 +157,11 @@ def main(argv=None) -> int:
     except OSError as e:
         print(f"awc_shorts: cannot list {e.filename or a.src}: {e.strerror or e}", file=sys.stderr)
         return 2
+    catalog = os.path.join(a.out, "shorts.csv")
+    for path, _ in banks:
+        if same_report_path(catalog, path):
+            print(f"awc_shorts: error: catalog would overwrite the input bank {path}", file=sys.stderr)
+            return 2
     try:
         os.makedirs(a.out, exist_ok=True)
     except OSError as e:
@@ -165,6 +170,9 @@ def main(argv=None) -> int:
     destinations = {}
     for path, bank in banks:
         target = os.path.join(a.out, bank)
+        if same_report_path(catalog, target):
+            print(f"awc_shorts: error: catalog would collide with bank export directory {target}", file=sys.stderr)
+            return 2
         key = path_key(target)
         if key in destinations:
             print(f"awc_shorts: error: {destinations[key]} and {path} would both export to {target}", file=sys.stderr)

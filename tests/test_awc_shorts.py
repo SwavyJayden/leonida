@@ -287,6 +287,32 @@ class ShortsTest(unittest.TestCase):
         import awc_shorts
         self.check_truncated_bank_skipped(awc_shorts, 2)
 
+    def test_catalog_collision_with_input_bank_rejected(self):
+        bank = os.path.join(self.tmp.name, "shorts.csv")
+        with open(bank, "wb") as f:
+            f.write(b"original input bank data")
+        out = self.tmp.name
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = shorts.main([bank, out, "--jobs", "1"])
+        self.assertEqual(rc, 2)
+        self.assertIn("catalog would overwrite the input bank", err.getvalue())
+        self.assertEqual(len(err.getvalue().splitlines()), 1)
+        with open(bank, "rb") as f:
+            self.assertEqual(f.read(), b"original input bank data")
+
+    def test_catalog_collision_with_bank_export_directory_rejected(self):
+        bank = os.path.join(self.tmp.name, "shorts.csv.awc")
+        with open(bank, "wb") as f:
+            f.write(b"bank data")
+        out = self.tmp.name
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = shorts.main([bank, out, "--jobs", "1"])
+        self.assertEqual(rc, 2)
+        self.assertIn("catalog would collide with bank export directory", err.getvalue())
+        self.assertEqual(len(err.getvalue().splitlines()), 1)
+        with open(bank, "rb") as f:
+            self.assertEqual(f.read(), b"bank data")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
