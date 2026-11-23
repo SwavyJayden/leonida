@@ -7554,6 +7554,12 @@ public:
         constexpr VkSampleCountFlags d3d12_multisample_sample_counts =
             VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT |
             VK_SAMPLE_COUNT_16_BIT | VK_SAMPLE_COUNT_32_BIT;
+        // Some 10.0.26100 SDKs end the D3D12_FEATURE enum before APPLICATION_SPECIFIC_DRIVER_STATE (56) and
+        // BYTECODE_BYPASS_HASH_SUPPORTED (57) (d3d12_feature_compat.h), and a case label outside the enum is MSVC
+        // C4063, so these two are answered before the switch: one BOOL, not supported.
+        if (feature == compat::kFeatureApplicationSpecificDriverState ||
+            feature == compat::kFeatureBytecodeBypassHashSupported)
+            return write_supported_feature<compat::FeatureSupportFlag>(method, data, size, FALSE);
         switch (feature) {
         case D3D12_FEATURE_FEATURE_LEVELS: {
             if (size != sizeof(D3D12_FEATURE_DATA_FEATURE_LEVELS)) return d3d12_trace::result(method, E_INVALIDARG);
@@ -8264,10 +8270,6 @@ public:
         case compat::kFeaturePredication:
             return write_supported_feature<compat::FeatureSupportFlag>(
                 method, data, size, state_.info.conditional_rendering ? TRUE : FALSE);
-        case compat::kFeatureApplicationSpecificDriverState:
-            return write_supported_feature<compat::FeatureSupportFlag>(method, data, size, FALSE);
-        case compat::kFeatureBytecodeBypassHashSupported:
-            return write_supported_feature<compat::FeatureSupportFlag>(method, data, size, FALSE);
         default:
             // Not answered yet. The log above lists every query; answers are added as the trace asks for them.
             return d3d12_trace::result(method, E_INVALIDARG);
