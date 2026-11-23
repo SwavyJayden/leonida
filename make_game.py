@@ -1717,7 +1717,8 @@ def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, boo
     if exe:
         try:
             r = subprocess.run([exe], capture_output=True, text=True, errors="replace", timeout=120)
-            size = smallest_max_subgroup(r.stdout)
+            if r.returncode == 0:
+                size = smallest_max_subgroup(r.stdout)
         except (OSError, subprocess.SubprocessError):
             size = None
     if size is None:
