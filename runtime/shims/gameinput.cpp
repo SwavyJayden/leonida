@@ -955,8 +955,6 @@ bool deliver_within(uint64_t quota_us) {
 
 uint16_t to_u16(float v) { return static_cast<uint16_t>(std::lround(std::clamp(v, 0.0f, 1.0f) * 65535.0f)); }
 
-float axis(SDL_Gamepad* p, SDL_GamepadAxis a) { return std::max(-1.0f, SDL_GetGamepadAxis(p, a) / 32767.0f); }
-
 float norm(float v, float max) { return std::clamp(v / max, -1.0f, 1.0f); }
 
 bool is_keyboard_pad(SDL_JoystickID jid);  // with the keyboard pad below
@@ -1032,10 +1030,23 @@ void apply_prompt_config() {
                      leonida::input_family_name(g_tracker.active()));
 }
 
-Snapshot read_pad(Device* d) {
-    SDL_Gamepad* p = d->pad;
-    Snapshot s;
-    auto down = [p](SDL_GamepadButton b) { return SDL_GetGamepadButton(p, b); };
+void set_pad_axis(Snapshot& s, SDL_GamepadAxis axis, Sint16 value) {
+    static constexpr float GameInputGamepadState::* kFields[] = {
+        &GameInputGamepadState::leftThumbstickX, &GameInputGamepadState::leftThumbstickY,
+        &GameInputGamepadState::rightThumbstickX, &GameInputGamepadState::rightThumbstickY,
+        &GameInputGamepadState::leftTrigger, &GameInputGamepadState::rightTrigger,
+    };
+    static_assert(SDL_GAMEPAD_AXIS_COUNT == kAxisCount && SDL_GAMEPAD_AXIS_RIGHT_TRIGGER == kAxisCount - 1);
+    // GameInput sticks use +Y up; the controller-axis view puts stick rest at 0.5. Triggers use 0..1 in both views.
+    float v = std::max(-1.0f, value / 32767.0f);
+    if (axis == SDL_GAMEPAD_AXIS_LEFTY || axis == SDL_GAMEPAD_AXIS_RIGHTY) v = -v;
+    const bool trigger = axis >= SDL_GAMEPAD_AXIS_LEFT_TRIGGER;
+    if (trigger) v = std::max(0.0f, v);
+    s.gamepad.*kFields[axis] = v;
+    s.axes[axis] = trigger ? v : (v + 1) * 0.5f;
+}
+
+void map_pad_buttons_and_navigation(Snapshot& s) {
     struct Map { SDL_GamepadButton sdl; uint32_t gi; };
     static const Map kMap[] = {
         {SDL_GAMEPAD_BUTTON_START, GameInputGamepadMenu},
@@ -1053,55 +1064,16 @@ Snapshot read_pad(Device* d) {
         {SDL_GAMEPAD_BUTTON_LEFT_STICK, GameInputGamepadLeftThumbstick},
         {SDL_GAMEPAD_BUTTON_RIGHT_STICK, GameInputGamepadRightThumbstick},
     };
+    s.gamepad.buttons = 0;
     for (const Map& m : kMap)
-        if (down(m.sdl)) s.gamepad.buttons |= m.gi;
-    // GameInput: sticks in -1..1 with +Y up, triggers in 0..1. SDL: +Y down, -32768..32767, triggers 0..32767.
-    s.gamepad.leftThumbstickX = axis(p, SDL_GAMEPAD_AXIS_LEFTX);
-    s.gamepad.leftThumbstickY = -axis(p, SDL_GAMEPAD_AXIS_LEFTY);
-    s.gamepad.rightThumbstickX = axis(p, SDL_GAMEPAD_AXIS_RIGHTX);
-    s.gamepad.rightThumbstickY = -axis(p, SDL_GAMEPAD_AXIS_RIGHTY);
-    s.gamepad.leftTrigger = std::max(0.0f, axis(p, SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
-    s.gamepad.rightTrigger = std::max(0.0f, axis(p, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
-
-    // Controller axes, 0..1 with 0.5 at rest for the sticks (VERIFY: the raw-axis convention of a GameInput gamepad).
-    s.axes[0] = (s.gamepad.leftThumbstickX + 1) * 0.5f;
-    s.axes[1] = (s.gamepad.leftThumbstickY + 1) * 0.5f;
-    s.axes[2] = (s.gamepad.rightThumbstickX + 1) * 0.5f;
-    s.axes[3] = (s.gamepad.rightThumbstickY + 1) * 0.5f;
-    s.axes[4] = s.gamepad.leftTrigger;
-    s.axes[5] = s.gamepad.rightTrigger;
-    for (uint32_t i = 0; i < kButtonCount; ++i) s.buttons[i] = down(static_cast<SDL_GamepadButton>(i));
-    s.guide = down(SDL_GAMEPAD_BUTTON_GUIDE);
-
-    // Motion, normalised against the maxima motionInfo reports (the ABI's fraction convention). Sensors were enabled
-    // when the pad was opened; a pad whose sensor read fails just reports no motion this poll. SDL answers reads
-    // with zeros before the device's first sample arrives, and gravity makes a real accelerometer never read
-    // exactly zero, so all-zero accel means "no sample yet" and the reading carries no motion at all.
-    if (d->has_motion) {
-        float accel[3], gyro[3];
-        if (SDL_GetGamepadSensorData(p, SDL_SENSOR_ACCEL, accel, 3) &&
-            SDL_GetGamepadSensorData(p, SDL_SENSOR_GYRO, gyro, 3) &&
-            (accel[0] != 0.0f || accel[1] != 0.0f || accel[2] != 0.0f)) {
-            s.has_motion = true;
-            s.motion.accelerationX = norm(accel[0], kMaxAcceleration);
-            s.motion.accelerationY = norm(accel[1], kMaxAcceleration);
-            s.motion.accelerationZ = norm(accel[2], kMaxAcceleration);
-            s.motion.angularVelocityX = norm(gyro[0], kMaxAngularVelocity);
-            s.motion.angularVelocityY = norm(gyro[1], kMaxAngularVelocity);
-            s.motion.angularVelocityZ = norm(gyro[2], kMaxAngularVelocity);
-            // SDL's gamepad API has no compass and the shim synthesises no orientation, so those stay zero and
-            // unknown rather than a made-up value.
-            s.motion.accelerometerAccuracy = GameInputMotionAccuracyHigh;
-            s.motion.gyroscopeAccuracy = GameInputMotionAccuracyHigh;
-            s.motion.magnetometerAccuracy = GameInputMotionAccuracyUnknown;
-            s.motion.orientationAccuracy = GameInputMotionAccuracyUnknown;
-        }
-    }
+        if (s.buttons[m.sdl]) s.gamepad.buttons |= m.gi;
+    s.guide = s.buttons[SDL_GAMEPAD_BUTTON_GUIDE];
 
     // UI navigation derived from the gamepad (VERIFY against the console's own mapping).
     const uint32_t b = s.gamepad.buttons;
     const float t = 0.5f;
     uint32_t& u = s.ui;
+    u = 0;
     if (b & GameInputGamepadMenu) u |= GameInputUiNavigationMenu;
     if (b & GameInputGamepadView) u |= GameInputUiNavigationView;
     if (b & GameInputGamepadA) u |= GameInputUiNavigationAccept;
@@ -1122,6 +1094,38 @@ Snapshot read_pad(Device* d) {
     if (s.gamepad.rightThumbstickY < -t) u |= GameInputUiNavigationScrollDown;
     if (s.gamepad.rightThumbstickX < -t) u |= GameInputUiNavigationScrollLeft;
     if (s.gamepad.rightThumbstickX > t) u |= GameInputUiNavigationScrollRight;
+}
+
+Snapshot read_pad(Device* d) {
+    SDL_Gamepad* p = d->pad;
+    Snapshot s;
+    for (uint32_t i = 0; i < kAxisCount; ++i) {
+        const auto axis = static_cast<SDL_GamepadAxis>(i);
+        set_pad_axis(s, axis, SDL_GetGamepadAxis(p, axis));
+    }
+    for (uint32_t i = 0; i < kButtonCount; ++i) s.buttons[i] = SDL_GetGamepadButton(p, static_cast<SDL_GamepadButton>(i));
+    map_pad_buttons_and_navigation(s);
+
+    // SDL supplies zeros before the first sensor sample. Use nonzero acceleration to detect the first sample.
+    if (d->has_motion) {
+        float accel[3], gyro[3];
+        if (SDL_GetGamepadSensorData(p, SDL_SENSOR_ACCEL, accel, 3) &&
+            SDL_GetGamepadSensorData(p, SDL_SENSOR_GYRO, gyro, 3) &&
+            (accel[0] != 0.0f || accel[1] != 0.0f || accel[2] != 0.0f)) {
+            s.has_motion = true;
+            s.motion.accelerationX = norm(accel[0], kMaxAcceleration);
+            s.motion.accelerationY = norm(accel[1], kMaxAcceleration);
+            s.motion.accelerationZ = norm(accel[2], kMaxAcceleration);
+            s.motion.angularVelocityX = norm(gyro[0], kMaxAngularVelocity);
+            s.motion.angularVelocityY = norm(gyro[1], kMaxAngularVelocity);
+            s.motion.angularVelocityZ = norm(gyro[2], kMaxAngularVelocity);
+            // SDL supplies neither compass nor orientation data.
+            s.motion.accelerometerAccuracy = GameInputMotionAccuracyHigh;
+            s.motion.gyroscopeAccuracy = GameInputMotionAccuracyHigh;
+            s.motion.magnetometerAccuracy = GameInputMotionAccuracyUnknown;
+            s.motion.orientationAccuracy = GameInputMotionAccuracyUnknown;
+        }
+    }
     return s;
 }
 
@@ -1911,18 +1915,75 @@ bool init_sdl() {
 #ifdef SDL_HINT_JOYSTICK_GAMEINPUT
     SDL_SetHint(SDL_HINT_JOYSTICK_GAMEINPUT, "0");
 #endif
-    SDL_SetGamepadEventsEnabled(false);  // the shim reads state directly; nothing drains an event queue
     if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
         std::fprintf(stderr, "[rt] gameinput: SDL gamepad init failed: %s; no controllers\n", SDL_GetError());
         s.sdl_failed = true;
         return false;
     }
     SDL_SetGamepadEventsEnabled(false);
+    SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_AXIS_MOTION, true);
+    SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_BUTTON_DOWN, true);
+    SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_BUTTON_UP, true);
     s.sdl_ready = true;
     const int v = SDL_GetVersion();
     std::fprintf(stderr, "[rt] gameinput: SDL %d.%d.%d gamepads\n", SDL_VERSIONNUM_MAJOR(v), SDL_VERSIONNUM_MINOR(v),
                  SDL_VERSIONNUM_MICRO(v));
     return true;
+}
+
+std::vector<SDL_Event> take_pad_events() {
+    // SDL translates joystick events into gamepad events synchronously. Drain the underlying joystick queue
+    // as well so this headless input loop cannot fill SDL's queue with events it has already handled.
+    SDL_FlushEvents(SDL_EVENT_JOYSTICK_AXIS_MOTION, SDL_EVENT_JOYSTICK_UPDATE_COMPLETE);
+    SDL_FlushEvents(SDL_EVENT_GAMEPAD_ADDED, SDL_EVENT_GAMEPAD_STEAM_HANDLE_UPDATED);
+    constexpr auto first = SDL_EVENT_GAMEPAD_AXIS_MOTION;
+    constexpr auto last = SDL_EVENT_GAMEPAD_BUTTON_UP;
+    const int count = SDL_PeepEvents(nullptr, 0, SDL_PEEKEVENT, first, last);
+    if (count <= 0) return {};
+    std::vector<SDL_Event> events(count);
+    const int taken = SDL_PeepEvents(events.data(), count, SDL_GETEVENT, first, last);
+    events.resize(std::max(taken, 0));
+    return events;
+}
+
+void publish_pad_sample(Device* d, const Snapshot& snap, uint64_t now, bool motion_tick = false) {
+    const bool guide_changed = d->last_snap.guide != snap.guide;
+    const bool changed = !(d->last_snap == snap);
+    d->last_snap = snap;
+    // The first observation of a newly opened pad is a baseline, even if a button is held.
+    if (const leonida::InputEdge edge = g_tracker.observe(d->id, d->family, sample_of(snap), now);
+        edge != leonida::InputEdge::None) {
+        publish_active();
+        if (!g_tracker.forced())
+            std::fprintf(stderr, "[rt] gameinput: input in use: %s (%s, %s)\n",
+                         leonida::input_family_name(d->family), d->name.c_str(), leonida::input_edge_name(edge));
+    }
+    if (!changed && !motion_tick) return;
+    std::lock_guard lock(g().mu);
+    queue_event({CbType::Reading, d, push_reading(d, snap, now), now, 0, 0, false, 0});
+    if (guide_changed) queue_event({CbType::Guide, d, nullptr, now, 0, 0, snap.guide, 0});
+}
+
+void replay_pad_events(Device* d, const std::vector<SDL_Event>& events, uint64_t now) {
+    std::optional<Snapshot> pending;
+    Uint64 timestamp = 0;
+    for (const SDL_Event& e : events) {
+        const bool axis = e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION;
+        const SDL_JoystickID id = axis ? e.gaxis.which : e.gbutton.which;
+        const uint32_t index = axis ? e.gaxis.axis : e.gbutton.button;
+        if (id != d->id || index >= (axis ? kAxisCount : kButtonCount)) continue;
+
+        if (!pending) {
+            pending = d->last_snap;
+        } else if (timestamp != e.common.timestamp) {
+            map_pad_buttons_and_navigation(*pending);
+            publish_pad_sample(d, *pending, now);
+        }
+        timestamp = e.common.timestamp;
+        if (axis) set_pad_axis(*pending, static_cast<SDL_GamepadAxis>(index), e.gaxis.value);
+        else pending->buttons[index] = e.gbutton.down;
+    }
+    // The final group is represented by the fresh snapshot, which also picks up motion and raw HID state.
 }
 
 void poll_once() {
@@ -1933,6 +1994,7 @@ void poll_once() {
     update_keyboard_pad();
     SDL_UpdateGamepads();
     const uint64_t now = now_us();
+    const auto events = take_pad_events();
 
     int count = 0;
     SDL_JoystickID* ids = SDL_GetGamepads(&count);
@@ -1947,6 +2009,11 @@ void poll_once() {
     for (Device* d : connected)
         if (std::find(present.begin(), present.end(), d->id) == present.end() || !SDL_GamepadConnected(d->pad))
             close_pad(d, now);
+    size_t previously_open;
+    {
+        std::lock_guard lock(s.mu);
+        previously_open = s.connected.size();
+    }
     for (SDL_JoystickID jid : present) {
         bool known = false;
         {
@@ -1960,33 +2027,15 @@ void poll_once() {
         std::lock_guard lock(s.mu);
         connected = s.connected;
     }
-    for (Device* d : connected) {
+    for (size_t i = 0; i < connected.size(); ++i) {
+        Device* d = connected[i];
+        const uint64_t last_reading_us = d->last_reading_us;
+        if (i < previously_open) replay_pad_events(d, events, now);
         Snapshot snap = read_pad(d);
         read_raw(d, &snap);
-        const bool guide_changed = d->last_snap.guide != snap.guide;
-        const bool changed = !(d->last_snap == snap);
-        d->last_snap = snap;
-        // A newly opened pad's first sample here is its baseline (active_input.h), so connecting a pad with a button
-        // held changes nothing.
-        if (const leonida::InputEdge edge = g_tracker.observe(d->id, d->family, sample_of(snap), now);
-            edge != leonida::InputEdge::None) {
-            publish_active();
-            if (!g_tracker.forced())
-                std::fprintf(stderr, "[rt] gameinput: input in use: %s (%s, %s)\n",
-                             leonida::input_family_name(d->family), d->name.c_str(), leonida::input_edge_name(edge));
-        }
-        // A pad with sensors streams readings at ~125 Hz even when nothing else changes, so motion the title reads
-        // between its frames is never stuck at the last button event; pads without sensors only read on change, as
-        // before. push_reading stamps last_reading_us, so the cadence follows the actual history.
-        const bool motion_tick = snap.has_motion && now - d->last_reading_us >= kMotionReadingUs;
-        if (changed || motion_tick) {
-            std::lock_guard lock(s.mu);
-            queue_event({CbType::Reading, d, push_reading(d, snap, now), now, 0, 0, false, 0});
-        }
-        if (guide_changed) {
-            std::lock_guard lock(s.mu);
-            queue_event({CbType::Guide, d, nullptr, now, 0, 0, snap.guide, 0});
-        }
+        // A pad with sensors still streams readings at ~125 Hz when the controls stay idle.
+        const bool motion_tick = snap.has_motion && now - last_reading_us >= kMotionReadingUs;
+        publish_pad_sample(d, snap, now, motion_tick);
         refresh_battery(d, now);
         apply_output(d, now);
     }
