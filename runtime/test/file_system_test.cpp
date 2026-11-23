@@ -15,6 +15,7 @@
 #include <fstream>
 #include <sstream>
 #include <initializer_list>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
@@ -334,6 +335,60 @@ void run_checks(const std::filesystem::path& root) {
     check(create_w && create_a && first_w && first_a && next_w && find_close && attributes_w && attributes_a &&
               attributes_ex_w && delete_w && delete_a,
           "the file API resolves through the registry under kernel32/kernelbase and the api sets");
+
+    {
+        using PathW = DWORD(WINAPI*)(DWORD, LPWSTR);
+        using PathA = DWORD(WINAPI*)(DWORD, LPSTR);
+        using NameW = UINT(WINAPI*)(LPCWSTR, LPCWSTR, UINT, LPWSTR);
+        using NameA = UINT(WINAPI*)(LPCSTR, LPCSTR, UINT, LPSTR);
+        auto pw = resolve<PathW>("kernel32.dll", "GetTempPathW");
+        auto pa = resolve<PathA>("kernelbase.dll", "GetTempPathA");
+        auto nw = resolve<NameW>("kernel32.dll", "GetTempFileNameW");
+        auto na = resolve<NameA>("kernelbase.dll", "GetTempFileNameA");
+        check(pw && pa && nw && na, "temporary file APIs resolve in the registry");
+        if (!pw) pw = ::GetTempPathW;
+        if (!pa) pa = ::GetTempPathA;
+        if (!nw) nw = ::GetTempFileNameW;
+        if (!na) na = ::GetTempFileNameA;
+        wchar_t old_tmp[32768]{};
+        DWORD old_len = ::GetEnvironmentVariableW(L"TMP", old_tmp, 32768);
+        wchar_t host[MAX_PATH]{}, actual[MAX_PATH]{}, filename[MAX_PATH]{}, second[MAX_PATH]{};
+        ::GetTempPathW(MAX_PATH, host);
+        check(pw(MAX_PATH, actual) && std::wstring(actual) == host, "host temporary path passes through unchanged");
+        wchar_t host_name[MAX_PATH]{}, shim_name[MAX_PATH]{};
+        UINT host_id = ::GetTempFileNameW(host, L"hst", 0x1234, host_name);
+        check(nw(host, L"hst", 0x1234, shim_name) == host_id && std::wstring(host_name) == shim_name,
+              "host temporary file name passes through unchanged");
+        const auto scratch = overlay / L".gta6rt-temp";
+        for (const wchar_t* drive : {L"GAME:\\", L"G:\\", L"T:\\"}) {
+            ::SetEnvironmentVariableW(L"TMP", drive);
+            DWORD host_result = ::GetTempPathW(MAX_PATH, host);
+            std::printf("NOTE host GetTempPathW %ls -> %lu %ls\n", drive, host_result, host);
+            DWORD result = pw(MAX_PATH, actual);
+            check(result && std::wstring(actual) == scratch.wstring() + L"\\",
+                  "console temporary path resolves to overlay scratch");
+            DWORD required = pw(0, nullptr);
+            check(required == result + 1, "GetTempPathW reports required size including terminator");
+            UINT host_name = ::GetTempFileNameW(drive, L"abc", 0, filename);
+            std::printf("NOTE host GetTempFileNameW %ls -> %u error %lu\n", drive, host_name, ::GetLastError());
+            UINT first = nw(drive, L"abcd", 0, filename);
+            UINT other = nw(drive, L"abcd", 0, second);
+            check(first && other && std::wstring(filename) != second && std::filesystem::exists(filename) &&
+                      std::filesystem::exists(second) && std::filesystem::path(filename).parent_path() == scratch,
+                  "console temporary names are unique files in scratch");
+        }
+        char a_path[MAX_PATH]{}, a_name[MAX_PATH]{};
+        check(pa(MAX_PATH, a_path) && std::filesystem::path(a_path).parent_path() == scratch,
+              "GetTempPathA resolves console path");
+        check(pa(0, nullptr) == std::strlen(a_path) + 1, "GetTempPathA reports required size including terminator");
+        check(na("GAME:\\", "abcdef", 0x1234, a_name) == 0x1234 &&
+                  std::filesystem::path(a_name).parent_path() == scratch &&
+                  !std::filesystem::exists(a_name) &&
+                  std::filesystem::path(a_name).filename().string().find("abc") == 0,
+              "GetTempFileNameA honours the prefix and nonzero unique value");
+        check(!std::filesystem::exists(package / L".gta6rt-temp"), "temporary files never enter the package");
+        ::SetEnvironmentVariableW(L"TMP", old_len && old_len < 32768 ? old_tmp : nullptr);
+    }
 
     // A read of a package file, through the mixed-case prefix and through forward slashes.
     {

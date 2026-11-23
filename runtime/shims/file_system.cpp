@@ -1484,6 +1484,85 @@ BOOL WINAPI get_volume_path_name_a(LPCSTR name, LPSTR output, DWORD size) {
     return TRUE;
 }
 
+// Console temporary directories always live in the writable overlay, independent of the package tree.
+static Target temp_directory(const std::wstring& path, bool& console) {
+    size_t prefix_length = 0;
+    console = console_drive(path, prefix_length) != Drive::None;
+    if (!console) return {};
+    std::vector<std::wstring> parts;
+    if (parse_console(path, parts) == Parsed::Refused) return fail(ERROR_INVALID_NAME);
+    const auto overlay = roots().overlay;
+    if (overlay.empty()) return fail(ERROR_PATH_NOT_FOUND);
+    std::error_code ec;
+    const auto scratch = overlay / kScratchDir;
+    std::filesystem::create_directories(scratch, ec);
+    if (ec) return fail(static_cast<DWORD>(ec.value()));
+    Target target;
+    target.path = scratch;
+    return target;
+}
+
+static std::wstring temp_environment() {
+    for (const wchar_t* key : {L"TMP", L"TEMP"}) {
+        const DWORD size = ::GetEnvironmentVariableW(key, nullptr, 0);
+        if (!size) continue;
+        std::vector<wchar_t> value(size);
+        const DWORD length = ::GetEnvironmentVariableW(key, value.data(), size);
+        if (length && length < size) return std::wstring(value.data(), length);
+    }
+    return {};
+}
+
+DWORD WINAPI get_temp_path_w(DWORD size, LPWSTR buffer) {
+    bool console = false;
+    const Target target = temp_directory(temp_environment(), console);
+    if (!console) return ::GetTempPathW(size, buffer);
+    if (target.error) return fail_bool(target.error);
+    std::wstring path = target.path.wstring();
+    if (path.empty() || !is_separator(path.back())) path += static_cast<wchar_t>(92);
+    const DWORD required = static_cast<DWORD>(path.size() + 1);
+    if (size < required) return required;
+    std::wmemcpy(buffer, path.c_str(), required);
+    return required - 1;
+}
+
+DWORD WINAPI get_temp_path_a(DWORD size, LPSTR buffer) {
+    bool console = false;
+    const Target target = temp_directory(temp_environment(), console);
+    if (!console) return ::GetTempPathA(size, buffer);
+    if (target.error) return fail_bool(target.error);
+    std::wstring path = target.path.wstring();
+    if (path.empty() || !is_separator(path.back())) path += static_cast<wchar_t>(92);
+    const int required = ::WideCharToMultiByte(CP_ACP, 0, path.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (!required) return 0;
+    if (size < static_cast<DWORD>(required)) return static_cast<DWORD>(required);
+    narrow_ansi(path, buffer, size);
+    return static_cast<DWORD>(required - 1);
+}
+
+UINT WINAPI get_temp_file_name_w(LPCWSTR path, LPCWSTR prefix, UINT unique, LPWSTR name) {
+    if (!path) return ::GetTempFileNameW(path, prefix, unique, name);
+    bool console = false;
+    const Target target = temp_directory(path, console);
+    if (!console) return ::GetTempFileNameW(path, prefix, unique, name);
+    if (target.error) return fail_bool(target.error);
+    return ::GetTempFileNameW(target.path.c_str(), prefix, unique, name);
+}
+
+UINT WINAPI get_temp_file_name_a(LPCSTR path, LPCSTR prefix, UINT unique, LPSTR name) {
+    if (!path) return ::GetTempFileNameA(path, prefix, unique, name);
+    bool console = false;
+    const Target target = temp_directory(widen_ansi(path), console);
+    if (!console) return ::GetTempFileNameA(path, prefix, unique, name);
+    if (target.error) return fail_bool(target.error);
+    const std::wstring wide = target.path.wstring();
+    const int length = ::WideCharToMultiByte(CP_ACP, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (!length) return 0;
+    std::vector<char> ansi(static_cast<size_t>(length));
+    narrow_ansi(wide, ansi.data(), ansi.size());
+    return ::GetTempFileNameA(ansi.data(), prefix, unique, name);
+}
+
 }  // namespace rt::fs
 
 namespace {
@@ -1497,6 +1576,10 @@ using namespace rt::fs;
         {dll, "GetVolumeInformationW", reinterpret_cast<void*>(&get_volume_information_w)},             \
         {dll, "GetVolumePathNameA", reinterpret_cast<void*>(&get_volume_path_name_a)},                   \
         {dll, "GetVolumePathNameW", reinterpret_cast<void*>(&get_volume_path_name_w)},                   \
+    {dll, "GetTempPathA", reinterpret_cast<void*>(&get_temp_path_a)},                                  \
+    {dll, "GetTempPathW", reinterpret_cast<void*>(&get_temp_path_w)},                                  \
+    {dll, "GetTempFileNameA", reinterpret_cast<void*>(&get_temp_file_name_a)},                          \
+    {dll, "GetTempFileNameW", reinterpret_cast<void*>(&get_temp_file_name_w)},                          \
     {dll, "CreateFileA", reinterpret_cast<void*>(&create_file_a)},                                       \
         {dll, "CreateFileW", reinterpret_cast<void*>(&create_file_w)},                                   \
         {dll, "CreateFile2", reinterpret_cast<void*>(&create_file2)},                                    \
