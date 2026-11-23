@@ -23,6 +23,7 @@ import os
 import shutil
 import sys
 import tempfile
+import traceback
 import zlib
 from dataclasses import dataclass
 
