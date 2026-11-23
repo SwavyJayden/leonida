@@ -1571,13 +1571,21 @@ UINT WINAPI get_temp_file_name_a(LPCSTR path, LPCSTR prefix, UINT unique, LPSTR 
     const Target target = temp_directory(widen_ansi(path), console);
     if (!console) return ::GetTempFileNameA(path, prefix, unique, name);
     if (target.error) return fail_bool(target.error);
-    const std::wstring wide = target.path.wstring();
-    const int length = ::WideCharToMultiByte(CP_ACP, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    if (!length) return 0;
-    std::vector<char> ansi(static_cast<size_t>(length));
-    narrow_ansi(wide, ansi.data(), ansi.size());
-    const UINT result = ::GetTempFileNameA(ansi.data(), prefix, unique, name);
-    if (!result) temp_name_error(target.path);
+    const std::wstring wide_prefix = widen_ansi(prefix);
+    wchar_t wide_name[MAX_PATH]{};
+    const UINT result = ::GetTempFileNameW(target.path.c_str(), prefix ? wide_prefix.c_str() : nullptr, unique, wide_name);
+    if (!result) {
+        temp_name_error(target.path);
+        return 0;
+    }
+    char converted[MAX_PATH]{};
+    const int length = ::WideCharToMultiByte(CP_ACP, 0, wide_name, -1, converted, MAX_PATH, nullptr, nullptr);
+    if (!length || widen_ansi(converted) != wide_name) {
+        if (!unique) ::DeleteFileW(wide_name);
+        ::SetLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return 0;
+    }
+    std::memcpy(name, converted, static_cast<size_t>(length));
     return result;
 }
 

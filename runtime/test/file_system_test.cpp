@@ -382,6 +382,28 @@ void run_checks(const std::filesystem::path& root) {
         check(na("T:\\existing", "sub", 0, sub_name) &&
                   std::filesystem::path(sub_name).parent_path() == subdir && std::filesystem::exists(sub_name),
               "GetTempFileNameA creates the file in the requested subdirectory");
+        // Exercise an overlay component that the active ANSI code page cannot round-trip, when available.
+        const wchar_t unicode_component[] = L"\u6f22\u5b57";
+        char encoded[32]{};
+        wchar_t decoded[32]{};
+        const int encoded_len = ::WideCharToMultiByte(CP_ACP, 0, unicode_component, -1, encoded, 32, nullptr, nullptr);
+        if (encoded_len && ::MultiByteToWideChar(CP_ACP, 0, encoded, -1, decoded, 32) &&
+            std::wstring(decoded) != unicode_component) {
+            const auto unicode_overlay = root / unicode_component;
+            const auto unicode_scratch = unicode_overlay / L".gta6rt-temp";
+            std::filesystem::create_directories(unicode_scratch);
+            rt::fs::configure(package, unicode_overlay);
+            char unicode_name[MAX_PATH]{};
+            ::SetLastError(0);
+            const UINT unicode_result = na("T:\\", "uni", 0, unicode_name);
+            const DWORD unicode_error = ::GetLastError();
+            check(!unicode_result && unicode_error == ERROR_NO_UNICODE_TRANSLATION &&
+                      std::filesystem::is_empty(unicode_scratch),
+                  "GetTempFileNameA rejects unrepresentable output and removes the created file");
+            rt::fs::configure(package, overlay);
+        } else {
+            std::printf("NOTE active ANSI code page represents the Unicode test path; conversion failure test skipped\n");
+        }
         ::SetLastError(0);
         const UINT missing = nw(L"T:\\missing", L"sub", 0, filename);
         const DWORD missing_error = ::GetLastError();
@@ -406,8 +428,6 @@ void run_checks(const std::filesystem::path& root) {
                   "console temporary path resolves to overlay scratch");
             DWORD required = pw(0, nullptr);
             check(required == result + 1, "GetTempPathW reports required size including terminator");
-            UINT host_name = ::GetTempFileNameW(drive, L"abc", 0, filename);
-            std::printf("NOTE host GetTempFileNameW %ls -> %u error %lu\n", drive, host_name, ::GetLastError());
             UINT first = nw(drive, L"abcd", 0, filename);
             UINT other = nw(drive, L"abcd", 0, second);
             check(first && other && std::wstring(filename) != second && std::filesystem::exists(filename) &&
