@@ -1031,6 +1031,8 @@ if(BUILD_TESTING)
   endif()
   add_executable(command_list_test test/command_list_test.cpp)
   add_test(NAME command_list COMMAND command_list_test)
+  add_executable(command_list_query_oom_test test/command_list_query_oom_test.cpp)
+  add_test(NAME command_list_query_oom COMMAND command_list_query_oom_test)
   # Which SPIR-V modules declare a storage image or buffer they may write (src/spirv_stores.h), on hand-built words.
   add_executable(spirv_stores_test test/spirv_stores_test.cpp)
   add_test(NAME spirv_stores COMMAND spirv_stores_test)

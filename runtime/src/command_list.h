@@ -838,7 +838,12 @@ public:
         if (closed_ || !query.heap || query.type == d3d12_query::timestamp) return false;
         if (find_active(query.heap, query.index) != active_.end()) return false;
         active_.push_back(query);
-        return append(query);
+        try {
+            return append(query);
+        } catch (...) {
+            active_.pop_back();
+            throw;
+        }
     }
 
     bool end_query(const EndQuery& query) {
@@ -846,7 +851,9 @@ public:
         if (query.type != d3d12_query::timestamp) {
             const auto it = find_active(query.heap, query.index);
             if (it == active_.end() || it->type != query.type) return false;
+            if (!append(query)) return false;
             active_.erase(it);
+            return true;
         }
         return append(query);
     }
