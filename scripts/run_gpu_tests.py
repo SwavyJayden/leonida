@@ -1104,7 +1104,7 @@ def run_suite(a, work: str) -> int:
                 ok = rc == 0 and (words == fused or (not strict and words == split))
                 detail = " ".join(hex(x) for x in words) if words else msg
                 if ok and words == split:
-                    detail += " (split: the driver rounds GLSL Fma on doubles twice; --fma khr fixes it)"
+                    detail += " (split: the driver rounded this all-constant GLSL Fma on doubles twice; --fma khr fixes it)"
                 results.append((name, ok, detail))
         elif name == "cs_cvt_f32_sat":
             # #300's saturating float -> int conversions: one dispatch per input word in s4 (VKC_SGPRS).
