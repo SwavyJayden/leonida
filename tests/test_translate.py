@@ -663,6 +663,58 @@ def test_ms_clip_and_cull_distances_across_pos1_pos2(make_shader):
     assert not ({1, 2} & set(meta.get("params", [])))
 
 
+def test_ms_compressed_pos1_clip_export_unpacks_f16_pairs(make_shader):
+    """'exp pos1 v20, v20, v21, v21 compr' in a mesh shader (a clip distance vector, v20/v21 packed f16 pairs) is
+    translated like the VS export: each register is UnpackHalf2x16'd and its two halves are clip[0..1] / clip[2..3]."""
+    import re
+    dxbc = make_dxbc([mesh_psv0_chunk(), signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 2, 0xF)])])
+    asm = _ms_header_asm("v_mov_b32 v20, 0x3c003800\nv_mov_b32 v21, 0x40004400\n"
+                         "exp pos1 v20, v20, v21, v21 done compr")
+    shader = make_shader(asm, name="ms_compr_pos1", dxbc=dxbc)
+    spvasm = shader.translate()
+    shader.validate(spvasm, KNOWN_VAL_ISSUES.get("ms_tri"))
+    assert len(re.findall(r"OpExtInst %v2float %glsl UnpackHalf2x16", spvasm)) == 2
+    chains = re.findall(r"OpAccessChain %_ptr_Function_float %ms_clip %c(\d+)", spvasm)
+    assert [int(x) for x in chains] == [0, 1, 2, 3] * 2      # the four stores, then the copy to the output
+    assert "OpCapability ClipDistance" in spvasm
+
+
+def test_ms_compressed_pos1_clip_export_off_register_writes_nothing(make_shader):
+    """A compressed export whose second register is off exports only clip[0..1]."""
+    import re
+    dxbc = make_dxbc([mesh_psv0_chunk(), signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 2, 0xF)])])
+    asm = _ms_header_asm("v_mov_b32 v20, 0x3c003800\nexp pos1 v20, v20, off, off done compr")
+    shader = make_shader(asm, name="ms_compr_pos1_off", dxbc=dxbc)
+    spvasm = shader.translate()
+    shader.validate(spvasm, KNOWN_VAL_ISSUES.get("ms_tri"))
+    assert len(re.findall(r"OpExtInst %v2float %glsl UnpackHalf2x16", spvasm)) == 1
+    chains = re.findall(r"OpAccessChain %_ptr_Function_float %ms_clip %c(\d+)", spvasm)
+    assert [int(x) for x in chains] == [0, 1] + [0, 1, 2, 3]     # two stores, then the copy to the output
+
+
+def test_ms_compressed_param_export_unpacks_f16_pairs(make_shader):
+    """'exp param0 ... compr' in a mesh shader stages (x,y,z,w) from the two unpacked f16 registers."""
+    import re
+    dxbc = make_dxbc([mesh_psv0_chunk(), signature_chunk(b"OSG1", [(0, 1, 0xF)])])
+    asm = _ms_header_asm("v_mov_b32 v20, 0x3c003800\nv_mov_b32 v21, 0x40004400\n"
+                         "exp param0 v20, v20, v21, v21 done compr")
+    shader = make_shader(asm, name="ms_compr_param", dxbc=dxbc)
+    spvasm = shader.translate()
+    shader.validate(spvasm, KNOWN_VAL_ISSUES.get("ms_tri"))
+    assert len(re.findall(r"OpExtInst %v2float %glsl UnpackHalf2x16", spvasm)) == 2
+    assert "OpStore %ms_param0" in spvasm
+
+
+def test_ms_uncompressed_exports_do_not_unpack_halves(make_shader):
+    """Negative control: the same exports without 'compr' read the registers as f32."""
+    dxbc = make_dxbc([mesh_psv0_chunk(), signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 2, 0xF)])])
+    asm = _ms_header_asm("exp param0 v10, v11, v12, v13\nexp pos1 v10, v11, v12, v13 done")
+    shader = make_shader(asm, name="ms_plain_exports", dxbc=dxbc)
+    spvasm = shader.translate()
+    shader.validate(spvasm, KNOWN_VAL_ISSUES.get("ms_tri"))
+    assert "UnpackHalf2x16" not in spvasm
+
+
 def test_wave64_detected_from_mask_ops_without_exec_markers(make_shader):
     """#210 part 2 / SHADER-28: s_bcnt1_i32_b64 on ordinary SGPRs marks the shader wave64 (no exec_hi / saveexec)."""
     shader = make_shader(
