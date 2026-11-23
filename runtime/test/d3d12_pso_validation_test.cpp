@@ -32,6 +32,12 @@ using namespace d3d12test;
 
 namespace {
 
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, typename T>
+struct alignas(void*) StreamObject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
+    T value{};
+};
+
 struct HostContext {
     std::string name;
     Ref<ID3D12Device> device;
@@ -201,6 +207,45 @@ int main() {
     const D3D12_SHADER_BYTECODE layer_ps_unorm{ps_unorm_container.data(), ps_unorm_container.size()};
     const D3D12_SHADER_BYTECODE layer_ps_uint{ps_uint_container.data(), ps_uint_container.size()};
     const D3D12_SHADER_BYTECODE layer_cs{cs_container.data(), cs_container.size()};
+
+    // The cached PSO identity must distinguish each explicit line mode, even when the device
+    // cannot honour it. In that case creation still succeeds with the ordinary raster state.
+    {
+        struct Stream {
+            StreamObject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root;
+            StreamObject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_SHADER_BYTECODE> vs;
+            StreamObject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+            StreamObject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2, D3D12_RASTERIZER_DESC2> raster;
+            StreamObject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC> depth;
+            StreamObject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
+            StreamObject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> targets;
+        } stream{};
+        stream.root.value = layer_root.p;
+        stream.vs.value = layer_vs_fs;
+        stream.ps.value = layer_ps_unorm;
+        stream.raster.value.FillMode = D3D12_FILL_MODE_SOLID;
+        stream.raster.value.CullMode = D3D12_CULL_MODE_NONE;
+        stream.raster.value.DepthClipEnable = TRUE;
+        stream.topology.value = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        stream.targets.value.NumRenderTargets = 1;
+        stream.targets.value.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        Ref<ID3D12Device2> device2;
+        EXPECT(SUCCEEDED(layer_dev->QueryInterface(IID_PPV_ARGS(&device2.p))));
+        std::vector<std::vector<std::uint8_t>> blobs;
+        for (int mode = 0; mode != 5; ++mode) {
+            // 99 cannot be honoured and checks the existing permissive fallback.
+            stream.raster.value.LineRasterizationMode = D3D12_LINE_RASTERIZATION_MODE(mode == 4 ? 99 : mode);
+            D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
+            Ref<ID3D12PipelineState> pso;
+            EXPECT(device2->CreatePipelineState(&desc, IID_PPV_ARGS(&pso.p)) == S_OK);
+            Ref<ID3DBlob> blob;
+            EXPECT(pso->GetCachedBlob(&blob.p) == S_OK);
+            const auto* data = static_cast<const std::uint8_t*>(blob->GetBufferPointer());
+            std::vector<std::uint8_t> bytes(data, data + blob->GetBufferSize());
+            for (const auto& previous : blobs) EXPECT(previous != bytes);
+            blobs.push_back(std::move(bytes));
+        }
+    }
 
     unsigned checked = 0, host_compared = 0;
 

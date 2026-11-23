@@ -3017,7 +3017,9 @@ leonida::cached_pso::Key pipeline_key(const D3D12_COMPUTE_PIPELINE_STATE_DESC& d
     return leonida::sha256_hex(key.data());
 }
 
-leonida::cached_pso::Key pipeline_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+leonida::cached_pso::Key pipeline_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, int line_mode = -1,
+                                      const D3D12_SHADER_BYTECODE* ms = nullptr,
+                                      const D3D12_SHADER_BYTECODE* as = nullptr) {
     leonida::cached_pso::KeyBuilder key;
     key.tag("graphics");
     key_root_signature(key, desc.pRootSignature);
@@ -3026,6 +3028,8 @@ leonida::cached_pso::Key pipeline_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& 
     key_shader(key, "ds", desc.DS);
     key_shader(key, "hs", desc.HS);
     key_shader(key, "gs", desc.GS);
+    if (ms && ms->BytecodeLength) key_shader(key, "ms", *ms);
+    if (as && as->BytecodeLength) key_shader(key, "as", *as);
     const D3D12_STREAM_OUTPUT_DESC& so = desc.StreamOutput;
     key.u32(so.pSODeclaration ? so.NumEntries : 0);
     for (UINT i = 0; so.pSODeclaration && i < so.NumEntries; ++i) {
@@ -3049,6 +3053,7 @@ leonida::cached_pso::Key pipeline_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& 
     key.u32(r.FillMode).u32(r.CullMode).u32(r.FrontCounterClockwise).u32(std::uint32_t(r.DepthBias)).u32(bias_clamp);
     key.u32(slope).u32(r.DepthClipEnable).u32(r.MultisampleEnable).u32(r.AntialiasedLineEnable);
     key.u32(r.ForcedSampleCount).u32(r.ConservativeRaster);
+    if (line_mode >= 0) key.tag("line_rasterization_mode").u32(std::uint32_t(line_mode));
     const D3D12_DEPTH_STENCIL_DESC& d = desc.DepthStencilState;
     key.u32(d.DepthEnable).u32(d.DepthWriteMask).u32(d.DepthFunc).u32(d.StencilEnable).u32(d.StencilReadMask);
     key.u32(d.StencilWriteMask);
@@ -3109,6 +3114,7 @@ struct PipelineStream {
     D3D12_COMPUTE_PIPELINE_STATE_DESC compute{};
     D3D12_SHADER_BYTECODE ms{};
     D3D12_SHADER_BYTECODE as{};
+    int line_mode = -1; // Only RASTERIZER2 has an explicit line mode.
     bool has_cs = false;
     bool has_graphics_stage = false;  // VS, PS, DS, HS, GS, AS or MS
 };
@@ -3268,6 +3274,7 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
                 r = {d.FillMode, d.CullMode, d.FrontCounterClockwise, 0, d.DepthBiasClamp, d.SlopeScaledDepthBias,
                      d.DepthClipEnable, FALSE, FALSE, d.ForcedSampleCount, d.ConservativeRaster};
                 bias = d.DepthBias;
+                out.line_mode = int(d.LineRasterizationMode);
             }
             r.DepthBias = INT(bias);
             if (ok && FLOAT(r.DepthBias) != bias) log_once("a fractional depth bias is truncated; bias x1000", int(bias * 1000));
@@ -3389,7 +3396,7 @@ public:
     // no VS, no vertex input or input assembly (the input layout, topology type and strip cut are ignored, as D3D12
     // does for mesh PSOs), drawn by DispatchMesh. An AS (amplification shader) is refused: the game has none.
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* ms = nullptr,
-                            const D3D12_SHADER_BYTECODE* as = nullptr) {
+                            const D3D12_SHADER_BYTECODE* as = nullptr, int line_mode = -1) {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
@@ -3944,6 +3951,7 @@ public:
         recipe_.assembly = assembly;
         recipe_.raster = raster;
         recipe_.conservative = r.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
+        recipe_.line_mode = line_mode;
         recipe_.multisample = multisample;
         graphics_.samples = samples;
         recipe_.sample_mask = sample_mask;
@@ -4094,6 +4102,7 @@ private:
         VkPipelineInputAssemblyStateCreateInfo assembly{};
         VkPipelineRasterizationStateCreateInfo raster{};
         bool conservative = false;
+        int line_mode = -1;
         VkPipelineMultisampleStateCreateInfo multisample{};
         VkSampleMask sample_mask = ~0u;
         VkPipelineDepthStencilStateCreateInfo depth{};
@@ -4148,6 +4157,27 @@ private:
             conservative.extraPrimitiveOverestimationSize = 0.0f;
             conservative.pNext = raster.pNext;
             raster.pNext = &conservative;
+        }
+        VkPipelineRasterizationLineStateCreateInfoEXT line{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO_EXT};
+        // Vulkan has no narrow quadrilateral mode; rectangular is the closest available approximation.
+        bool use_line = false;
+        switch (r.line_mode) {
+        case D3D12_LINE_RASTERIZATION_MODE_ALIASED:
+            line.lineRasterizationMode = VK_LINE_RASTERIZATION_MODE_BRESENHAM_EXT;
+            use_line = device_.info.line_bresenham; break;
+        case D3D12_LINE_RASTERIZATION_MODE_ALPHA_ANTIALIASED:
+            line.lineRasterizationMode = VK_LINE_RASTERIZATION_MODE_SMOOTH_EXT;
+            use_line = device_.info.line_smooth; break;
+        case D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_WIDE:
+        case D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW:
+            line.lineRasterizationMode = VK_LINE_RASTERIZATION_MODE_RECTANGULAR_EXT;
+            use_line = device_.info.line_rectangular; break;
+        default: break;
+        }
+        if (use_line) {
+            line.stippledLineEnable = VK_FALSE;
+            line.pNext = raster.pNext;
+            raster.pNext = &line;
         }
         multisample.pSampleMask = &r.sample_mask;
         VkPipelineColorBlendStateCreateInfo blend = r.blend;
@@ -6184,11 +6214,13 @@ public:
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
         const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)
-                                         : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as);
+                                         : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as, stream.line_mode);
         if (FAILED(hr)) {
             pipeline->Release();
             return d3d12_trace::result(method, hr);
         }
+        if (!stream.has_cs && stream.line_mode >= 0)
+            pipeline->set_cache_key(pipeline_key(stream.graphics, stream.line_mode, &stream.ms, &stream.as));
         return d3d12_trace::result(method, hand_out(pipeline, riid, out));
     }
 
@@ -9657,6 +9689,24 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     info.conservative_rasterization = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
         return std::strcmp(e.extensionName, VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) == 0;
     });
+    const bool has_line_rasterization = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+        return std::strcmp(e.extensionName, VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME) == 0;
+    });
+    VkPhysicalDeviceLineRasterizationFeaturesEXT line_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_EXT};
+    if (has_line_rasterization) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &line_features};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.line_bresenham = line_features.bresenhamLines == VK_TRUE;
+        info.line_smooth = line_features.smoothLines == VK_TRUE;
+        info.line_rectangular = line_features.rectangularLines == VK_TRUE;
+        // Stippled lines are not used by this layer.
+        line_features.stippledRectangularLines = VK_FALSE;
+        line_features.stippledBresenhamLines = VK_FALSE;
+        line_features.stippledSmoothLines = VK_FALSE;
+        line_features.pNext = *v13.next();
+        *v13.next() = &line_features;
+    }
     const bool has_host_image_copy = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
         return std::strcmp(e.extensionName, VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) == 0;
     });
@@ -9900,6 +9950,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     std::vector<const char*> device_extensions;
     v13.add_extensions(device_extensions);
     if (info.conservative_rasterization) device_extensions.push_back(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
+    if (has_line_rasterization) device_extensions.push_back(VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME);
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     if (info.vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);

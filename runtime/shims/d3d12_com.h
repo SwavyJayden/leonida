@@ -117,6 +117,10 @@ struct VulkanDeviceInfo {
     // VK_EXT_conservative_rasterization is enabled on the logical device. Tier 1/2 depend on the physical
     // precision/overestimation properties; Tier 2 also requires post-snap degenerate triangles.
     bool conservative_rasterization = false;
+    // VK_EXT_line_rasterization features enabled on the logical device.
+    bool line_bresenham = false;
+    bool line_smooth = false;
+    bool line_rectangular = false;
     // Opt in only for shader libraries whose InnerCoverage input contract uses FullyCoveredEXT. The device
     // still checks physical Tier 2 and fullyCoveredFragmentShaderInputVariable properties. The standalone
     // device leaves this false until the Xbox PS input mapping is confirmed (synthetic GLSL is not that ABI).
