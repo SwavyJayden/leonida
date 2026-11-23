@@ -819,7 +819,10 @@ def command_expect(arguments):
     scene_outcomes = [
         verify_scene(scene, image_directory) for scene in manifest.scenes
     ]
-    return EXIT_PASSED if print_expect_report(scene_outcomes) else EXIT_FAILED
+    passed = print_expect_report(scene_outcomes)
+    if any(outcome.image_problem for outcome in scene_outcomes):
+        return EXIT_ERROR
+    return EXIT_PASSED if passed else EXIT_FAILED
 
 
 # ---------------------------------------------------------------------------
@@ -1480,7 +1483,7 @@ def step_expect_missing_and_invalid(directory):
     exit_code, output = run_and_capture(
         command_expect, argparse.Namespace(manifest=missing_manifest_path, dir=None)
     )
-    require_equal("expect exit code for a missing image", exit_code, EXIT_FAILED)
+    require_equal("expect exit code for a missing image", exit_code, EXIT_ERROR)
     require_true("missing image message names the file", "absent.png" in output)
     require_true(
         "missing image message says what to check",
