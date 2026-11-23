@@ -3927,6 +3927,46 @@ class Gen:
             self.emit(f"OpBranch {lbl_end}")
             self.emit(f"{lbl_end} = OpLabel")
 
+    FLAT_GLOBAL_OPS = frozenset(
+        ["global_load_dword", "global_load_dwordx2", "global_load_dwordx3", "global_load_dwordx4",
+         "global_store_dword", "global_store_dwordx2", "global_store_dwordx3", "global_store_dwordx4",
+         "global_load_ubyte", "global_load_sbyte", "global_load_ushort", "global_load_sshort"])
+
+    def flat_mem(self, op, a, mods):
+        """flat_load_* vD, v[a:a+1] / flat_store_* v[a:a+1], vD: the FLAT forms of global_mem and global_sub.
+
+        A FLAT address is a 64-bit VGPR pair with no SADDR. The RDNA2 ISA's flat-memory chapter sends an address inside
+        the LDS or private (scratch) aperture to that memory and any other address to global memory, where it is the
+        same access as GLOBAL with `off`. The aperture bases are per-queue values a program reads as src_shared_base and
+        src_private_base; the translator does not accept those operands, so a program that builds an aperture
+        address from them is refused as a whole, and the FLAT accesses that do translate are global ones. (An aperture
+        address taken from memory or a constant would be read as global memory: not seen, and not detectable here.)
+
+        The instruction offset must be 0. Its behaviour on the console's GPU is not measured, and LLVM marks GFX10.1
+        with FeatureFlatSegmentOffsetBug ("inst_offset is ignored when flat instructions access global memory") and
+        then folds no offset into a FLAT access, so a non-zero one is refused rather than guessed."""
+        rest = op[len("flat_"):]
+        gop = "global_" + rest
+        if gop not in self.GLOBAL_SUB and gop not in self.FLAT_GLOBAL_OPS:
+            raise Unsupported(op)
+        offsets = [m.split(":", 1)[1] for m in mods if m.startswith("offset:")]
+        try:
+            nonzero = any(int(o, 0) != 0 for o in offsets)
+        except ValueError:
+            nonzero = True
+        if nonzero:
+            raise Unsupported(f"{op} instruction offset (FLAT, GFX10)")
+        store = rest.startswith("store_")
+        vaddr = a[0] if store else (a[1] if len(a) > 1 else None)
+        if len(a) != 2 or vaddr["k"] != "vgpr" or vaddr.get("n") != 2:
+            raise Unsupported(op + " addressing")
+        args = [a[0], a[1], {"k": "special", "t": "off", "neg": False, "abs": False}]
+        mods = [m for m in mods if not m.startswith("offset:")]
+        if gop in self.GLOBAL_SUB:
+            self.global_sub(gop, args, mods)
+        else:
+            self.global_mem(gop, args, mods)
+
     def buf_dword_ptr(self, arr, host, step, i, same_base=False):
         """Pointer to dword i (a Python int or a uint id) of a buffer access whose first dword is at host address
         `host`, `arr` the same address as a PSB array: arr[i] for the linear layout (step None), else host + i * step
@@ -10225,6 +10265,8 @@ class Gen:
         elif op.startswith(("global_load_dword", "global_store_dword")) or \
                 op in ("global_load_ushort", "global_load_sshort", "global_load_ubyte", "global_load_sbyte"):
             self.global_mem(op, a, mods)
+        elif op.startswith(("flat_load_", "flat_store_")):
+            self.flat_mem(op, a, mods)
         elif op in ("s_add_u32", "s_addc_u32", "s_sub_u32", "s_subb_u32"):
             # 32-bit add/sub with carry/borrow through SCC (used for 64-bit address arithmetic, e.g. s_getpc + offset).
             sub = op.startswith("s_sub")
@@ -16678,7 +16720,7 @@ def read_before_write_vgprs(insns):
         if (base_op(op) in ("v_swap_b32", "v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16",
                             "v_dot2c_f32_f16", "v_dot2c_i32_i16", "v_dot2c_u32_u16", "v_dot4c_u32_u8",
                             "v_dot8c_i32_i4", "v_dot8c_u32_u4") or
-                (op.startswith(("global_load_", "buffer_load_")) and "_d16" in op and "format" not in op)) and \
+                (op.startswith(("global_load_", "flat_load_", "buffer_load_")) and "_d16" in op and "format" not in op)) and \
                 a[0]["k"] == "vgpr":   # d16 keeps a half
             regs.append(a[0]["r"])
         for r in regs:
@@ -18081,7 +18123,7 @@ def interp_copy_sources(insns):
         ins["seq"] = i      # program order: also unique without encoding comments (test fixtures share a pc)
         a = ins["args"]
         if not (a and a[0].get("k") == "vgpr") or base_op(ins["op"]).startswith(
-                ("buffer_store", "tbuffer_store", "scratch_store", "global_store", "image_store", "ds_write")):
+                ("buffer_store", "tbuffer_store", "scratch_store", "global_store", "flat_store", "image_store", "ds_write")):
             continue
         for r in vgpr_dest_registers(ins, extra=int("tfe" in ins["mods"])):
             writes.setdefault(r, []).append(ins)
