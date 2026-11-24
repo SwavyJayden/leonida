@@ -108,6 +108,36 @@ class Generation(unittest.TestCase):
                 lines = {m.line for m in sm.mutants_for(source, first, last)}
                 self.assertEqual(sorted(lines), [n for n in (11,) if first < n <= last + 1])
 
+    def test_docstring_after_a_comment_with_quotes_and_concatenated_docstring(self):
+        # Two forms ast.get_docstring() accepts (@lixonik on #660): a `"""` in a comment before the docstring is no
+        # delimiter, and adjacent literals ("a " "b") are one docstring.
+        source = textwrap.dedent('''\
+            class Gen:
+                def f(self, x, y):
+                    # a comment with """ in it, and one with \'\'\' too
+                    """Start of the docstring.
+
+                    OpIAdd is named here.
+                    """
+                    self.emit(f"{r} = OpIAdd %uint {x} {y}")
+
+                def g(self, x, y):
+                    "OpIAdd is an example. " "Emit an instruction."
+                    self.emit(f"{r} = OpIAdd %uint {x} {y}")
+
+                def h(self, x, y):
+                    ("UMin is not a docstring here: the call reads it, so it is code. "
+                     "OpISub") and self.emit(f"{r} = OpIAdd %uint {x} {y}")
+            ''').split("\n")
+        named = next(i for i, s in enumerate(source) if "OpIAdd is named here" in s)
+        self.assertEqual(sm.mutants_for(source, named, named), [])
+        for name, code_lines in (("f", [8]), ("g", [12])):
+            first, last = sm.find_function(source, name)
+            with self.subTest(function=name):
+                self.assertEqual(sorted({m.line for m in sm.mutants_for(source, first, last)}), code_lines)
+        first, last = sm.find_function(source, "h")
+        self.assertIn(16, {m.line for m in sm.mutants_for(source, first, last)})   # still code: mutated
+
 
 class Tables(unittest.TestCase):
     def test_entry_takes_the_other_values_of_its_table(self):
