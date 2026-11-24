@@ -858,11 +858,53 @@ void check_run_time_load() {
                       "a callback that returns false stops the enumeration");
                 check(enumerate(7, 0, &game, collect) == E_INVALIDARG && enumerate(0, 0, &game, nullptr) == E_INVALIDARG,
                       "an unknown package kind or no callback is E_INVALIDARG");
-                // The slot (28) answers the same as the export.
+                // Slots 28, 35 (IXPackageImpl2) and 39 (IXPackageImpl3) enumerate as the export does, including the
+                // extended index/count/ageRestricted/titleID fields.
+                struct DetailsV3 {
+                    Details base;
+                    uint32_t index;
+                    uint32_t count;
+                    bool age_restricted;
+                    const char* title_id;
+                };
+                static_assert(sizeof(DetailsV3) == 88, "XPackageDetailsV3 is 88 bytes");
+                struct SeenV3 {
+                    std::vector<std::string> ids;
+                    std::vector<uint32_t> indices;
+                    uint32_t count = 0;
+                    bool ok_tail = true;
+                };
+                using CallbackV3 = bool(CALLBACK*)(void*, const DetailsV3*);
+                using EnumSlotV3 = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t, void*, CallbackV3);
+                const auto collect_v3 = [](void* ctx, const DetailsV3* d) -> bool {
+                    auto* s = static_cast<SeenV3*>(ctx);
+                    s->ids.push_back(d->base.id);
+                    s->indices.push_back(d->index);
+                    s->count = d->count;
+                    s->ok_tail = s->ok_tail && !d->age_restricted && d->title_id != nullptr;
+                    return true;
+                };
                 using EnumSlot = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t, void*, Callback);
                 Seen via_slot;
                 check(reinterpret_cast<EnumSlot>(slot(pk, 28))(pk, 1, 0, &via_slot, collect) == S_OK && via_slot.ids == content.ids,
                       "slot 28 enumerates as the export does");
+                SeenV3 via_35, via_39;
+                check(reinterpret_cast<EnumSlotV3>(slot(pk, 35))(pk, 1, 0, &via_35, collect_v3) == S_OK &&
+                          via_35.ids == content.ids && via_35.count == 2 && via_35.indices == std::vector<uint32_t>({0, 1}) &&
+                          via_35.ok_tail,
+                      "slot 35 (IXPackageImpl2::EnumeratePackages) populates extended details");
+                check(reinterpret_cast<EnumSlotV3>(slot(pk, 39))(pk, 1, 0, &via_39, collect_v3) == S_OK &&
+                          via_39.ids == content.ids && via_39.count == 2 && via_39.indices == std::vector<uint32_t>({0, 1}) &&
+                          via_39.ok_tail,
+                      "slot 39 (IXPackageImpl3::EnumeratePackages) populates extended details");
+                // Slot 5/6 (CreateInstallationMonitor / CloseInstallationMonitorHandle) through the COM vtable.
+                using CreateSlot = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint32_t, const void*, uint32_t, void*, void**);
+                using CloseSlot = void(STDMETHODCALLTYPE*)(void*, void*);
+                void* vtable_mon = nullptr;
+                check(reinterpret_cast<CreateSlot>(slot(pk, 5))(pk, "ENUMGAME_12345678901234567890123", 0, nullptr, 1000, nullptr, &vtable_mon) == S_OK &&
+                          vtable_mon != nullptr,
+                      "slot 5 (XPackageCreateInstallationMonitor) opens a monitor via vtable");
+                if (vtable_mon) reinterpret_cast<CloseSlot>(slot(pk, 6))(pk, vtable_mon);
 
                 using Create = HRESULT(__stdcall*)(const char*, uint32_t, const void*, uint32_t, void*, void**);
                 using Close = void(__stdcall*)(void*);
@@ -913,8 +955,10 @@ void check_run_time_load() {
         }
         SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", nullptr);
         using Stub = HRESULT(STDMETHODCALLTYPE*)(void*);
-        check(reinterpret_cast<Stub>(slot(pk, 27))(pk) == E_NOTIMPL && reinterpret_cast<Stub>(slot(pk, 40))(pk) == E_NOTIMPL,
-              "the slots without an offline answer (27, 40) are E_NOTIMPL");
+        check(reinterpret_cast<Stub>(slot(pk, 27))(pk) == E_NOTIMPL &&
+                  reinterpret_cast<Stub>(slot(pk, 40))(pk) == E_NOTIMPL &&
+                  reinterpret_cast<Stub>(slot(pk, 41))(pk) == E_NOTIMPL,
+              "the slots without an offline answer (27, 40, 41) are E_NOTIMPL");
         struct Progress {
             uint64_t total, installed, launch;
             bool launchable, completed;
@@ -932,18 +976,20 @@ void check_run_time_load() {
                   reinterpret_cast<UnregInstalled>(slot(pk, 22))(pk, XTaskQueueRegistrationToken{1}, false) &&
                   !reinterpret_cast<Uninstall>(slot(pk, 34))(pk, "pkg"),
               "the bool slots 8, 10, 22 and 34 return their documented offline answers");
+        const GUID package4 = {0x0b9d556e, 0xab70, 0x43f4, {0xba, 0xa0, 0x99, 0x99, 0xac, 0x4c, 0xb0, 0x40}};
         const GUID chain[] = {
             package_cls,
             {0x3720de07, 0xe8e4, 0x44a3, {0xad, 0x32, 0xb3, 0x59, 0xe8, 0xad, 0xbe, 0x55}},
             {0xf92d8712, 0x2b27, 0x4d8a, {0xbf, 0x01, 0x11, 0xa6, 0xf8, 0xe3, 0xeb, 0x42}},
-            package3};
+            package3,
+            package4};
         bool all = true;
         for (const GUID& iid : chain) {
             void* same = nullptr;
             all = all && query(&package_cls, iid, &same) == S_OK && same == pk;
             if (same) release(same);
         }
-        check(all, "IXPackageImpl3 answers for IXPackageImpl and IXPackageImpl2 too");
+        check(all, "IXPackageImpl4 answers for IXPackageImpl, IXPackageImpl2, IXPackageImpl3 and IXPackageImpl4");
         release(pk);
     }
     {

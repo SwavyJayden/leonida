@@ -997,7 +997,9 @@ bool __stdcall XPackageIsPackagedProcess() {
 
 enum class XPackageKind : uint32_t { Game = 0, Content = 1 };
 
-// XPackageDetails as the GDK reference lays it out on x64: 64 bytes.
+// XPackageDetails as the GDK reference lays it out on x64: 64 bytes (v1), extended in later GDK headers
+// (IXPackageImpl2/3) with index, count, ageRestricted and titleID (88 bytes total). Passing the extended struct by
+// its base pointer satisfies v1 (64 B), v2 (72 B) and v3/v4 (88 B) callbacks without reading past the struct.
 struct XPackageDetails {
     const char* packageIdentifier;
     uint64_t version;  // XVersion: four u16 (major, minor, build, revision) in one u64
@@ -1009,6 +1011,14 @@ struct XPackageDetails {
     bool installing;
 };
 static_assert(sizeof(XPackageDetails) == 64, "XPackageDetails layout");
+struct XPackageDetailsV3 {
+    XPackageDetails base;
+    uint32_t index;
+    uint32_t count;
+    bool ageRestricted;
+    const char* titleID;
+};
+static_assert(offsetof(XPackageDetailsV3, base) == 0 && sizeof(XPackageDetailsV3) == 88, "XPackageDetailsV3 layout");
 using XPackageEnumerationCallback = bool(CALLBACK*)(void* context, const XPackageDetails* details);
 
 static std::string current_package_identifier() {
@@ -1047,15 +1057,21 @@ HRESULT __stdcall XPackageEnumeratePackages(uint32_t kind, uint32_t /*scope*/, v
     const auto k = static_cast<XPackageKind>(kind);
     const std::vector<std::string> ids =
         k == XPackageKind::Game ? std::vector<std::string>{current_package_identifier()} : content_package_identifiers();
-    for (const std::string& id : ids) {
-        XPackageDetails details{};
-        details.packageIdentifier = id.c_str();
-        details.kind = k;
-        details.displayName = id.c_str();
-        details.description = "";
-        details.publisher = "";
-        details.storeId = "";
-        if (!callback(context, &details)) break;
+    const uint32_t total = static_cast<uint32_t>(ids.size());
+    for (uint32_t i = 0; i < total; ++i) {
+        const std::string& id = ids[i];
+        XPackageDetailsV3 details{};
+        details.base.packageIdentifier = id.c_str();
+        details.base.kind = k;
+        details.base.displayName = id.c_str();
+        details.base.description = "";
+        details.base.publisher = "";
+        details.base.storeId = "";
+        details.index = i;
+        details.count = total;
+        details.ageRestricted = false;
+        details.titleID = "";
+        if (!callback(context, &details.base)) break;
     }
     return S_OK;
 }
@@ -1152,11 +1168,13 @@ bool __stdcall XPackageUnregisterPackageInstalled(XTaskQueueRegistrationToken, b
 // returns E_NOTIMPL, so the first boot shows which ones the title needs.
 
 constexpr GUID kPackageClass = {0xaf406016, 0xe850, 0x4aa8, {0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e}};
-// IXPackageImpl3 : IXPackageImpl2 : IXPackageImpl (xgameruntime include/xpackage.idl); the class id is its own.
+// IXPackageImpl4 : IXPackageImpl3 : IXPackageImpl2 : IXPackageImpl (xgameruntime include/xpackage.idl); the class id
+// is its own. IXPackageImpl4's IID was measured from retail QueryApiImpl calls at startup.
 constexpr GUID kPackage1 = {0x3720de07, 0xe8e4, 0x44a3, {0xad, 0x32, 0xb3, 0x59, 0xe8, 0xad, 0xbe, 0x55}};
 constexpr GUID kPackage2 = {0xf92d8712, 0x2b27, 0x4d8a, {0xbf, 0x01, 0x11, 0xa6, 0xf8, 0xe3, 0xeb, 0x42}};
 constexpr GUID kPackage3 = {0xe2a4734b, 0x2f4a, 0x456d, {0xaa, 0x8f, 0xd0, 0x65, 0xe0, 0x4f, 0xb2, 0x09}};
-const GUID* const kPackageIids[] = {&kPackage1, &kPackage2, &kPackage3, nullptr};
+constexpr GUID kPackage4 = {0x0b9d556e, 0xab70, 0x43f4, {0xba, 0xa0, 0x99, 0x99, 0xac, 0x4c, 0xb0, 0x40}};
+const GUID* const kPackageIids[] = {&kPackage1, &kPackage2, &kPackage3, &kPackage4, nullptr};
 
 template <int Slot> HRESULT STDMETHODCALLTYPE package_not_implemented(void*) {
     static std::atomic<bool> s_logged{false};
@@ -1334,12 +1352,16 @@ const void* const kPackageVtable[] = {
     PN(30), PN(31),                                   // 30 GetWriteStats, 31 _unknown_
     PN(32), PN(33),                                   // 32 UninstallUWPInstance, 33 EnumerateFeatures
     reinterpret_cast<const void*>(&pkg_uninstall_package),     // 34 XPackageUninstallPackage (bool)
-    PN(35), PN(36), PN(37), PN(38),                   // IXPackageImpl2: EnumeratePackages, RegisterPackageInstalled,
-                                                      //   MountWithUiAsync, MountWithUiResult
-    PN(39), PN(40),                                   // IXPackageImpl3: EnumeratePackages, RegisterPackageInstalled
+    reinterpret_cast<const void*>(&pkg_enumerate),           // 35 IXPackageImpl2::EnumeratePackages
+    PN(36), PN(37), PN(38),                                  //    RegisterPackageInstalled, MountWithUiAsync/Result
+    reinterpret_cast<const void*>(&pkg_enumerate),           // 39 IXPackageImpl3::EnumeratePackages
+    PN(40),                                                  //    RegisterPackageInstalled
+    PN(41), PN(42), PN(43), PN(44), PN(45), PN(46),          // IXPackageImpl4+ tail (safe logging E_NOTIMPL stubs)
+    PN(47), PN(48), PN(49), PN(50), PN(51), PN(52),
+    PN(53), PN(54), PN(55),
 };
 #undef PN
-static_assert(std::size(kPackageVtable) == 41, "IUnknown + IXPackageImpl's 32 + IXPackageImpl2's 4 + IXPackageImpl3's 2");
+static_assert(std::size(kPackageVtable) == 56, "IUnknown + IXPackageImpl 1-3 + IXPackageImpl4 tail");
 
 RuntimeObject& package_object() {
     static RuntimeObject object{kPackageVtable, &kPackageClass, kPackageIids};
