@@ -483,10 +483,16 @@ int main() {
             // The clipping invocations of the mesh segments (D3D-MESH-CLIPPING-COUNTER). Without the feature they
             // read 0; with it they are the mesh-primitives count of those segments.
             const auto mesh_clipping = mixed.CInvocations - vertex_only.CInvocations;
-            if (d.mesh_shader_queries)
+            if (d.mesh_shader_queries) {
+                // The count has to be wired up, not merely self-consistent. A layer that reported the feature but
+                // never created the third pool would leave both counts at 0, and 0 >= 0 would still hold. How many
+                // primitives the mesh shader emits is the driver's, so ask for a positive count and not for a
+                // number: the mesh draw above fills the top-left quadrant, so it emits at least one.
                 EXPECT(mesh_clipping >= mesh_only.CInvocations);
-            else
+                EXPECT(mesh_only.CInvocations > 0);
+            } else {
                 EXPECT(mesh_clipping == 0);
+            }
             EXPECT(mixed.PSInvocations > vertex_only.PSInvocations);
             EXPECT(mesh_only.IAVertices == 0 && mesh_only.IAPrimitives == 0 && mesh_only.VSInvocations == 0 &&
                    mesh_only.GSInvocations == 0 && mesh_only.GSPrimitives == 0 && mesh_only.HSInvocations == 0 &&
