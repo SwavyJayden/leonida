@@ -2520,7 +2520,7 @@ private:
         // two submissions copying into one buffer, say. Vulkan orders submissions on a queue only by what their
         // barriers say, so this one starts with a full memory barrier against everything submitted before it
         // (synchronization validation: WRITE_AFTER_WRITE between vk_queue_test's back-to-back copies).
-        {
+        if (context_.vk.vkCmdPipelineBarrier) {  // a mocked context may leave it out
             VkMemoryBarrier full{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
             full.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
             full.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
