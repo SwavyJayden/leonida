@@ -145,6 +145,56 @@ void test_apply() {
     check(fault.ExceptionCode == STATUS_ACCESS_VIOLATION && fault.NumberParameters == 2 &&
               fault.ExceptionInformation[0] == 1 && fault.ExceptionInformation[1] == 0,
           "clzero on an unwritable line reports a write access violation at the line");
+
+    // try_clzero_loop EFlags: first-line fault keeps incoming flags, post-prefix fault and >64 MiB batch apply CMP.
+    const uint8_t loop12[] = {0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4};
+    if (auto* two_pages = static_cast<uint8_t*>(VirtualAlloc(nullptr, 8192, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))) {
+        const uint64_t start = reinterpret_cast<uint64_t>(two_pages);
+        DWORD old = 0;
+        VirtualProtect(two_pages, 8192, PAGE_READONLY, &old);
+        c = {};
+        c.Rax = start;
+        c.Rdx = start + 8192;
+        c.Rip = rip;
+        c.EFlags = 0x202;
+        check(ce::try_clzero_loop(loop12, sizeof loop12, &c, &fault) == ce::ClzeroLoopResult::faulted &&
+                  c.Rax == start && c.Rip == rip && c.EFlags == 0x202,
+              "clzero loop fault on first line preserves entry EFlags");
+
+        VirtualProtect(two_pages, 4096, PAGE_READWRITE, &old);
+        std::memset(two_pages, 0x5A, 4096);
+        c = {};
+        c.Rax = start;
+        c.Rdx = start + 8192;
+        c.Rip = rip;
+        c.EFlags = 0x246;  // ZF=1, CF=0 on entry
+        check(ce::try_clzero_loop(loop12, sizeof loop12, &c, &fault) == ce::ClzeroLoopResult::faulted,
+              "clzero loop post-prefix fault reported");
+        bool prefix_zeroed = true;
+        for (int i = 0; i < 4096; ++i) prefix_zeroed &= two_pages[i] == 0;
+        check(prefix_zeroed && c.Rax == start + 4096 && c.Rip == rip &&
+                  fault.ExceptionCode == STATUS_ACCESS_VIOLATION && fault.ExceptionInformation[1] == start + 4096 &&
+                  (c.EFlags & 0xC1u) == 0x81u,
+              "clzero loop post-prefix fault zeroes prefix and applies CMP flags (CF=1, ZF=0, SF=1)");
+        VirtualFree(two_pages, 0, MEM_RELEASE);
+    }
+
+    constexpr size_t kLargeSpan = (size_t(64) << 20) + 4096;
+    if (auto* large = static_cast<uint8_t*>(VirtualAlloc(nullptr, kLargeSpan, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))) {
+        const uint64_t base = reinterpret_cast<uint64_t>(large);
+        c = {};
+        c.Rax = base;
+        c.Rdx = base + kLargeSpan;
+        c.Rip = rip;
+        c.EFlags = 0x202;
+        check(ce::try_clzero_loop(loop12, sizeof loop12, &c, &fault) == ce::ClzeroLoopResult::ok &&
+                  c.Rip == rip && c.Rax == base + (uint64_t(64) << 20) && (c.EFlags & 0xC1u) == 0x81u,
+              "clzero loop >64 MiB first batch applies CMP flags (CF=1, ZF=0, SF=1)");
+        check(ce::try_clzero_loop(loop12, sizeof loop12, &c, &fault) == ce::ClzeroLoopResult::ok &&
+                  c.Rip == rip + 12 && c.Rax == base + kLargeSpan && (c.EFlags & 0xC1u) == 0x40u,
+              "clzero loop >64 MiB second batch completes with CF=0, ZF=1, SF=0");
+        VirtualFree(large, 0, MEM_RELEASE);
+    }
 }
 
 // ---- Running the real encodings ----

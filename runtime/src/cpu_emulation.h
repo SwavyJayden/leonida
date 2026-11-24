@@ -284,6 +284,22 @@ inline uint64_t gpr_read(const CONTEXT* c, int r) {
 
 enum class ClzeroLoopResult { no_match, ok, faulted };
 
+inline void apply_cmp_flags(CONTEXT* c, uint64_t lhs, uint64_t rhs) {
+    const uint64_t diff = lhs - rhs;
+    uint32_t flags = c->EFlags & ~DWORD(0x8D5u);  // clear CF(0), PF(2), AF(4), ZF(6), SF(7), OF(11)
+    if (lhs < rhs) flags |= 0x1u;                         // CF
+    uint8_t lo8 = static_cast<uint8_t>(diff);
+    lo8 ^= lo8 >> 4;
+    lo8 ^= lo8 >> 2;
+    lo8 ^= lo8 >> 1;
+    if ((lo8 & 1u) == 0) flags |= 0x4u;                   // PF
+    if ((lhs ^ rhs ^ diff) & 0x10u) flags |= 0x10u;       // AF
+    if (diff == 0) flags |= 0x40u;                        // ZF
+    if (diff >> 63) flags |= 0x80u;                       // SF
+    if (((lhs ^ rhs) & (lhs ^ diff)) >> 63) flags |= 0x800u;  // OF
+    c->EFlags = flags;
+}
+
 // Fast-path for the Zen 2 zeroing loop: `clzero; add rax, 0x40; cmp rax, reg64; jb -12` (12 bytes).
 // Zeroes the entire writable span in one memset instead of raising #UD + VirtualQuery per 64-byte line.
 inline ClzeroLoopResult try_clzero_loop(const uint8_t* code, std::size_t avail, CONTEXT* c, EXCEPTION_RECORD* fault) {
@@ -312,6 +328,7 @@ inline ClzeroLoopResult try_clzero_loop(const uint8_t* code, std::size_t avail, 
             if (cur > start) {
                 std::memset(reinterpret_cast<void*>(start), 0, std::size_t(cur - start));
                 c->Rax = cur;
+                apply_cmp_flags(c, cur, limit);
             }
             if (fault) {
                 std::memset(fault, 0, sizeof *fault);
@@ -328,22 +345,8 @@ inline ClzeroLoopResult try_clzero_loop(const uint8_t* code, std::size_t avail, 
 
     std::memset(reinterpret_cast<void*>(start), 0, std::size_t(total));
     c->Rax = end;
-    if (end >= limit) {
-        c->Rip += 12;
-        const uint64_t diff = end - limit;
-        uint32_t flags = c->EFlags & ~DWORD(0x8D5u);  // clear CF(0), PF(2), AF(4), ZF(6), SF(7), OF(11)
-        // CF is 0 because end >= limit (unsigned).
-        uint8_t lo8 = static_cast<uint8_t>(diff);
-        lo8 ^= lo8 >> 4;
-        lo8 ^= lo8 >> 2;
-        lo8 ^= lo8 >> 1;
-        if ((lo8 & 1u) == 0) flags |= 0x4u;                   // PF
-        if ((end ^ limit ^ diff) & 0x10u) flags |= 0x10u;     // AF
-        if (diff == 0) flags |= 0x40u;                        // ZF
-        if (diff >> 63) flags |= 0x80u;                       // SF
-        if (((end ^ limit) & (end ^ diff)) >> 63) flags |= 0x800u;  // OF
-        c->EFlags = flags;
-    }
+    apply_cmp_flags(c, end, limit);
+    if (end >= limit) c->Rip += 12;
     return ClzeroLoopResult::ok;
 }
 
