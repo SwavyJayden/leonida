@@ -55,7 +55,6 @@ DEBT = {
     "test_salu_xnor_saveexec_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_salu_xor_saveexec_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_alignbyte_b32.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_cvt_f32_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_dot4_int.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_dot8_int.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_fma_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
@@ -75,12 +74,9 @@ DEBT = {
     "test_valu_pk_minmax_f16.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_pk_mul_f16.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_rcp_f16.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_rcp_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_rsq_f16.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_rsq_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_sad_u32.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_sqrt_f16.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_sqrt_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_trig_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
 }
 
