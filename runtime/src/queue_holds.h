@@ -1,6 +1,8 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -66,9 +68,10 @@ public:
         if (held_.load(std::memory_order_acquire) == 0 || in_pump()) return;
         {
             std::lock_guard pump(pump_mutex_);
-            in_pump() = true;  // what is dropped may release other fences: they must not wait for this lock
-            for (Holder* holder : snapshot()) holder->discard_waiting_on(semaphore);
-            in_pump() = false;
+            PumpGuard guard(this);  // what is dropped may release other fences: they must not wait for this lock
+            for (Holder* holder : snapshot()) {
+                if (is_attached(holder)) holder->discard_waiting_on(semaphore);
+            }
         }
         pump_ready();
     }
@@ -105,16 +108,18 @@ public:
         holders_.push_back(holder);
     }
 
-    // Returns once no thread is using `holder`.
+    // Returns once no thread is using `holder` (without self-deadlocking when called re-entrantly).
     void detach(Holder* holder) {
+        if (in_pump()) {
+            std::lock_guard lock(mutex_);
+            erase_holder_locked(holder);
+            dirty_.store(true, std::memory_order_release);
+            return;
+        }
         {
             std::lock_guard pump(pump_mutex_);
             std::lock_guard lock(mutex_);
-            for (auto it = holders_.begin(); it != holders_.end(); ++it)
-                if (*it == holder) {
-                    holders_.erase(it);
-                    break;
-                }
+            erase_holder_locked(holder);
         }
         pump_ready();
     }
@@ -135,18 +140,19 @@ public:
         pump_ready();
     }
 
-    // Drops the callbacks of `owner` that have not run, and waits for one that is running.
+    // Drops the callbacks of `owner` that have not run, and waits for one that is running
+    // (without self-deadlocking when called re-entrantly).
     void cancel_after(const void* owner) {
+        if (in_pump()) {
+            std::lock_guard lock(mutex_);
+            erase_barriers_locked(owner);
+            dirty_.store(true, std::memory_order_release);
+            return;
+        }
         {
             std::lock_guard pump(pump_mutex_);
             std::lock_guard lock(mutex_);
-            for (auto it = barriers_.begin(); it != barriers_.end();)
-                if (it->owner == owner) {
-                    it = barriers_.erase(it);
-                    barrier_count_.fetch_sub(1, std::memory_order_acq_rel);
-                } else {
-                    ++it;
-                }
+            erase_barriers_locked(owner);
         }
         pump_ready();
     }
@@ -165,16 +171,19 @@ public:
         for (;;) {
             std::unique_lock pump(pump_mutex_, std::try_to_lock);
             if (!pump) return;  // another thread is releasing and will see dirty_
-            in_pump() = true;
-            while (dirty_.exchange(false, std::memory_order_acq_rel)) {
-                bool progress = true;
-                while (progress) {
-                    progress = false;
-                    for (Holder* holder : snapshot()) progress |= holder->release_ready();
+            {
+                PumpGuard guard(this);
+                while (dirty_.exchange(false, std::memory_order_acq_rel)) {
+                    bool progress = true;
+                    while (progress) {
+                        progress = false;
+                        for (Holder* holder : snapshot()) {
+                            if (is_attached(holder)) progress |= holder->release_ready();
+                        }
+                    }
+                    run_barriers();
                 }
-                run_barriers();
             }
-            in_pump() = false;
             pump.unlock();
             if (!dirty_.load(std::memory_order_acquire)) return;
         }
@@ -187,9 +196,57 @@ private:
         std::function<void()> fn;
     };
 
-    static bool& in_pump() {
-        static thread_local bool pumping = false;
-        return pumping;
+    // Track pumping per (thread, QueueHolds*) instead of one global thread_local bool so sibling QueueHolds
+    // instances work independently on the same thread and exception unwinding always clears the flag.
+    static std::vector<const QueueHolds*>& active_pumps() {
+        static thread_local std::vector<const QueueHolds*> stack;
+        return stack;
+    }
+
+    bool in_pump() const {
+        const auto& stack = active_pumps();
+        return std::find(stack.begin(), stack.end(), this) != stack.end();
+    }
+
+    struct PumpGuard {
+        const QueueHolds* self;
+        explicit PumpGuard(const QueueHolds* q) : self(q) { active_pumps().push_back(self); }
+        ~PumpGuard() {
+            auto& stack = active_pumps();
+            for (std::size_t i = stack.size(); i > 0; --i) {
+                if (stack[i - 1] == self) {
+                    stack.erase(stack.begin() + std::ptrdiff_t(i - 1));
+                    break;
+                }
+            }
+        }
+        PumpGuard(const PumpGuard&) = delete;
+        PumpGuard& operator=(const PumpGuard&) = delete;
+    };
+
+    bool is_attached(const Holder* holder) const {
+        std::lock_guard lock(mutex_);
+        return std::find(holders_.begin(), holders_.end(), holder) != holders_.end();
+    }
+
+    void erase_holder_locked(const Holder* holder) {
+        for (auto it = holders_.begin(); it != holders_.end(); ++it) {
+            if (*it == holder) {
+                holders_.erase(it);
+                break;
+            }
+        }
+    }
+
+    void erase_barriers_locked(const void* owner) {
+        for (auto it = barriers_.begin(); it != barriers_.end();) {
+            if (it->owner == owner) {
+                it = barriers_.erase(it);
+                barrier_count_.fetch_sub(1, std::memory_order_acq_rel);
+            } else {
+                ++it;
+            }
+        }
     }
 
     std::vector<Holder*> snapshot() const {
@@ -207,6 +264,7 @@ private:
                 front = barriers_.front();
             }
             for (Holder* holder : snapshot()) {
+                if (!is_attached(holder)) continue;
                 const std::uint64_t oldest = holder->oldest_held_seq();
                 if (oldest && oldest <= front.seq) return;
             }
