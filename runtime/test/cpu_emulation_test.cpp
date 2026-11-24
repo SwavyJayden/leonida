@@ -244,6 +244,33 @@ void test_live(const ce::Host& host) {
               "clzero with 66 emulated");
     }
 
+    // clzero loop fast-path: mov rax, rcx; clzero; add rax, 0x40; cmp rax, rdx; jb -12; ret
+    {
+        alignas(64) static uint8_t buf[512];
+        std::memset(buf, 0xA5, sizeof buf);
+        Code clz_loop({0x48, 0x89, 0xC8, 0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4, 0xC3});
+        check(run(clz_loop, buf + 64, buf + 320, &ex), "clzero loop ran");
+        bool loop_ok = true;
+        for (int i = 0; i < 512; ++i) loop_ok &= buf[i] == ((i >= 64 && i < 320) ? 0 : 0xA5);
+        check(loop_ok, "clzero loop zeroed exact span [64, 320)");
+
+        // REX.R limit register (r8): mov rax, rcx; mov r8, rdx; clzero; add rax, 0x40; cmp rax, r8; jb -12; ret
+        std::memset(buf, 0xA5, sizeof buf);
+        Code clz_r8({0x48, 0x89, 0xC8, 0x49, 0x89, 0xD0, 0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x4C, 0x39, 0xC0,
+                     0x72, 0xF4, 0xC3});
+        check(run(clz_r8, buf + 64, buf + 320, &ex), "clzero loop (r8) ran");
+        bool r8_ok = true;
+        for (int i = 0; i < 512; ++i) r8_ok &= buf[i] == ((i >= 64 && i < 320) ? 0 : 0xA5);
+        check(r8_ok, "clzero loop (r8) zeroed exact span [64, 320)");
+
+        // Non-multiple-of-64 limit (300): rounds up to 320, matching native do-while `cmp rax, limit; jb`.
+        std::memset(buf, 0xA5, sizeof buf);
+        check(run(clz_loop, buf + 64, buf + 300, &ex), "clzero loop (unaligned limit) ran");
+        bool unaligned_ok = true;
+        for (int i = 0; i < 512; ++i) unaligned_ok &= buf[i] == ((i >= 64 && i < 320) ? 0 : 0xA5);
+        check(unaligned_ok, "clzero loop (unaligned limit 300) zeroed span [64, 320)");
+    }
+
     // mov rax,rcx; xor ecx,ecx; xor edx,edx; monitorx; xor eax,eax; xor ecx,ecx; mwaitx; ret
     // (no timer: an interrupt or a store ends a native wait; the emulated one returns at once)
     Code mon({0x48, 0x89, 0xC8, 0x31, 0xC9, 0x31, 0xD2, 0x0F, 0x01, 0xFA, 0x31, 0xC0, 0x31, 0xC9, 0x0F, 0x01, 0xFB,
