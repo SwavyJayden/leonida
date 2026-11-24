@@ -113,15 +113,18 @@ VOP2_INT16 = {"v_add_u16", "v_sub_u16", "v_subrev_u16", "v_mul_lo_u16", "v_lshlr
 def partial_write(ins, op):
     """Whether a VALU instruction writes only part of its 32-bit destination and keeps the rest (design.md, "16-bit
     results" and "16-bit SDWA result"): SDWA with a byte or word dst_sel and UNUSED_PRESERVE; otherwise a 16-bit
-    result, the first type in the name (v_add_f16, v_cvt_f16_f32, v_mad_u16, v_add_u16_e64), except the VOP2 16-bit
-    integer ops in _e32 form, which define the whole register. Packed and 32-bit results are whole: v_pk_*,
-    v_cvt_pk*, v_sad_*, v_cvt_f32_f16, v_mad_u32_u16. When unsure it says partial, which only costs tier A."""
+    result, the first type in the name (v_add_f16, v_cvt_f16_f32, v_mad_u16, v_add_u16_e64), or v_sat_pk_u8_* (two
+    packed u8 values in vdst[15:0], preserving vdst[31:16]), except the VOP2 16-bit integer ops in _e32 form, which
+    define the whole register. Packed and 32-bit results are whole: v_pk_*, v_cvt_pk*, v_sad_*, v_cvt_f32_f16,
+    v_mad_u32_u16. When unsure it says partial, which only costs tier A."""
     mods = ins.get("mods") or []
     op = ins.get("op", op)   # the printed name: base_op drops _e32/_e64/_sdwa, which decide it here
     if "_sdwa" in op or any(m.startswith("dst_sel:") for m in mods):
         return "dst_unused:UNUSED_PRESERVE" in mods and any(m.startswith(("dst_sel:BYTE_", "dst_sel:WORD_"))
                                                              for m in mods)
     name = op.split("_e32")[0].split("_e64")[0].split("_dpp")[0]
+    if name.startswith("v_sat_pk_u8_"):
+        return True
     if name.startswith(("v_pk_", "v_cvt_pk", "v_sad_")):
         return False
     first = next((p for p in name.split("_")[1:] if _TYPE.match(p)), None)
@@ -138,7 +141,7 @@ _INT16_VOP2_OPS = (
 )
 # 16-bit-suffixed or -prefixed mnemonics that write the full 32-bit destination register.
 _FULL32_V16_PREFIXES = (
-    "v_pk_", "v_pack_", "v_cvt_pk", "v_sat_pk", "v_sad_", "v_msad_", "v_qsad_", "v_mqsad_",
+    "v_pk_", "v_pack_", "v_cvt_pk", "v_sad_", "v_msad_", "v_qsad_", "v_mqsad_",
     "v_cmp", "v_cmpx", "v_interp_p1", "v_dot", "v_cvt_f32_", "v_cvt_u32_", "v_cvt_i32_", "v_cvt_f64_",
     "v_mad_i32_", "v_mad_u32_",
 )

@@ -193,6 +193,48 @@ class PartialDestSoundnessTests(unittest.TestCase):
         self.assertIs(srcs_vop3[0], v6)
         self.assertNotIn(v6, srcs_vop2)
 
+    def test_sat_pk_u8_i16_is_16bit_partial_write(self):
+        v0 = {"k": "vgpr", "r": 0, "n": 1}
+        v6 = {"k": "vgpr", "r": 6, "n": 1}
+        v10 = {"k": "vgpr", "r": 10, "n": 1}
+        s4 = {"k": "sgpr", "r": 4, "n": 1}
+        s6 = {"k": "sgpr", "r": 6, "n": 1}
+        imm0 = {"k": "imm", "v": 0}
+        imm16 = {"k": "imm", "v": 16}
+        imm_m1 = {"k": "imm", "v": -1}
+        target_param0 = {"k": "special", "t": "param0"}
+
+        for op in ("v_sat_pk_u8_i16_e32", "v_sat_pk_u8_i16_e64"):
+            ins = {"op": op, "args": [v6, s4], "mods": []}
+            self.assertTrue(wave64_halves.partial_write(ins, op), op)
+            _, srcs, _, _ = wave64_halves.operands(ins)
+            self.assertIs(srcs[0], v6, op)
+
+            # v_sat_pk_u8_i16 writes vdst[15:0] and preserves prior lane-id taint in vdst[31:16].
+            res = wave64_halves.analyse([[
+                {"op": "v_mbcnt_lo_u32_b32", "args": [v6, imm_m1, imm0], "mods": []},
+                {"op": "v_mbcnt_hi_u32_b32", "args": [v6, imm_m1, v6], "mods": []},
+                {"op": "v_lshlrev_b32_e32", "args": [v6, imm16, v6], "mods": []},
+                ins,
+                {"op": "exp", "args": [target_param0, v6, v6, v6, v6], "mods": ["done"]},
+                {"op": "s_endpgm", "args": [], "mods": []},
+            ]], [[]], {}, "vs")
+            self.assertEqual(res["tier"], "C", f"{op}: {res}")
+            self.assertIn("lane-id", res["reasons"], f"{op}: {res}")
+
+            # Uniform readlane must be rejected when high half carries per-lane v0.
+            rl_res = wave64_halves.analyse([[
+                {"op": "v_lshlrev_b32_e32", "args": [v10, imm16, v0], "mods": []},
+                {"op": op, "args": [v10, s4], "mods": []},
+                {"op": "v_readlane_b32", "args": [s6, v10, imm0], "mods": []},
+                {"op": "v_mov_b32_e32", "args": [v6, s6], "mods": []},
+                {"op": "exp", "args": [target_param0, v6, v6, v6, v6], "mods": ["done"]},
+                {"op": "s_endpgm", "args": [], "mods": []},
+            ]], [[]], {}, "vs")
+            self.assertEqual(rl_res["tier"], "C", f"{op} readlane: {rl_res}")
+            self.assertIn("cross-lane", rl_res["reasons"], f"{op} readlane: {rl_res}")
+            self.assertNotIn("readlane-uniform", rl_res["idioms"], f"{op} readlane: {rl_res}")
+
     def test_16bit_clean_controls(self):
         self.assert_tier_a_and_agrees("vs_u16_e32_clean", [
             "v_mbcnt_lo_u32_b32 v6, -1, 0",
