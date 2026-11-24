@@ -437,6 +437,17 @@ def test_mesh_cull_primitive_is_block_bool(make_shader):
     assert re.search(r"OpAccessChain %_ptr_Out_bool_ms %ms_cull %\w+ %c0", spvasm)
 
 
+def test_mesh_cull_precedes_clip_vertex_block_in_entrypoint(make_shader):
+    """%ms_cull must precede %ms_out_vtx in OpEntryPoint MeshEXT: AMD Windows LLPC crashes (0xC0000005) otherwise."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "ms_clip.asm"), encoding="utf-8") as f:
+        shader = make_shader(f.read(), "ms_clip", dxbc=SAMPLE_DXBC["ms_clip"])
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    ep = next(ln for ln in spvasm.splitlines() if "OpEntryPoint MeshEXT" in ln)
+    assert "%ms_cull" in ep and "%ms_out_vtx" in ep
+    assert ep.index("%ms_cull") < ep.index("%ms_out_vtx"), ep
+
+
 # ---- pos1..pos3: ClipDistance / CullDistance / misc exports (VS & MS) ----
 
 def _vgpr_to_index_map(spvasm, array_var, ptr_type):
