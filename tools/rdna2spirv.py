@@ -397,6 +397,7 @@ class Gen:
         self.fmt_norm_fn = None    # lines of the shared exact norm quotient for a run-time width (SHADER-849)
         self.fmt_enc_fn = None    # lines of the format-encode and element-size functions, once a typed store needs them
         self.uses_fmt_tables = False    # %fmt_desc_tab / %fmt_norm_rep_tab: a format's kind and channel widths
+        self.uses_fmt_enc_table = False # %fmt_enc_tab: per-format encode kind, channel count, widths and B/R swap bit
         self.x_round_fns: dict[str, list[str]] = {}       # emulate_inline: helper functions for x_round pre-barrier setup
         self.x_round_fn_types: dict[int, str] = {}        # emulate_inline: arity -> OpTypeFunction id for x_round_fns
         self.sgpr_imm = {}    # SGPR -> literal an s_mov_b32 put there earlier in this basic block (see gather_addr_modes)
@@ -2476,6 +2477,28 @@ class Gen:
         The quotient m / (2^n - 1) is m's n bits repeated; the constant holds the first 64 of them."""
         return [0] + [sum(1 << (64 - n * (k + 1)) for k in range(64 // n)) for n in range(1, 17)]
 
+    # Run-time FORMAT encode (branch-free table-driven twin of SHADER-849): one uint per 7-bit format code.
+    ENC_NONE, ENC_F32, ENC_U32, ENC_I32, ENC_UINT, ENC_SINT, ENC_F16, ENC_UNORM, ENC_SNORM, ENC_UFLOAT = range(10)
+    ENC_KINDS = {"f32": ENC_F32, "u32": ENC_U32, "i32": ENC_I32, "uint": ENC_UINT, "sint": ENC_SINT,
+                 "f16": ENC_F16, "unorm": ENC_UNORM, "uscaled": ENC_UNORM,
+                 "snorm": ENC_SNORM, "sscaled": ENC_SNORM, "ufloat": ENC_UFLOAT}
+
+    @classmethod
+    def fmt_enc_table(cls):
+        """One uint per format code: enc_kind (0..9) | ncomp << 4 | widths[0..3] << (7+6*i) | br_swap << 31."""
+        table = []
+        for code in range(128):
+            entry = cls.FORMATS.get(code)
+            kind = cls.ENC_KINDS.get(entry[1], cls.ENC_NONE) if entry else cls.ENC_NONE
+            widths = entry[2] if entry else ()
+            word = kind | (len(widths) << 4)
+            for i in range(4):
+                word |= (widths[i] if i < len(widths) else 0) << (7 + 6 * i)
+            if code in (50, 56):
+                word |= 1 << 31
+            table.append(word)
+        return table
+
     def encode_norm_bits(self, u, w, signed):
         """Exact single-rounded UNORM/SNORM channel bits from an f32 bit pattern u (NaN already mapped to 0).
 
@@ -4305,63 +4328,212 @@ class Gen:
             return addr, d3, in_b, (part if mode in (None, 0, 3) else None), step
         return addr, d3, in_b, step
 
+    def fmt_enc_channel(self, packed_param):
+        """Encode one channel of an arbitrary run-time FORMAT (branch-free): packed_param = v4uint(mode, wid, fval, ival)."""
+        mode, wid, fval, ival = (self.tmp() for _ in range(4))
+        self.emit(f"{mode} = OpCompositeExtract %uint {packed_param} 0")
+        self.emit(f"{wid} = OpCompositeExtract %uint {packed_param} 1")
+        self.emit(f"{fval} = OpCompositeExtract %uint {packed_param} 2")
+        self.emit(f"{ival} = OpCompositeExtract %uint {packed_param} 3")
+        # Clamp width to [2, 16] for narrow integer and norm conversions so shifts are always well-defined.
+        w_lo, w_n, w_n1 = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{w_lo} = OpExtInst %uint %glsl UMax {wid} {self.cu(2)}")
+        self.emit(f"{w_n} = OpExtInst %uint %glsl UMin {w_lo} {self.cu(16)}")
+        self.emit(f"{w_n1} = OpISub %uint {w_n} {self.cu(1)}")
+        # Narrow UINT: saturate to (1 << w_n) - 1.
+        u_one, u_max, c_uint = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{u_one} = OpShiftLeftLogical %uint {self.cu(1)} {w_n}")
+        self.emit(f"{u_max} = OpISub %uint {u_one} {self.cu(1)}")
+        self.emit(f"{c_uint} = OpExtInst %uint %glsl UMin {ival} {u_max}")
+        # Narrow SINT: signed clamp to [-(1 << (w_n - 1)), (1 << (w_n - 1)) - 1].
+        s_half, s_lo, s_hi, s_clamped, c_sint = (self.tmp() for _ in range(5))
+        self.emit(f"{s_half} = OpShiftLeftLogical %uint {self.cu(1)} {w_n1}")
+        self.emit(f"{s_lo} = OpISub %uint {self.cu(0)} {s_half}")
+        self.emit(f"{s_hi} = OpISub %uint {s_half} {self.cu(1)}")
+        self.emit(f"{s_clamped} = OpExtInst %int %glsl SClamp {self.as_int(ival)} {self.as_int(s_lo)} {self.as_int(s_hi)}")
+        self.emit(f"{c_sint} = OpBitcast %uint {s_clamped}")
+        # UNORM / USCALED (signed=False) and SNORM / SSCALED (signed=True): single-rounded 64-bit product.
+        is_sn, sw, sc_one, scale, scale64 = (self.tmp() for _ in range(5))
+        self.emit(f"{is_sn} = OpIEqual %bool {mode} {self.cu(self.ENC_SNORM)}")
+        self.emit(f"{sw} = OpSelect %uint {is_sn} {w_n1} {w_n}")
+        self.emit(f"{sc_one} = OpShiftLeftLogical %uint {self.cu(1)} {sw}")
+        self.emit(f"{scale} = OpISub %uint {sc_one} {self.cu(1)}")
+        self.emit(f"{scale64} = OpUConvert %ulong {scale}")
+        sign, neg, a = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{sign} = OpShiftRightLogical %uint {fval} {self.cu(31)}")
+        self.emit(f"{neg} = OpINotEqual %bool {sign} {self.cu(0)}")
+        self.emit(f"{a} = OpBitwiseAnd %uint {fval} {self.cu(0x7FFFFFFF)}")
+        small, ge1, exp_, ec, ec2, shift, sh64, sh1, sh1_64 = (self.tmp() for _ in range(9))
+        self.emit(f"{small} = OpULessThan %bool {a} {self.cu(0x37000000)}")
+        self.emit(f"{ge1} = OpUGreaterThanEqual %bool {a} {self.cu(0x3F800000)}")
+        self.emit(f"{exp_} = OpShiftRightLogical %uint {a} {self.cu(23)}")
+        self.emit(f"{ec} = OpExtInst %uint %glsl UMax {exp_} {self.cu(110)}")
+        self.emit(f"{ec2} = OpExtInst %uint %glsl UMin {ec} {self.cu(126)}")
+        self.emit(f"{shift} = OpISub %uint {self.cu(150)} {ec2}")
+        self.emit(f"{sh64} = OpUConvert %ulong {shift}")
+        self.emit(f"{sh1} = OpISub %uint {shift} {self.cu(1)}")
+        self.emit(f"{sh1_64} = OpUConvert %ulong {sh1}")
+        mant, m, m64, p, half, ps, q64, q, mag1, mag = (self.tmp() for _ in range(10))
+        self.emit(f"{mant} = OpBitwiseAnd %uint {a} {self.cu(0x7FFFFF)}")
+        self.emit(f"{m} = OpBitwiseOr %uint {mant} {self.cu(0x800000)}")
+        self.emit(f"{m64} = OpUConvert %ulong {m}")
+        self.emit(f"{p} = OpIMul %ulong {m64} {scale64}")
+        self.emit(f"{half} = OpShiftLeftLogical %ulong {self.cl(1)} {sh1_64}")
+        self.emit(f"{ps} = OpIAdd %ulong {p} {half}")
+        self.emit(f"{q64} = OpShiftRightLogical %ulong {ps} {sh64}")
+        self.emit(f"{q} = OpUConvert %uint {q64}")
+        self.emit(f"{mag1} = OpSelect %uint {small} {self.cu(0)} {q}")
+        self.emit(f"{mag} = OpSelect %uint {ge1} {scale} {mag1}")
+        nmag, c_unorm, c_snorm, c_norm = (self.tmp() for _ in range(4))
+        self.emit(f"{nmag} = OpISub %uint {self.cu(0)} {mag}")
+        self.emit(f"{c_unorm} = OpSelect %uint {neg} {self.cu(0)} {mag}")
+        self.emit(f"{c_snorm} = OpSelect %uint {neg} {nmag} {mag}")
+        self.emit(f"{c_norm} = OpSelect %uint {is_sn} {c_snorm} {c_unorm}")
+        # F16: exact RTZ + NaN payload preserving conversion.
+        c_f16 = self.mem_f16(self.tof(fval))
+        # UFLOAT (widths 10 -> mb=5, 11 -> mb=6): reuse a, neg, exp_, m already computed above.
+        is_w11 = self.tmp()
+        self.emit(f"{is_w11} = OpIEqual %bool {wid} {self.cu(11)}")
+        c_dsh_base, c_rsh, c_mmask, c_inf, c_maxfin = (self.tmp() for _ in range(5))
+        self.emit(f"{c_dsh_base} = OpSelect %uint {is_w11} {self.cu(130)} {self.cu(131)}")
+        self.emit(f"{c_rsh} = OpSelect %uint {is_w11} {self.cu(17)} {self.cu(18)}")
+        self.emit(f"{c_mmask} = OpSelect %uint {is_w11} {self.cu(63)} {self.cu(31)}")
+        self.emit(f"{c_inf} = OpSelect %uint {is_w11} {self.cu(31 << 6)} {self.cu(31 << 5)}")
+        self.emit(f"{c_maxfin} = OpSelect %uint {is_w11} {self.cu((30 << 6) | 63)} {self.cu((30 << 5) | 31)}")
+        (uf_sh0, uf_shc, uf_dn, uf_nr0, uf_nr, uf_nm, uf_nm1, uf_nz, uf_nmant, uf_nanb,
+         uf_isnan, uf_isinf, uf_big, uf_norm, uf_r0, uf_r1, uf_r2, uf_r3, uf_snan, uf_ng,
+         c_ufloat) = (self.tmp() for _ in range(21))
+        self.emit(f"{uf_sh0} = OpISub %uint {c_dsh_base} {exp_}")
+        self.emit(f"{uf_shc} = OpExtInst %uint %glsl UMin {uf_sh0} {self.cu(31)}")
+        self.emit(f"{uf_dn} = OpShiftRightLogical %uint {m} {uf_shc}")
+        self.emit(f"{uf_nr0} = OpISub %uint {a} {self.cu(112 << 23)}")
+        self.emit(f"{uf_nr} = OpShiftRightLogical %uint {uf_nr0} {c_rsh}")
+        self.emit(f"{uf_nm} = OpShiftRightLogical %uint {a} {c_rsh}")
+        self.emit(f"{uf_nm1} = OpBitwiseAnd %uint {uf_nm} {c_mmask}")
+        self.emit(f"{uf_nz} = OpIEqual %bool {uf_nm1} {self.cu(0)}")
+        self.emit(f"{uf_nmant} = OpSelect %uint {uf_nz} {self.cu(1)} {uf_nm1}")
+        self.emit(f"{uf_nanb} = OpBitwiseOr %uint {uf_nmant} {c_inf}")
+        self.emit(f"{uf_isnan} = OpUGreaterThan %bool {a} {self.cu(0x7F800000)}")
+        self.emit(f"{uf_isinf} = OpIEqual %bool {a} {self.cu(0x7F800000)}")
+        self.emit(f"{uf_big} = OpUGreaterThanEqual %bool {a} {self.cu(0x47800000)}")
+        self.emit(f"{uf_norm} = OpUGreaterThanEqual %bool {a} {self.cu(0x38800000)}")
+        self.emit(f"{uf_r0} = OpSelect %uint {uf_norm} {uf_nr} {uf_dn}")
+        self.emit(f"{uf_r1} = OpSelect %uint {uf_big} {c_maxfin} {uf_r0}")
+        self.emit(f"{uf_r2} = OpSelect %uint {uf_isinf} {c_inf} {uf_r1}")
+        self.emit(f"{uf_r3} = OpSelect %uint {uf_isnan} {uf_nanb} {uf_r2}")
+        self.emit(f"{uf_snan} = OpLogicalNot %bool {uf_isnan}")
+        self.emit(f"{uf_ng} = OpLogicalAnd %bool {neg} {uf_snan}")
+        self.emit(f"{c_ufloat} = OpSelect %uint {uf_ng} {self.cu(0)} {uf_r3}")
+        # Select converted field by mode (ENC_NONE -> 0).
+        res = self.cu(0)
+        for kind, val in ((self.ENC_UFLOAT, c_ufloat), (self.ENC_SNORM, c_norm), (self.ENC_UNORM, c_norm),
+                          (self.ENC_F16, c_f16), (self.ENC_SINT, c_sint), (self.ENC_UINT, c_uint),
+                          (self.ENC_I32, ival), (self.ENC_U32, ival), (self.ENC_F32, fval)):
+            eq, sel = self.tmp(), self.tmp()
+            self.emit(f"{eq} = OpIEqual %bool {mode} {self.cu(kind)}")
+            self.emit(f"{sel} = OpSelect %uint {eq} {val} {res}")
+            res = sel
+        return res
+
     def format_encode_call(self, fmt, fc, normalized, unorm_view, ic, signed_ic, two):
         """The 4 words of the element a typed store writes, per the run-time FORMAT, and its size in bytes (0 for a code
-        outside FORMATS: nothing is stored). One function per module like the decode (format_decode_call): inlined, every
-        store site carried every format's encode, three times the module of the older table (cs_store 169 KB -> 503 KB).
+        outside FORMATS: nothing is stored). Branch-free table-driven encode (%fmt_enc_tab + %fmt_enc_chan + %fmt_encode_fn)
+        and table-driven element size (%fmt_size_tab), replacing the 77-branch per-format if-chain.
         The five lists are 4 uint ids each: the raw float bits, the same with NaN -> 0 (NORM stores), the B/R-swapped
         view for 50 and 56, the integers and the sign-extended d16 integers; a component the instruction does not give is 0."""
         if self.fmt_enc_fn is None:
+            self.uses_fmt_enc_table = True
+            for v in Gen.fmt_enc_table():
+                self.cu(v)
             names = ["%fe_fmt"] + [f"%fe_{g}{i}" for g in "fnvis" for i in range(4)] + [f"%fe_t{i}" for i in range(8)]
-            saved, self.body = self.body, []
             params = names[1:21]
             tw = names[21:29]       # the channels a two-component V# store takes: norm, float, int, signed int (2 each)
             lists = [params[4 * g:4 * g + 4] for g in range(5)]
-            for code, (size, kind, widths) in self.FORMATS.items():
-                e = self.tmp()
-                self.emit(f"{e} = OpIEqual %bool {names[0]} {self.cu(code)}")
-                ld, le = self.tmp() + "_s", self.tmp() + "_se"
-                self.emit(f"OpSelectionMerge {le} None")
-                self.emit(f"OpBranchConditional {e} {ld} {le}")
-                self.emit(f"{ld} = OpLabel")
-                source = lists[1] if kind in ("unorm", "snorm", "uscaled", "sscaled") else lists[0]
-                if code in (50, 56):
-                    source = lists[2]
-                integer_source = lists[4] if kind in ("i32", "sint") else lists[3]
-                if len(widths) == 2:
-                    # through a V# a two-component format takes the channels DST_SEL picks (x, y; x, w; y, x; ...), swizzled
-                    # at the store site like gfx1036 does it; tbuffer stores are encoded in line, with (x, y)
-                    source = tw[0:2] if kind in ("unorm", "snorm", "uscaled", "sscaled") else tw[2:4]
-                    integer_source = tw[6:8] if kind in ("i32", "sint") else tw[4:6]
-                words = self.encode_format(source[:len(widths)] + [self.cu(0)] * 4,
-                                           integer_source[:len(widths)] + [self.cu(0)] * 4, code)
-                words = (words + [self.cu(0)] * 4)[:4]
-                res = self.tmp()
-                self.emit(f"{res} = OpCompositeConstruct %v4uint_fmt " + " ".join(words))
-                self.emit(f"OpReturnValue {res}")
-                self.emit(f"{le} = OpLabel")
-            zero = self.tmp()
-            self.emit(f"{zero} = OpCompositeConstruct %v4uint_fmt " + " ".join([self.cu(0)] * 4))
-            self.emit(f"OpReturnValue {zero}")
+            # Build branch-free single-channel encoder %fmt_enc_chan(%fec_args: v4uint).
+            saved, self.body = self.body, []
+            chan_res = self.fmt_enc_channel("%fec_args")
+            chan_lines, self.body = self.body, saved
+            # Build branch-free 4-channel packer %fmt_encode_fn.
+            saved, self.body = self.body, []
+            desc = self.fmt_table_get("%_ptr_Private_fmt_enc_elem", "%fmt_enc_tab", names[0])
+            mode, ncomp_raw, ncomp, br_bit, is_br = (self.tmp() for _ in range(5))
+            self.emit(f"{mode} = OpBitwiseAnd %uint {desc} {self.cu(15)}")
+            self.emit(f"{ncomp_raw} = OpShiftRightLogical %uint {desc} {self.cu(4)}")
+            self.emit(f"{ncomp} = OpBitwiseAnd %uint {ncomp_raw} {self.cu(7)}")
+            self.emit(f"{br_bit} = OpShiftRightLogical %uint {desc} {self.cu(31)}")
+            self.emit(f"{is_br} = OpINotEqual %bool {br_bit} {self.cu(0)}")
+            is_un, is_sn, is_norm = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{is_un} = OpIEqual %bool {mode} {self.cu(self.ENC_UNORM)}")
+            self.emit(f"{is_sn} = OpIEqual %bool {mode} {self.cu(self.ENC_SNORM)}")
+            self.emit(f"{is_norm} = OpLogicalOr %bool {is_un} {is_sn}")
+            is_i32, is_si, is_sint, is_2 = (self.tmp() for _ in range(4))
+            self.emit(f"{is_i32} = OpIEqual %bool {mode} {self.cu(self.ENC_I32)}")
+            self.emit(f"{is_si} = OpIEqual %bool {mode} {self.cu(self.ENC_SINT)}")
+            self.emit(f"{is_sint} = OpLogicalOr %bool {is_i32} {is_si}")
+            self.emit(f"{is_2} = OpIEqual %bool {ncomp} {self.cu(2)}")
+            widths = []
+            for i in range(4):
+                raw, w = self.tmp(), self.tmp()
+                self.emit(f"{raw} = OpShiftRightLogical %uint {desc} {self.cu(7 + 6 * i)}")
+                self.emit(f"{w} = OpBitwiseAnd %uint {raw} {self.cu(63)}")
+                widths.append(w)
+            offsets = [self.cu(0)]
+            for i in range(1, 4):
+                o = self.tmp()
+                self.emit(f"{o} = OpIAdd %uint {offsets[-1]} {widths[i - 1]}")
+                offsets.append(o)
+            words = [self.cu(0)] * 4
+            for c in range(4):
+                f_base, f_br, i_base = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{f_base} = OpSelect %uint {is_norm} {lists[1][c]} {lists[0][c]}")
+                self.emit(f"{f_br} = OpSelect %uint {is_br} {lists[2][c]} {f_base}")
+                self.emit(f"{i_base} = OpSelect %uint {is_sint} {lists[4][c]} {lists[3][c]}")
+                if c < 2:
+                    f_tw, i_tw, fval, ival = (self.tmp() for _ in range(4))
+                    self.emit(f"{f_tw} = OpSelect %uint {is_norm} {tw[c]} {tw[2 + c]}")
+                    self.emit(f"{i_tw} = OpSelect %uint {is_sint} {tw[6 + c]} {tw[4 + c]}")
+                    self.emit(f"{fval} = OpSelect %uint {is_2} {f_tw} {f_br}")
+                    self.emit(f"{ival} = OpSelect %uint {is_2} {i_tw} {i_base}")
+                else:
+                    fval, ival = f_br, i_base
+                arg_vec, field = self.tmp(), self.tmp()
+                self.emit(f"{arg_vec} = OpCompositeConstruct %v4uint_fmt {mode} {widths[c]} {fval} {ival}")
+                self.emit(f"{field} = OpFunctionCall %uint %fmt_enc_chan {arg_vec}")
+                # Mask to widths[c] bits (0 when widths[c] == 0, full 32 bits when widths[c] == 32).
+                w_lo5, one_w, m_sm, is32, mask, masked = (self.tmp() for _ in range(6))
+                self.emit(f"{w_lo5} = OpBitwiseAnd %uint {widths[c]} {self.cu(31)}")
+                self.emit(f"{one_w} = OpShiftLeftLogical %uint {self.cu(1)} {w_lo5}")
+                self.emit(f"{m_sm} = OpISub %uint {one_w} {self.cu(1)}")
+                self.emit(f"{is32} = OpIEqual %bool {widths[c]} {self.cu(32)}")
+                self.emit(f"{mask} = OpSelect %uint {is32} {self.cu(0xFFFFFFFF)} {m_sm}")
+                self.emit(f"{masked} = OpBitwiseAnd %uint {field} {mask}")
+                if c == 0:
+                    words[0] = masked
+                else:
+                    wi, bo, placed = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{wi} = OpShiftRightLogical %uint {offsets[c]} {self.cu(5)}")
+                    self.emit(f"{bo} = OpBitwiseAnd %uint {offsets[c]} {self.cu(31)}")
+                    self.emit(f"{placed} = OpShiftLeftLogical %uint {masked} {bo}")
+                    for d in range(c + 1):
+                        eq_d, add_d, nxt_w = self.tmp(), self.tmp(), self.tmp()
+                        self.emit(f"{eq_d} = OpIEqual %bool {wi} {self.cu(d)}")
+                        self.emit(f"{add_d} = OpSelect %uint {eq_d} {placed} {self.cu(0)}")
+                        self.emit(f"{nxt_w} = OpBitwiseOr %uint {words[d]} {add_d}")
+                        words[d] = nxt_w
+            res = self.tmp()
+            self.emit(f"{res} = OpCompositeConstruct %v4uint_fmt " + " ".join(words))
+            self.emit(f"OpReturnValue {res}")
             lines, self.body = self.body, saved
-            size_lines = []
-            outer, self.body = self.body, []
-            sz = self.cu(0)
-            for code, (size, _, _) in self.FORMATS.items():
-                e, n2 = self.tmp(), self.tmp()
-                self.emit(f"{e} = OpIEqual %bool %fs_fmt {self.cu(code)}")
-                self.emit(f"{n2} = OpSelect %uint {e} {self.cu(size)} {sz}")
-                sz = n2
-            size_lines, self.body = self.body, outer
-            self.fmt_enc_fn = (["%fmt_encode_fn = OpFunction %v4uint_fmt None %fn_fmt_encode"] +
+            self.fmt_enc_fn = (["%fmt_enc_chan = OpFunction %uint None %fn_fmt_enc_chan",
+                                "%fec_args = OpFunctionParameter %v4uint_fmt",
+                                "%fec_entry = OpLabel"] + chan_lines + [f"OpReturnValue {chan_res}", "OpFunctionEnd",
+                                "%fmt_encode_fn = OpFunction %v4uint_fmt None %fn_fmt_encode"] +
                                [f"{q} = OpFunctionParameter %uint" for q in names] + ["%fe_entry = OpLabel"] + lines +
-                               ["OpFunctionEnd", "%fmt_size_fn = OpFunction %uint Pure %fn_tbuffer_norm",
-                                "%fs_fmt = OpFunctionParameter %uint", "%fs_entry = OpLabel"] + size_lines +
-                               [f"OpReturnValue {sz}", "OpFunctionEnd"])
-        r, size = self.tmp(), self.tmp()
+                               ["OpFunctionEnd"])
+        r = self.tmp()
         args = [fmt] + fc + normalized + unorm_view + ic + signed_ic + two
         self.emit(f"{r} = OpFunctionCall %v4uint_fmt %fmt_encode_fn " + " ".join(args))
-        self.emit(f"{size} = OpFunctionCall %uint %fmt_size_fn {fmt}")
+        size = self.fmt_size_of(fmt)
         words = []
         for c in range(4):
             x = self.tmp()
@@ -15403,6 +15575,7 @@ def assemble(gen):
          (["%fmt_norm_mask", "%fmt_f32_mask"] if gen.uses_d16_image else []) + \
         (["%fmt_size_tab"] if gen.uses_fmt_size else []) + \
         (["%fmt_desc_tab", "%fmt_norm_rep_tab"] if gen.uses_fmt_tables else []) + \
+        (["%fmt_enc_tab"] if gen.uses_fmt_enc_table else []) + \
         [f"%stv{c}_{d}" for d in sorted(gen.uses_store_views) for c in range(3)] + \
         [f"%itx{c}_{d}" for d in sorted(gen.uses_int_fetch) for c in (1, 2)]
     psb = gen.uses_psb
@@ -15706,6 +15879,8 @@ def assemble(gen):
     if gen.uses_fmt_tables:
         gen.cu(128)
         gen.cu(17)
+    if gen.uses_fmt_enc_table:
+        gen.cu(128)
     if gen.uses_store_views or gen.uses_int_fetch:
         gen.cu(16)
         for words in Gen.int_format_masks():
@@ -15717,8 +15892,8 @@ def assemble(gen):
     written = dict(gen.consts)     # what the module defines; insert_late_constants adds what assemble asks for later
     if gen.desc_fn:
         types.append("%fn_desc_lookup = OpTypeFunction %uint " + " ".join(["%uint"] * 8))
-    if gen.tbuffer_norm_fns or gen.fmt_enc_fn:
-        types.append("%fn_tbuffer_norm = OpTypeFunction %uint %uint")      # also the element-size function's type
+    if gen.tbuffer_norm_fns:
+        types.append("%fn_tbuffer_norm = OpTypeFunction %uint %uint")
     if gen.fmt_fn or gen.fmt_enc_fn:
         types.append("%v4uint_fmt = OpTypeVector %uint 4")      # dedupe_types merges it with any other uvec4
     if gen.fmt_fn:
@@ -15727,6 +15902,7 @@ def assemble(gen):
         types.append("%fn_fmt_dec = OpTypeFunction %uint %uint %v4uint_fmt")
         types.append("%fn_fmt_norm = OpTypeFunction %uint %uint %uint")
     if gen.fmt_enc_fn:
+        types.append("%fn_fmt_enc_chan = OpTypeFunction %uint %v4uint_fmt")
         types.append("%fn_fmt_encode = OpTypeFunction %v4uint_fmt " + " ".join(["%uint"] * 29))
     for arity, fn_type in sorted(gen.x_round_fn_types.items()):
         types.append(f"{fn_type} = OpTypeFunction %uint " + " ".join(["%uint"] * arity))
@@ -15789,6 +15965,13 @@ def assemble(gen):
                      " ".join(gen.lconsts[v] for v in Gen.fmt_norm_reps()))
         gvars += ["%fmt_desc_tab = OpVariable %_ptr_Private_fmt_desc Private %fmt_desc_init",
                   "%fmt_norm_rep_tab = OpVariable %_ptr_Private_fmt_rep Private %fmt_norm_rep_init"]
+    if gen.uses_fmt_enc_table:
+        types += [f"%fmt_enc_arr = OpTypeArray %uint {gen.cu(128)}",
+                  "%_ptr_Private_fmt_enc = OpTypePointer Private %fmt_enc_arr",
+                  "%_ptr_Private_fmt_enc_elem = OpTypePointer Private %uint"]
+        types.append("%fmt_enc_init = OpConstantComposite %fmt_enc_arr " +
+                     " ".join(gen.consts[v] for v in Gen.fmt_enc_table()))
+        gvars += ["%fmt_enc_tab = OpVariable %_ptr_Private_fmt_enc Private %fmt_enc_init"]
     if gen.uses_store_views or gen.uses_int_fetch or gen.uses_d16_image:
         u, si = Gen.int_format_masks()
         types += ["%v4uint_st = OpTypeVector %uint 4", "%v4int_st = OpTypeVector %int 4",
