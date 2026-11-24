@@ -52,17 +52,35 @@ def _translate_cs(lines, rsrc2=0x18088, w64_emulate=False) -> str:
             rdna2spirv.WAVE64_EMULATE = prev
 
 
+def _check_cfg(spv: str):
+    body = []
+    in_body = False
+    for raw in spv.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = si._LINE.match(line)
+        assert m, f"unparseable SPIR-V line: {line!r}"
+        res, op, rest = m.groups()
+        if in_body:
+            body.append((res, op, rest.split(), line))
+        elif op == "OpFunction":
+            in_body = True
+    assert body, "empty SPIR-V function body"
+    si.check_structure(body)
+
+
 class LdsBoundAccessTests(unittest.TestCase):
     def _assert_no_bitmask_wrap_and_uses_bound(self, op_lines):
         # Include an OOB constant offset:1536 so g.lds_bound = g.lds_dwords = 384 (0x180).
         spv = _translate_cs(op_lines)
-        si.check_structure(si.parse(spv)[1])
-        # Bounded LDS must compare against %u180 (384) via OpULessThan and must NOT wrap with
-        # OpBitwiseAnd against %u17f (383).
+        _check_cfg(spv)
+        # Bounded LDS must compare against %c180 (384) via OpULessThan and must NOT wrap with
+        # OpBitwiseAnd against %c17f (383).
         self.assertIn("OpULessThan %bool", spv)
-        self.assertIn("%u180", spv)
+        self.assertIn("%c180", spv)
         self.assertNotIn("OpBitwiseAnd %uint", "\n".join(
-            ln for ln in spv.splitlines() if "%u17f" in ln
+            ln for ln in spv.splitlines() if "%c17f" in ln
         ))
 
     def test_ds_add_f32_uses_lds_bound(self):
@@ -105,7 +123,7 @@ class LdsBoundAccessTests(unittest.TestCase):
             "ds_read_addtid_b32 v6 offset:1536",
             "s_waitcnt lgkmcnt(0)",
         ], w64_emulate=True)
-        si.check_structure(si.parse(spv)[1])
+        _check_cfg(spv)
 
 
 if __name__ == "__main__":
