@@ -107,7 +107,9 @@ FAIL  blend        (128,128)     expected 105,25,45,255      got 200,30,60  (0.5
 - A missing, truncated or corrupt image is one scene-level FAIL carrying the
   reader's message (path, byte offset or CRC), and the scene's declared checks
   are counted as failed in the summary.
-- Exit code is 0 only when every check passed.
+- Exit code is 0 when every check passed, 1 for a pixel-check failure, and 2
+  when an image cannot be read. If a run has both image errors and pixel-check
+  failures, it exits 2 after reporting all scenes.
 
 `expect` does not verify that the manifest's checks are the right expectations.
 That is the scene contract's job; this tool checks the pixels against whatever
@@ -282,7 +284,7 @@ selftest passed
 - **expect**: a manifest with five checks (one per corner plus the centre)
   passes, prints five PASS rows and exits 0; a wrong expectation and an
   out-of-range coordinate both fail with explanations and exit 1; a missing
-  image produces one scene-level failure naming the path; a scene with an empty
+  image produces one scene-level failure naming the path and exits 2; a scene with an empty
   check list is rejected at load. A manifest with a UTF-8 BOM still loads.
 - **diff metrics**: a known two-pixel change in a 4x3 image produces exact
   differing count, total pixels, percent, mean absolute delta, maximum delta and
@@ -391,11 +393,9 @@ changes made after the first working version.
 The legibility review found three claims in this README that the code did not support. They are corrected
 here rather than silently rewritten above:
 
-- **Exit codes are not identical in every mode.** `expect` treats an unreadable or missing image as a failed
-  scene and exits **1**; `diff` exits **2** when it cannot compare (missing manifest, size mismatch). Both
-  mean "the run did not complete", but only `diff` returns 2 for them. A crash that the tool did not
-  anticipate now exits **2** with a traceback, never 1, so a calling script can tell "the pixels differ"
-  from "this program failed".
+- **Input errors use exit code 2.** `expect` reports each unreadable or missing image at scene level,
+  finishes the remaining scene checks, and exits **2**. Pixel mismatches in readable images exit **1**.
+  `diff` also exits **2** when its inputs cannot be compared.
 - **The whole-frame mean does not separate "small area failing hard" from "large area failing softly".**
   One pixel off by 255 and 255 pixels off by 1 give the same mean. Read the mean together with
   `differing` and `max`.

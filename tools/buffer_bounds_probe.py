@@ -199,7 +199,10 @@ def main():
     if args.self_test:
         self_test()
         return 0
-    waves = [int(w) for w in args.waves.split(",") if w.strip()]
+    try:
+        waves = [int(w) for w in args.waves.split(",") if w.strip()]
+    except ValueError:   # "abc" is a bad argument (exit 2), not a traceback
+        waves = []
     if not waves or any(w not in (32, 64) for w in waves):
         print("--waves must be a non-empty list of 32 and/or 64", file=sys.stderr)
         return 2

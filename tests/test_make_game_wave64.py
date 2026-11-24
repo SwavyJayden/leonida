@@ -52,11 +52,11 @@ class SmallestMaxSubgroupTest(unittest.TestCase):
 class Wave64EmulateTest(unittest.TestCase):
     """wave64_emulate(): on and off are taken as given; auto asks vulkaninfo and falls back to on."""
 
-    def decide(self, mode, which="vulkaninfo", stdout="", error=None):
+    def decide(self, mode, which="vulkaninfo", stdout="", error=None, returncode=0):
         def fake_run(args, **kw):
             if error:
                 raise error
-            return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+            return subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr="")
         with mock.patch.object(make_game.shutil, "which", return_value=which), \
                 mock.patch.object(make_game.subprocess, "run", side_effect=fake_run) as run, \
                 mock.patch.object(make_game, "log", lambda *a: None):
@@ -83,6 +83,10 @@ class Wave64EmulateTest(unittest.TestCase):
     def test_auto_when_vulkaninfo_cannot_run_turns_it_on(self):
         self.assertTrue(self.decide("auto", error=OSError("cannot start"))[0])
         self.assertTrue(self.decide("auto", error=subprocess.TimeoutExpired("vulkaninfo", 120))[0])
+
+    def test_auto_ignores_partial_stdout_when_vulkaninfo_fails(self):
+        partial = real_format(("First adapter", 64, []))
+        self.assertEqual(self.decide("auto", stdout=partial, returncode=1), (True, True))
 
     def test_auto_when_vulkaninfo_prints_no_subgroup_size_turns_it_on(self):
         self.assertTrue(self.decide("auto", stdout="ERROR: no Vulkan device\n")[0])

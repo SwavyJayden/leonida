@@ -15,13 +15,27 @@ std::vector<VkBufferImageCopy> b2i_copies;
 std::vector<VkBufferImageCopy> i2b_copies;
 std::vector<leonida::Depth24Job> depth24_jobs;
 
-VKAPI_ATTR void VKAPI_CALL noop_barrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
-                                        std::uint32_t, const VkMemoryBarrier*, std::uint32_t,
-                                        const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {}
+// Whether a barrier since the last buffer copy ordered earlier transfer writes before transfer reads and writes, and
+// that answer for each vkCmdCopyBuffer in turn: D3D12 orders back-to-back copies, Vulkan needs the barrier.
+bool transfer_writes_ordered = false;
+std::vector<bool> buffer_copy_ordered;
+
+VKAPI_ATTR void VKAPI_CALL rec_barrier(VkCommandBuffer, VkPipelineStageFlags src_stages, VkPipelineStageFlags dst_stages,
+                                       VkDependencyFlags, std::uint32_t memory_count, const VkMemoryBarrier* memory,
+                                       std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t,
+                                       const VkImageMemoryBarrier*) {
+    const VkAccessFlags after = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    for (std::uint32_t i = 0; i < memory_count; ++i)
+        if ((src_stages & VK_PIPELINE_STAGE_TRANSFER_BIT) && (dst_stages & VK_PIPELINE_STAGE_TRANSFER_BIT) &&
+            (memory[i].srcAccessMask & VK_ACCESS_TRANSFER_WRITE_BIT) && (memory[i].dstAccessMask & after) == after)
+            transfer_writes_ordered = true;
+}
 
 VKAPI_ATTR void VKAPI_CALL rec_copy_buffer(VkCommandBuffer, VkBuffer, VkBuffer, std::uint32_t count,
                                            const VkBufferCopy* regions) {
     for (std::uint32_t i = 0; i < count; ++i) buffer_copies.push_back(regions[i]);
+    buffer_copy_ordered.push_back(transfer_writes_ordered);
+    transfer_writes_ordered = false;
 }
 
 VKAPI_ATTR void VKAPI_CALL rec_copy_b2i(VkCommandBuffer, VkBuffer, VkImage, VkImageLayout, std::uint32_t count,
@@ -56,7 +70,7 @@ int main() {
     using namespace leonida;
 
     ReplayFunctions vk{};
-    vk.pipeline_barrier = noop_barrier;
+    vk.pipeline_barrier = rec_barrier;
     vk.copy_buffer = rec_copy_buffer;
     vk.copy_buffer_to_image = rec_copy_b2i;
     vk.copy_image_to_buffer = rec_copy_i2b;
@@ -135,6 +149,8 @@ int main() {
 
     const auto run = [&](const CommandList& list) {
         buffer_copies.clear();
+        buffer_copy_ordered.clear();
+        transfer_writes_ordered = false;
         b2i_copies.clear();
         i2b_copies.clear();
         depth24_jobs.clear();
@@ -149,6 +165,21 @@ int main() {
         expect(buffer_copies.size() == 1 && buffer_copies[0].srcOffset == src_buf.buffer_offset &&
                    buffer_copies[0].dstOffset == dst_buf.buffer_offset && buffer_copies[0].size == src_buf.size,
                "CopyResource applies src and dst buffer_offset");
+        expect(buffer_copy_ordered == std::vector<bool>{true},
+               "a buffer copy is ordered after earlier transfer writes (an earlier list on the queue may have written)");
+    }
+
+    // 1b. Back-to-back copies into the same buffer, with no barrier from the application: D3D12 runs them in order,
+    // so each vkCmdCopyBuffer needs its own barrier after the transfer write before it (one barrier ahead of the
+    // first copy would leave the second unordered against the first).
+    {
+        CommandList list;
+        expect(list.copy_buffer({2, 0, 1, 0, 256}) && list.copy_buffer({2, 128, 1, 512, 256}) && list.close(),
+               "record two overlapping CopyBufferRegion calls");
+        expect(run(list) == ReplayResult::success, "back-to-back buffer copies replay");
+        expect(buffer_copies.size() == 2, "both buffer copies are emitted");
+        expect(buffer_copy_ordered == (std::vector<bool>{true, true}),
+               "each back-to-back buffer copy is ordered after the transfer write before it");
     }
 
     // 2. CopyResource within a single shared backing VkBuffer (arena): disjoint & adjacent succeed, overlap fails.
@@ -306,6 +337,103 @@ int main() {
 
         src_buf.buffer_offset = 2;  // violates 4-byte rgb96 alignment
         expect(run(up) == ReplayResult::unsupported, "rgb96 upload rejects misaligned backing buffer_offset");
+        src_buf = saved_src;
+        dst_buf = saved_dst;
+    }
+
+    // 6. tile_footprint unaligned staging honors format alignment (8B, 16B, BC1) and 3D slice layout.
+    {
+        const auto saved_src = src_buf, saved_dst = dst_buf;
+        VkDeviceSize scratch_req = 0;
+        vk.copy_scratch = [&](std::uint64_t bytes, VkBuffer& buf, VkDeviceSize& off) {
+            scratch_req = bytes;
+            buf = handle<VkBuffer>(0xA000);
+            off = 256;
+            return true;
+        };
+
+        ResourceBinding rgba16f_img{};
+        rgba16f_img.image = handle<VkImage>(6);
+        rgba16f_img.format = VK_FORMAT_R16G16B16A16_SFLOAT;  // 8 bytes/texel
+        rgba16f_img.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+        rgba16f_img.width = 8;
+        rgba16f_img.height = 4;
+        rgba16f_img.mip_levels = 1;
+        rgba16f_img.array_layers = 1;
+        rgba16f_img.depth = 2;
+        rgba16f_img.volume = true;
+        rgba16f_img.samples = 1;
+
+        ResourceBinding bc1_img{};
+        bc1_img.image = handle<VkImage>(7);
+        bc1_img.format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;  // 8 bytes per 4x4 block
+        bc1_img.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+        bc1_img.width = 12;
+        bc1_img.height = 8;
+        bc1_img.mip_levels = 1;
+        bc1_img.array_layers = 1;
+        bc1_img.depth = 1;
+        bc1_img.samples = 1;
+
+        const auto resolve_tile = [&](ResourceId id) -> const ResourceBinding* {
+            if (id == 6) return &rgba16f_img;
+            if (id == 7) return &bc1_img;
+            return resolve(id);
+        };
+
+        // 6a. 8-byte 3D texture with bufferOffset = 4 (4-byte aligned, NOT 8-byte aligned): must stage both slices.
+        src_buf.buffer_offset = 0;
+        src_buf.size = 4096;
+        {
+            const CopyLocation tex{6, false, 0, 0, 0, 0, 0, 0};
+            // footprint: width=8, height=4, depth=2, row_pitch=256 (32 texels/row, slice_pitch=1024), offset=4
+            const CopyLocation fp{1, true, 0, 4, 8, 4, 2, 256};
+            CopyTexture copy{tex, 0, 0, 0, fp, true, {0, 0, 0, 4, 2, 2}};  // 4x2x2 texels -> 32B/row, 2 rows, 2 slices = 128B
+            copy.tile_footprint = true;
+            CommandList list;
+            expect(list.copy_texture(copy) && list.close(), "record 8B 3D tile_footprint upload");
+            buffer_copies.clear();
+            b2i_copies.clear();
+            scratch_req = 0;
+            expect(replay(list, VK_NULL_HANDLE, resolve_tile, vk) == ReplayResult::success,
+                   "8B 3D tile_footprint upload with offset=4 replays");
+            expect(scratch_req == 128, "8B 3D tile_footprint allocates 4*8 * 2 * 2 = 128 bytes of scratch");
+            expect(buffer_copies.size() == 4, "8B 3D tile_footprint stages 2 rows x 2 slices");
+            expect(buffer_copies.size() == 4 &&
+                       buffer_copies[0].srcOffset == 4 && buffer_copies[0].dstOffset == 256 && buffer_copies[0].size == 32 &&
+                       buffer_copies[1].srcOffset == 260 && buffer_copies[1].dstOffset == 288 && buffer_copies[1].size == 32 &&
+                       buffer_copies[2].srcOffset == 1028 && buffer_copies[2].dstOffset == 320 && buffer_copies[2].size == 32 &&
+                       buffer_copies[3].srcOffset == 1284 && buffer_copies[3].dstOffset == 352 && buffer_copies[3].size == 32,
+                   "8B 3D tile_footprint row/slice strides match 256B row_pitch and 1024B slice_pitch");
+            expect(b2i_copies.size() == 1 && b2i_copies[0].bufferOffset == 256 &&
+                       b2i_copies[0].bufferRowLength == 0 && b2i_copies[0].bufferImageHeight == 0,
+                   "8B 3D tile_footprint emits aligned scratch offset and clears row/image height");
+        }
+
+        // 6b. BC1 (8B per 4x4 block) with bufferOffset = 4: must stage 2x2 blocks = 32B, not texels*4.
+        {
+            const CopyLocation tex{7, false, 0, 0, 0, 0, 0, 0};
+            // footprint: width=12 (3 blocks), height=8 (2 blocks), row_pitch=256 (32*8B), offset=4
+            const CopyLocation fp{1, true, 0, 4, 12, 8, 1, 256};
+            CopyTexture copy{tex, 0, 0, 0, fp, true, {0, 0, 0, 8, 8, 1}};  // 2x2 blocks: 16B/row, 2 rows = 32B
+            copy.tile_footprint = true;
+            CommandList list;
+            expect(list.copy_texture(copy) && list.close(), "record BC1 tile_footprint upload");
+            buffer_copies.clear();
+            b2i_copies.clear();
+            scratch_req = 0;
+            expect(replay(list, VK_NULL_HANDLE, resolve_tile, vk) == ReplayResult::success,
+                   "BC1 tile_footprint upload with offset=4 replays");
+            expect(scratch_req == 32, "BC1 tile_footprint allocates 2*8 * 2 = 32 bytes of scratch");
+            expect(buffer_copies.size() == 2 &&
+                       buffer_copies[0].srcOffset == 4 && buffer_copies[0].dstOffset == 256 && buffer_copies[0].size == 16 &&
+                       buffer_copies[1].srcOffset == 260 && buffer_copies[1].dstOffset == 272 && buffer_copies[1].size == 16,
+                   "BC1 tile_footprint copies 16B block rows at 256B pitch");
+            expect(b2i_copies.size() == 1 && b2i_copies[0].bufferOffset == 256 && b2i_copies[0].bufferRowLength == 0,
+                   "BC1 tile_footprint emits aligned scratch offset");
+        }
+
+        vk.copy_scratch = {};
         src_buf = saved_src;
         dst_buf = saved_dst;
     }

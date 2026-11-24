@@ -25,8 +25,12 @@ import os
 import re
 import stat
 import sys
+import tempfile
 import time
 from typing import Callable, Optional, TextIO
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
 
 CHUNK = 8 * 1024 * 1024
 DEFAULT_MANIFEST = os.path.join(os.path.dirname(__file__), "..", "reports", "manifest.json")
@@ -146,17 +150,72 @@ def save_cache(path: str, entries: dict[str, dict]) -> None:
     directory = os.path.dirname(os.path.abspath(path))
     if directory:
         os.makedirs(directory, exist_ok=True)
-    tmp = path + ".tmp"
+    tmp = None
     try:
-        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n", dir=directory,
+            prefix=".verify-cache-", suffix=".tmp", delete=False,
+        ) as f:
+            tmp = f.name
             json.dump({"version": CACHE_VERSION, "files": dict(sorted(entries.items()))}, f, indent=1)
         os.replace(tmp, path)
     except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         raise
+
+
+def _stable_stamp(path: str, before: list[int]) -> Optional[list[int]]:
+    """The stamp to cache for a file that just hashed OK, or None. only save it if the stamp didn't move while
+    hashing and it wasn't written super recently, otherwise a sneaky write could hide behind the cache"""
+    try:
+        after = _cache_stamp(path, os.stat(path))
+    except OSError:
+        return None
+    return after if after == before and time.time_ns() - after[1] > RACY_WINDOW_NS else None
+
+
+def check_files(files: list[tuple[str, int, str]], cache_path: Optional[str] = None) -> None:
+    """Checks each (path, size, sha256): the size first, then the streamed SHA-256. the first file that differs
+    raises ManifestError, one line with the file and expected vs actual. cache_path works like --cache: a file whose
+    size, times and id match an entry that passed isn't read again, and a cache that can't be written is skipped."""
+    cache = load_cache(cache_path) if cache_path is not None else {}
+    passed = 0
+    try:
+        for path, size, expected in files:
+            expected = expected.lower()
+            try:
+                st = os.stat(path)
+            except OSError as err:
+                raise ManifestError(f"{path}: cannot read it ({err.strerror or err})") from None
+            if st.st_size != size:
+                raise ManifestError(f"{path}: size is {st.st_size} bytes, expected {size}")
+            if cache_path is not None:
+                stamp = _cache_stamp(path, st)
+                key = _cache_key(path)
+                hit = cache.get(key)
+                if hit is not None and hit["stamp"] == stamp and hit["sha256"] == expected:
+                    continue
+            try:
+                actual = sha256_file(path, expected_size=size)
+            except OSError as err:
+                raise ManifestError(f"{path}: cannot hash it ({err})") from None
+            if actual != expected:
+                raise ManifestError(f"{path}: SHA-256 is {actual}, expected {expected}")
+            if cache_path is not None:
+                after = _stable_stamp(path, stamp)
+                if after is not None:
+                    cache[key] = {"stamp": after, "sha256": expected}
+                    passed += 1
+    finally:
+        if passed:
+            try:
+                save_cache(cache_path, cache)
+            except OSError:
+                pass
 
 
 def walk(target_dir: str, *, exclude: str | tuple[str, ...] | None = None):
@@ -326,6 +385,8 @@ def verify_manifest(
     cache_path: Optional[str] = None,
 ) -> ManifestReport:
     """Verifies target_dir against manifest_path, optionally in parallel."""
+    if cache_path is not None and same_report_path(cache_path, manifest_path):
+        raise ManifestError(f"cache must not overwrite the manifest: {cache_path}")
     try:
         mode = os.stat(target_dir).st_mode
     except FileNotFoundError:
@@ -336,6 +397,10 @@ def verify_manifest(
         raise ManifestError(f"target path is not a directory: {target_dir}")
 
     want = load_manifest(manifest_path)
+    if cache_path is not None:
+        for rel in want:
+            if same_report_path(cache_path, os.path.join(target_dir, rel)):
+                raise ManifestError(f"cache must not overwrite a listed input: {rel}")
     have = dict(walk(target_dir, exclude=manifest_path if cache_path is None else (manifest_path, cache_path)))
     if not want and have:
         # A cut-short create or a mistyped --manifest would otherwise print OK without checking a file.
@@ -401,13 +466,8 @@ def verify_manifest(
         except OSError as err:
             return rel, size, "UNREADABLE", str(err)
         if cache_path is not None:
-            # only save it if the stamp didn't move while hashing and it wasn't written super recently,
-            # otherwise a sneaky write could hide behind the cache
-            try:
-                after = _cache_stamp(abs_p, os.stat(abs_p))
-            except OSError:
-                after = None
-            if after == stamps[rel] and time.time_ns() - after[1] > RACY_WINDOW_NS:
+            after = _stable_stamp(abs_p, stamps[rel])
+            if after is not None:
                 kept[_cache_key(abs_p)] = {"stamp": after, "sha256": expected_hash}
         return rel, size, "OK", None
 

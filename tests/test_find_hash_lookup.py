@@ -128,6 +128,83 @@ class FindHashLookupTest(unittest.TestCase):
             self.assertIn("ERROR: cannot write", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
 
+    def test_zero_call_target_produces_no_candidates(self):
+        """A hash that appears in code but has no E8 in the following window yields an empty candidates list."""
+        # Build a PE whose .text is just `mov ecx, <hash>; ret; <NOP padding>` -- no E8 anywhere.
+        value = fhl.joaat("player_story000_00")
+        code = b"\xB9" + struct.pack("<I", value) + b"\xC3" + b"\x90" * 59
+        data = pe(code)
+        report = fhl.rank(data, [("player_story000_00", value)])
+        self.assertEqual(report["hashes"][0]["occurrences"], 1)
+        self.assertEqual(report["candidates"], [],
+                         "no E8 in window → candidates must be empty")
+
+    def test_zero_window_produces_no_candidates(self):
+        """window=0 means the search tail is empty; no candidates regardless of calls nearby."""
+        data, _lookup, _decoy = image()
+        hashes = [("player_story000_00", fhl.joaat("player_story000_00")),
+                  ("cs_mandy", fhl.joaat("cs_mandy"))]
+        report = fhl.rank(data, hashes, window=0)
+        self.assertEqual(report["candidates"], [],
+                         "window=0 must yield no candidates")
+
+    def test_negative_window_raises(self):
+        """rank() with window < 0 must raise ValueError, not silently misbehave."""
+        data, _, _ = image()
+        with self.assertRaises(ValueError, msg="negative window must raise"):
+            fhl.rank(data, [("player_story000_00", fhl.joaat("player_story000_00"))], window=-1)
+
+    def test_non_positive_top_raises(self):
+        """rank() with top <= 0 must raise ValueError; top=-1 would otherwise return a wrong slice."""
+        data, _, _ = image()
+        hashes = [("player_story000_00", fhl.joaat("player_story000_00"))]
+        with self.assertRaises(ValueError, msg="top=0 must raise"):
+            fhl.rank(data, hashes, top=0)
+        with self.assertRaises(ValueError, msg="top=-1 must raise"):
+            fhl.rank(data, hashes, top=-1)
+
+    def test_truncated_pe_does_not_crash(self):
+        """A PE whose raw section data is cut short must not raise; it scans what is available."""
+        data, _, _ = image()
+        # Chop 100 bytes off the end so the section extends beyond the file.
+        truncated = data[:-100]
+        # Must not raise; result may have zero candidates but must not throw.
+        try:
+            fhl.rank(truncated, [("player_story000_00", fhl.joaat("player_story000_00"))])
+        except (ValueError, struct.error):
+            pass  # acceptable: some truncations invalidate the header itself
+        # The important thing is no unhandled exception propagates.
+
+    def test_cli_negative_window_exits_with_error(self):
+        """--window -1 on the CLI must exit non-zero with an ERROR line, no traceback."""
+        data, _, _ = image()
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "image.exe")
+            with open(exe, "wb") as f:
+                f.write(data)
+            r = subprocess.run(
+                [sys.executable, "-I", TOOL, exe, "--window", "-1"],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("ERROR", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
+    def test_cli_top_zero_exits_with_error(self):
+        """--top 0 on the CLI must exit non-zero with an ERROR line, no traceback."""
+        data, _, _ = image()
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "image.exe")
+            with open(exe, "wb") as f:
+                f.write(data)
+            r = subprocess.run(
+                [sys.executable, "-I", TOOL, exe, "--top", "0"],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("ERROR", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

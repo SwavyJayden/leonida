@@ -113,15 +113,18 @@ VOP2_INT16 = {"v_add_u16", "v_sub_u16", "v_subrev_u16", "v_mul_lo_u16", "v_lshlr
 def partial_write(ins, op):
     """Whether a VALU instruction writes only part of its 32-bit destination and keeps the rest (design.md, "16-bit
     results" and "16-bit SDWA result"): SDWA with a byte or word dst_sel and UNUSED_PRESERVE; otherwise a 16-bit
-    result, the first type in the name (v_add_f16, v_cvt_f16_f32, v_mad_u16, v_add_u16_e64), except the VOP2 16-bit
-    integer ops in _e32 form, which define the whole register. Packed and 32-bit results are whole: v_pk_*,
-    v_cvt_pk*, v_sad_*, v_cvt_f32_f16, v_mad_u32_u16. When unsure it says partial, which only costs tier A."""
+    result, the first type in the name (v_add_f16, v_cvt_f16_f32, v_mad_u16, v_add_u16_e64), or v_sat_pk_u8_* (two
+    packed u8 values in vdst[15:0], preserving vdst[31:16]), except the VOP2 16-bit integer ops in _e32 form, which
+    define the whole register. Packed and 32-bit results are whole: v_pk_*, v_cvt_pk*, v_sad_*, v_cvt_f32_f16,
+    v_mad_u32_u16. When unsure it says partial, which only costs tier A."""
     mods = ins.get("mods") or []
     op = ins.get("op", op)   # the printed name: base_op drops _e32/_e64/_sdwa, which decide it here
     if "_sdwa" in op or any(m.startswith("dst_sel:") for m in mods):
         return "dst_unused:UNUSED_PRESERVE" in mods and any(m.startswith(("dst_sel:BYTE_", "dst_sel:WORD_"))
                                                              for m in mods)
     name = op.split("_e32")[0].split("_e64")[0].split("_dpp")[0]
+    if name.startswith("v_sat_pk_u8_"):
+        return True
     if name.startswith(("v_pk_", "v_cvt_pk", "v_sad_")):
         return False
     first = next((p for p in name.split("_")[1:] if _TYPE.match(p)), None)
@@ -138,7 +141,7 @@ _INT16_VOP2_OPS = (
 )
 # 16-bit-suffixed or -prefixed mnemonics that write the full 32-bit destination register.
 _FULL32_V16_PREFIXES = (
-    "v_pk_", "v_pack_", "v_cvt_pk", "v_sat_pk", "v_sad_", "v_msad_", "v_qsad_", "v_mqsad_",
+    "v_pk_", "v_pack_", "v_cvt_pk", "v_sad_", "v_msad_", "v_qsad_", "v_mqsad_",
     "v_cmp", "v_cmpx", "v_interp_p1", "v_dot", "v_cvt_f32_", "v_cvt_u32_", "v_cvt_i32_", "v_cvt_f64_",
     "v_mad_i32_", "v_mad_u32_",
 )
@@ -335,6 +338,7 @@ class Analysis:
         self.vgprs = sorted({r[1] for b in blocks for ins in b for x in ins["args"]
                              for r in _regs(x) if isinstance(r, tuple) and r[0] == "v"})
         self.tok = {("e",): (None, None, True)}      # exec token -> (parent token, exec tag after, exec is the entry exec)
+        self.wqm_base = {}                           # exec token -> base token it is a WQM superset of
         self.stale = set()
         self.voted = {}                              # block -> mask register key the terminating branch votes on
         self.branch_class = {}
@@ -448,6 +452,7 @@ class Analysis:
         u = a["u"] & b["u"]
         ua = (a["ua"] & b["ua"]) if a["x"] == b["x"] else u
         return {"t": t, "g": g, "x": x, "xg": a["xg"] if a["xg"] == b["xg"] else None, "f": a["f"] and b["f"],
+                "nz": a["nz"] and b["nz"],
                 "u": u, "ua": ua, "l": {k: v for k, v in a["l"].items() if b["l"].get(k) == v},
                 "r": self.union_map(a["r"], b["r"]), "b": self.union_map(a["b"], b["b"])}
 
@@ -456,13 +461,13 @@ class Analysis:
         return {k: a.get(k, frozenset()) | b.get(k, frozenset()) for k in set(a) | set(b)}
 
     def entry(self):
-        return {"t": {}, "g": {}, "x": ("e",), "xg": None, "f": True, "u": frozenset(), "ua": frozenset(), "l": {},
-                "r": {}, "b": {}}
+        return {"t": {}, "g": {}, "x": ("e",), "xg": None, "f": True, "nz": False, "u": frozenset(), "ua": frozenset(),
+                "l": {}, "r": {}, "b": {}}
 
     # ---- the transfer function ----
     def block(self, n, st, ev):
-        st = {"t": dict(st["t"]), "g": dict(st["g"]), "x": st["x"], "xg": st["xg"], "f": st["f"], "u": st["u"],
-              "ua": st["ua"], "l": dict(st["l"]), "r": dict(st["r"]), "b": dict(st["b"])}
+        st = {"t": dict(st["t"]), "g": dict(st["g"]), "x": st["x"], "xg": st["xg"], "f": st["f"], "nz": st["nz"],
+              "u": st["u"], "ua": st["ua"], "l": dict(st["l"]), "r": dict(st["r"]), "b": dict(st["b"])}
         for i, ins in enumerate(self.blocks[n]):
             self.step(n, i, ins, st, ev)
         return st
@@ -619,9 +624,9 @@ class Analysis:
             if ev is not None:
                 ev["idioms"].add(name)
 
-        def src_taint():
+        def src_taint(inputs):
             t = 0
-            for x in srcs:
+            for x in inputs:
                 t |= self.rd(st, ins, x)
             for r in uses:
                 t |= T.get(r, 0) | (CTRL if (id(ins), r) in self.stale else 0)
@@ -767,7 +772,7 @@ class Analysis:
                 put(dests[0], BASE | (ELECT if elected else 0), ("elect", st["xg"][1]) if elected else None)
             return
 
-        t_src = src_taint()
+        t_src = src_taint(srcs)
         # a lane mask read as data (not as a mask operand of a mask instruction, a select or an exec write): on
         # hardware it is the 64 lane bits, here the bits of the lanes of the half
         md = 0
@@ -783,7 +788,20 @@ class Analysis:
                     md |= MASKD | X
         t_src |= md
         if op.startswith(("buffer_load", "tbuffer_load")):
-            t_src |= self.add_tid_lane(n, i, a, mods)
+            implicit_lane = self.add_tid_lane(n, i, a, mods)
+            t_src |= implicit_lane
+            if (op in ("buffer_load_format_d16_xyz", "tbuffer_load_format_d16_xyz")
+                    and len(a) >= 3 and a[0].get("k") == "vgpr" and a[0].get("n") == 2 and st["f"]
+                    and not t_src & (TAG_BITS | BASE | CNT)):
+                # Full EXEC overwrites X/Y. Only Z keeps the upper half of its old word.
+                # Leave masked writes and proof-carrying values to the conservative transfer below.
+                xy = {"k": "vgpr", "r": a[0]["r"]}
+                z = {"k": "vgpr", "r": a[0]["r"] + 1}
+                address = src_taint(a[1:]) | md | implicit_lane
+                packed_z = address | self.rd(st, ins, z)
+                put(xy, address)
+                put(z, packed_z)
+                return
 
         # --- lane masks and counts
         if op in ("s_bcnt1_i32_b64", "s_ff1_i32_b64") and len(a) == 2 and self.is_mask(ins, a[1]):
@@ -927,6 +945,8 @@ class Analysis:
             if tag is None and self.uniform_cmp(st, ins, srcs, uses, tj):
                 tag = UVOTE
             put(d, tj, tag)
+            if d.get("k") == "sgpr" and d.get("n", 1) == 1:
+                put({"k": "sgpr", "r": d["r"] + 1, "n": 1}, tj, tag)
             if len(dests) > 1:
                 put(dests[1], t_src)
             return
@@ -955,7 +975,9 @@ class Analysis:
                 violation("mask-half")
                 put(dests[0], t_src | X)
                 return
-            if any(not self.is_mask(ins, x) and not (x.get("k") == "imm" and x["v"] in (
+            if any(not self.is_mask(ins, x)
+                   and not (_regs(x) and all(st["g"].get(r) == UVOTE for r in _regs(x)))
+                   and not (x.get("k") == "imm" and x["v"] in (
                     0, -1, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF)) for x in srcs):
                 # a lane mask combined with a register that is not one (a user value, a loaded mask): the result is
                 # no mask the translator tracks, and its bits are the lanes of the half
@@ -970,12 +992,22 @@ class Analysis:
                     tag = ("mask", st["x"])
                 elif r and r[0] in st["g"] and st["g"][r[0]][0] in ("mask", "elect", "wfmask", "uvote"):
                     tag = st["g"][r[0]]
-            elif op == "s_and_b64" and not t_src and all(
-                    (_regs(x) == ["exec"] and st["f"]) or (_regs(x) and all(st["g"].get(r) == UVOTE for r in _regs(x)))
-                    for x in srcs) and any(_regs(x) != ["exec"] for x in srcs):
-                # a uniform compare ANDed with EXEC while EXEC is the launch mask (LLVM: s_and_b64 vcc, exec, s[..])
+            elif op == "s_cselect_b64" and len(srcs) == 2 and (st["f"] or st["nz"]) and not T.get("scc", 0):
+                is_exec = lambda x: _regs(x) == ["exec"]
+                is_zero = lambda x: x.get("k") == "imm" and x["v"] == 0
+                if (is_exec(srcs[0]) and is_zero(srcs[1])) or (is_zero(srcs[0]) and is_exec(srcs[1])):
+                    tag = UVOTE
+                    t_src = 0
+            elif op in ("s_and_b64", "s_or_b64") and all(
+                    (_regs(x) == ["exec"] and (st["f"] or st["nz"]))
+                    or (not self.rd(st, ins, x) and _regs(x) and all(st["g"].get(r) == UVOTE for r in _regs(x)))
+                    for x in srcs):
+                # uniform compares combined with each other or ANDed/ORed with EXEC (while launch mask or non-zero)
                 tag = UVOTE
+                t_src = 0
             put(dests[0], t_src, tag)
+            if tag == UVOTE and dests[0].get("k") == "sgpr" and dests[0].get("n", 1) == 1:
+                put({"k": "sgpr", "r": dests[0]["r"] + 1, "n": 1}, t_src, tag)
             if not op.startswith(("s_mov", "s_cselect")):     # those leave SCC as it was: no vote on their dest
                 T["scc"] = X
                 st["g"]["scc"] = ("vote", _regs(dests[0])[0] if _regs(dests[0]) else "exec")
@@ -1203,7 +1235,7 @@ class Analysis:
         every lane (an immediate, a scalar that is no lane mask, a VGPR written from those with EXEC the launch mask)
         and carries no taint, so the mask is every launch lane or none, in the wave and in each half alike. A value
         read with v_readfirstlane from a varying VGPR is tainted (waterfall-scalar), so it is not one."""
-        if tj or uses or not st["f"] or not srcs:
+        if tj or uses or not (st["f"] or st["nz"]) or not srcs:
             return False
         for x in srcs:
             k = x.get("k")
@@ -1268,10 +1300,13 @@ class Analysis:
                 mt = 0
                 for x in srcregs:
                     mt |= self.rd(st, ins, x)
-            if (op == "s_mov_b64" or (op == "s_or_b64" and any(_regs(x) == ["exec"] for x in srcs))) \
-                    and mg and mg[0] == "mask" and (op == "s_mov_b64" or self.ancestor(mg[1], old)):
+            if (op == "s_mov_b64" or (op == "s_or_b64" and any(_regs(x) == ["exec"] for x in srcs))
+                    or (op == "s_and_b64" and any(_regs(x) == ["exec"] for x in srcs)
+                        and mg and mg[0] == "mask" and self.wqm_base.get(old) == mg[1])) \
+                    and mg and mg[0] == "mask" and (op != "s_or_b64" or self.ancestor(mg[1], old)):
                 st["x"] = mg[1]
                 st["xg"], st["f"] = self.tok.get(mg[1], (None, None, False))[1:]
+                st["nz"] = False
                 st["ua"] = st["u"]
                 if op == "s_or_b64":                            # s_mov_b64 leaves SCC as it was
                     T["scc"] = X
@@ -1283,10 +1318,18 @@ class Analysis:
                 self.new_exec(site, old, st, True, mg, mt, violation, idiom)
             elif op == "s_andn2_b64" and len(srcs) == 2 and _regs(srcs[0]) == ["exec"]:
                 self.new_exec(site, old, st, True, None, mt, violation, idiom)
+            elif op == "s_wqm_b64" and len(srcs) == 1 and _regs(srcs[0]) == ["exec"]:
+                st["x"] = site
+                self.tok[site] = (None, None, False)
+                self.wqm_base[site] = self.wqm_base.get(old, old)
+                st["xg"], st["f"] = None, False
+                st["nz"] = False
+                st["ua"] = st["u"]
             else:
                 st["x"] = site
                 self.tok[site] = (None, None, False)
                 st["xg"], st["f"] = None, False
+                st["nz"] = False
                 st["ua"] = st["u"]
                 if mt & ~0:
                     for b, name in NAMES.items():
@@ -1300,6 +1343,7 @@ class Analysis:
         st["x"] = site
         self.tok[site] = (None, None, False)
         st["xg"], st["f"] = None, False
+        st["nz"] = False
         st["ua"] = st["u"]
 
     def scalar_def_since_exec(self, n, i, r):
@@ -1341,6 +1385,7 @@ class Analysis:
                         break
         self.tok[site] = (old if narrowing else None, xg, st["f"] and False)
         st["x"], st["xg"], st["f"] = site, xg, False
+        st["nz"] = False
         if not narrowing:
             st["ua"] = st["u"]
 
@@ -1620,8 +1665,14 @@ class Analysis:
         while work:
             n = work.pop()
             out = self.block(n, entry[n], None)
-            for s in self.succ[n]:
-                new = out if entry[s] is None else self.join(entry[s], out, s)
+            last_op = base_op(self.blocks[n][-1]["op"]) if self.blocks[n] else ""
+            nz_idx = 1 if last_op == "s_cbranch_execz" else (0 if last_op == "s_cbranch_execnz" else -1)
+            for idx, s in enumerate(self.succ[n]):
+                edge_out = out
+                if idx == nz_idx and len(self.succ[n]) == 2 and not out["nz"]:
+                    edge_out = dict(out)
+                    edge_out["nz"] = True
+                new = edge_out if entry[s] is None else self.join(entry[s], edge_out, s)
                 if entry[s] is None or new != entry[s]:
                     entry[s] = new
                     work.append(s)

@@ -107,6 +107,49 @@ class PackedFormatFixture(unittest.TestCase):
             self.assertIn("0/1 passed", output.getvalue())
 
 
+class TbufferStoreFixture(unittest.TestCase):
+    def _run_tbuffer_store(self, check_return):
+        name = "cs_tbuffer_store"
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+
+            def translate(_cmd, env=None, gpu=True):
+                (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                return 0, ""
+
+            output = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=translate),
+                  patch.object(rgt, "tbuffer_store_test", return_value=check_return) as check_tb,
+                  contextlib.redirect_stdout(output),
+                  contextlib.redirect_stderr(output)):
+                rc = rgt.run_suite(args, tmp)
+        check_tb.assert_called_once()
+        return rc, output.getvalue()
+
+    def test_filtered_suite_records_tbuffer_store_pass(self):
+        rc, out = self._run_tbuffer_store("")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("PASS  cs_tbuffer_store", out)
+        self.assertIn("192/192 dumped words exact", out)
+        self.assertIn("1/1 passed", out)
+
+    def test_filtered_suite_counts_tbuffer_store_mismatch(self):
+        problem = "word 12: expected 0x11223344, got 0x00000000"
+        rc, out = self._run_tbuffer_store(problem)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL  cs_tbuffer_store", out)
+        self.assertIn(problem, out)
+        self.assertIn("0/1 passed", out)
+
+    def test_filtered_suite_counts_tbuffer_store_skip(self):
+        rc, out = self._run_tbuffer_store(check.Skip("SKIP (unsupported: no format)"))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("SKIP  cs_tbuffer_store", out)
+        self.assertIn("0/1 passed, 1 skipped", out)
+
+
 class FrameReadbackTest(unittest.TestCase):
     def test_only_a_frame_written_by_this_run_can_pass(self):
         name = "ps_ops"

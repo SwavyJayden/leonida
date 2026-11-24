@@ -100,6 +100,91 @@ bool test_intra_tile_bijective() {
     return offsets.size() == (tile_w * tile_h);
 }
 
+// Independent element-by-element scalar reference against SwizzleLut64K<Bpe>, verifying both exact tiled/linear
+// byte placement and that all inactive padding bytes in the tiled buffer stay untouched.
+template <std::uint32_t Bpe>
+bool test_exact_against_scalar(std::uint32_t width, std::uint32_t height, std::uint32_t block_dim = 1) {
+    constexpr SwizzleLut64K<Bpe> lut{};
+    const std::size_t linear_size = linear_surface_size(width, height, Bpe, block_dim);
+    const std::size_t tiled_size = tiled_surface_size_64k(width, height, Bpe, block_dim);
+    if (!linear_size || !tiled_size) return false;
+
+    const std::uint32_t blocks_w = 1u + (width - 1u) / block_dim;
+    const std::uint32_t blocks_h = 1u + (height - 1u) / block_dim;
+    const std::uint32_t tiles_x = 1u + (blocks_w - 1u) / lut.tile_w;
+
+    std::vector<std::byte> linear_in(linear_size);
+    fill_synthetic_linear(linear_in, width * 17u + height * 31u + Bpe * 7u + block_dim);
+
+    std::vector<std::byte> tiled_got(tiled_size, std::byte{0xCC});
+    std::vector<std::byte> tiled_ref(tiled_size, std::byte{0xCC});
+    if (!tile_surface_64k(linear_in, tiled_got, width, height, Bpe, block_dim)) return false;
+
+    for (std::uint32_t y = 0; y < blocks_h; ++y) {
+        const std::size_t macro_y = static_cast<std::size_t>(y / lut.tile_h) * tiles_x * tile_size_in_bytes;
+        const std::uint16_t iy = lut.lut_y[y % lut.tile_h];
+        const std::size_t lin_row = static_cast<std::size_t>(y) * blocks_w * Bpe;
+        for (std::uint32_t x = 0; x < blocks_w; ++x) {
+            const std::size_t t_off =
+                macro_y + static_cast<std::size_t>(x / lut.tile_w) * tile_size_in_bytes + (lut.lut_x[x % lut.tile_w] | iy);
+            std::memcpy(&tiled_ref[t_off], &linear_in[lin_row + static_cast<std::size_t>(x) * Bpe], Bpe);
+        }
+    }
+    if (std::memcmp(tiled_got.data(), tiled_ref.data(), tiled_size) != 0) {
+        std::fprintf(stderr, "tile_surface_64k diverged from scalar ref for %ux%u bpe=%u blk=%u\n",
+                     width, height, Bpe, block_dim);
+        return false;
+    }
+
+    // Fill the entire tiled buffer (including padding) with distinct bytes and verify detile_surface_64k matches
+    // the scalar reference byte-for-byte.
+    std::vector<std::byte> tiled_in(tiled_size);
+    fill_synthetic_linear(tiled_in, width * 53u + height * 19u + Bpe * 11u + 3u);
+    std::vector<std::byte> linear_got(linear_size, std::byte{0xAA});
+    std::vector<std::byte> linear_ref(linear_size, std::byte{0xAA});
+    if (!detile_surface_64k(tiled_in, linear_got, width, height, Bpe, block_dim)) return false;
+
+    for (std::uint32_t y = 0; y < blocks_h; ++y) {
+        const std::size_t macro_y = static_cast<std::size_t>(y / lut.tile_h) * tiles_x * tile_size_in_bytes;
+        const std::uint16_t iy = lut.lut_y[y % lut.tile_h];
+        const std::size_t lin_row = static_cast<std::size_t>(y) * blocks_w * Bpe;
+        for (std::uint32_t x = 0; x < blocks_w; ++x) {
+            const std::size_t t_off =
+                macro_y + static_cast<std::size_t>(x / lut.tile_w) * tile_size_in_bytes + (lut.lut_x[x % lut.tile_w] | iy);
+            std::memcpy(&linear_ref[lin_row + static_cast<std::size_t>(x) * Bpe], &tiled_in[t_off], Bpe);
+        }
+    }
+    if (std::memcmp(linear_got.data(), linear_ref.data(), linear_size) != 0) {
+        std::fprintf(stderr, "detile_surface_64k diverged from scalar ref for %ux%u bpe=%u blk=%u\n",
+                     width, height, Bpe, block_dim);
+        return false;
+    }
+    return true;
+}
+
+template <std::uint32_t Bpe>
+bool test_all_edge_remainders() {
+    constexpr SwizzleLut64K<Bpe> lut{};
+    // Cover every remainder modulo micro-tile width/height (up to 8) and across single/multi-tile boundaries.
+    const std::uint32_t dims_x[] = {
+        1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 15u, 16u, 17u,
+        lut.tile_w - 3u, lut.tile_w - 1u, lut.tile_w, lut.tile_w + 1u, lut.tile_w + 5u, lut.tile_w + 7u,
+    };
+    const std::uint32_t dims_y[] = {
+        1u, 2u, 3u, 4u, 5u, 7u, 8u, 9u,
+        lut.tile_h - 1u, lut.tile_h, lut.tile_h + 1u, lut.tile_h + 3u,
+    };
+    for (std::uint32_t w : dims_x) {
+        if (!test_exact_against_scalar<Bpe>(w, 11u)) return false;
+        if (!test_exact_against_scalar<Bpe>(w, lut.tile_h + 5u)) return false;
+    }
+    for (std::uint32_t h : dims_y) {
+        if (!test_exact_against_scalar<Bpe>(13u, h)) return false;
+        if (!test_exact_against_scalar<Bpe>(lut.tile_w + 3u, h)) return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -202,6 +287,16 @@ int main() {
     // Non-multiple of 4 texel dimensions:
     CHECK(test_roundtrip(1001, 603, 8, 4));
     CHECK(test_roundtrip(1920, 1080, 16, 4));
+
+    // 6. Exhaustive bit-exactness against independent scalar reference across all BPEs and micro-tile/tile edges:
+    CHECK(test_all_edge_remainders<1>());
+    CHECK(test_all_edge_remainders<2>());
+    CHECK(test_all_edge_remainders<4>());
+    CHECK(test_all_edge_remainders<8>());
+    CHECK(test_all_edge_remainders<16>());
+    CHECK(test_exact_against_scalar<8>(1001, 603, 4));
+    CHECK(test_exact_against_scalar<16>(1920, 1080, 4));
+    CHECK(test_exact_against_scalar<16>(263, 271, 4));
 
     std::printf("resource detile: all 64 KiB GFX10 swizzle round-trip and validation checks passed\n");
     return 0;

@@ -91,7 +91,9 @@ def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True
     if backend == "python":
         asm, bad = rdna2_decode.disasm_bytes(code, mcpu=mcpu, wave32=wave32)
         return asm, bad, ""
-    text = " ".join(f"0x{b:02x}" for b in code)
+    # 64 bytes per line: llvm-mc slows down sharply on one long input line (a 90 KB program took 58.6 s as one line
+    # and 0.2 s split like this, with byte-identical output); only its diagnostics' line/column numbers change.
+    text = "\n".join(" ".join(f"0x{b:02x}" for b in code[i:i + 64]) for i in range(0, len(code), 64))
     try:
         p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"],
                            input=text, capture_output=True, text=True, errors="replace",

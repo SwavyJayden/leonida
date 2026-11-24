@@ -79,7 +79,7 @@ queues come from this slot, the first of them a compute queue. The first queue c
 
 Xbox device slot 73 is `(desc, allocator, pso, riid, out)`. `desc` is 16 bytes and its first word reads as the
 `D3D12_COMMAND_LIST_TYPE`. `riid` is a console command-list IID that is not in the PC SDK (#3520 records that the
-package doesn't export it). The shim's unknown-IID log names it on the player's machine. Creating an
+package doesn't export it). A retail run logged it as `{c3827890-4024-474c-98cf-645b51dc4874}` (#445). Creating an
 `ID3D12GraphicsCommandList` of that type and handing out #2490's console list
 proxy gets all 581 lists created and closed.
 

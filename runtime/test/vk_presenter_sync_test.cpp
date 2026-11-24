@@ -399,6 +399,37 @@ int main() {
             context.remove_resource(2);
         }
 
+        // A full deferred queue must not accept another present when suspension interrupts the wait.
+        {
+            VulkanFence gate(context, 0);
+            EXPECT(gate.semaphore() != VK_NULL_HANDLE);
+            CommandList draw;
+            EXPECT(draw.transition({1, 0, d3d12_state::common, d3d12_state::render_target}));
+            EXPECT(draw.clear_render_target({1, 0, 0, 1}, {0.9f, 0.1f, 0.2f, 1.0f}));
+            EXPECT(draw.transition({1, 0, d3d12_state::render_target, d3d12_state::common}));
+            EXPECT(draw.close());
+            const CommandList* ptr = &draw;
+            queue.wait(gate.semaphore(), 1);
+            EXPECT(queue.execute({&ptr, 1}) == ReplayResult::success);
+            EXPECT(context.holds().any_held());
+
+            constexpr std::uint64_t capacity = 8;
+            const std::uint64_t shown = presenter.presented();
+            for (std::uint64_t i = 0; i < capacity; ++i)
+                EXPECT(presenter.present(1, true) == VK_SUCCESS);
+            EXPECT(presenter.presented() == shown);
+
+            presenter.set_abort([] { return true; });
+            const VkResult interrupted = presenter.present_blank(true);
+            presenter.set_abort(nullptr);
+            EXPECT(gate.signal(1));
+            EXPECT(queue.idle());
+            EXPECT(interrupted == VK_NOT_READY);
+            EXPECT(presenter.presented() == shown + capacity);
+            EXPECT(presenter.present(1, true) == VK_SUCCESS);
+            EXPECT(presenter.presented() == shown + capacity + 1);
+        }
+
         // 2c. A queue destroyed with held work lets the Presents queued behind it run (the work is dropped).
         {
             VulkanFence never(context, 0);

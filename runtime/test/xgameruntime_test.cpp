@@ -6,6 +6,7 @@
 // the process queue, drive a custom XAsyncBegin provider to a result, then uninitialize. No game data; nothing
 // online.
 #include <windows.h>
+#include <vector>
 
 #include <atomic>
 #include <cstdint>
@@ -266,7 +267,8 @@ void check_measured_classes(QueryFn query, XSystemAnalyticsInfo (*named_analytic
 }
 
 // xgameruntime.lib's thunks don't import the runtime: they LoadLibraryW(L"xgameruntime.dll") and GetProcAddress five
-// names (measured in the package's libHttpClient.GDK.dll and XCurl.dll). Drive that path through the loader shims,
+// names (measured in the package's libHttpClient.GDK.dll and XCurl.dll), and its XGameRuntimeInitialize a sixth,
+// XErrorReport, without which it refuses to initialise. Drive that path through the loader shims,
 // bound by the api set XCurl.dll imports them from, as a mapped image would be.
 void check_run_time_load() {
     using LoadW = HMODULE(WINAPI*)(LPCWSTR);
@@ -294,12 +296,12 @@ void check_run_time_load() {
           "the same module for a bare name, a full path in any case, LoadLibraryExA and GetModuleHandleW");
 
     const char* entry_points[] = {"InitializeApiImpl", "InitializeApiImplEx", "InitializeApiImplEx2",
-                                  "UninitializeApiImpl", "QueryApiImpl"};
+                                  "UninitializeApiImpl", "QueryApiImpl", "XErrorReport"};
     bool all = true;
     for (const char* n : entry_points)
         all = all && get_proc(rt_mod, n) &&
               reinterpret_cast<void*>(get_proc(rt_mod, n)) == rt::shims::find("xgameruntime.dll", n);
-    check(all, "GetProcAddress serves the five entry points xgameruntime.lib looks up");
+    check(all, "GetProcAddress serves the six entry points xgameruntime.lib looks up");
     SetLastError(0);
     check(get_proc(rt_mod, "NoSuchRuntimeFunction") == nullptr && GetLastError() == ERROR_PROC_NOT_FOUND,
           "an unserved name is NULL with ERROR_PROC_NOT_FOUND, as from a real module");
@@ -365,6 +367,9 @@ void check_run_time_load() {
         check(reinterpret_cast<Create>(slot(t, 12))(t, XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual,
                                                     &queue) == S_OK && queue,
               "slot 12 is XTaskQueueCreate");
+        using IsEmpty = bool(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, XTaskQueuePort);
+        check(reinterpret_cast<IsEmpty>(slot(t, 28))(t, queue, XTaskQueuePort::Work),
+              "slot 28 reports an idle work port empty");
         static std::atomic<int> s_ran{0};
         using Submit = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, XTaskQueuePort, void*,
                                                   XTaskQueueCallback*);
@@ -373,6 +378,10 @@ void check_run_time_load() {
         };
         check(reinterpret_cast<Submit>(slot(t, 18))(t, queue, XTaskQueuePort::Work, &s_ran, cb) == S_OK,
               "slot 18 is XTaskQueueSubmitCallback");
+        check(!reinterpret_cast<IsEmpty>(slot(t, 28))(t, queue, XTaskQueuePort::Work),
+              "slot 28 reports queued work nonempty");
+        check(reinterpret_cast<IsEmpty>(slot(t, 28))(t, queue, XTaskQueuePort::Completion),
+              "slot 28 reports completion empty while work is queued");
         using Dispatch = bool(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, XTaskQueuePort, uint32_t);
         check(reinterpret_cast<Dispatch>(slot(t, 16))(t, queue, XTaskQueuePort::Work, 0) && s_ran.load() == 1,
               "slot 16 is XTaskQueueDispatch: the callback ran on the work port");
@@ -393,17 +402,34 @@ void check_run_time_load() {
         // Slot 8 (XAsyncBeginAlloc, private, signature not measured) must not report a begun call whose provider
         // never received XAsyncOp::Begin: either it refuses, or the provider saw Begin exactly once.
         static std::atomic<int> s_begins{0};
-        XAsyncProvider* provider = [](XAsyncOp op, const XAsyncProviderData*) -> HRESULT {
-            if (op == XAsyncOp::Begin) s_begins.fetch_add(1);
+        static bool s_context_ok = false;
+        static const uint8_t* s_parameter = nullptr;
+        XAsyncProvider* provider = [](XAsyncOp op, const XAsyncProviderData* data) -> HRESULT {
+            if (op == XAsyncOp::Begin) {
+                auto* context = static_cast<uint8_t*>(data->context);
+                s_context_ok = context && context != s_parameter &&
+                               std::memcmp(context, s_parameter, 4) == 0 && context[15] == 0;
+                if (context) context[15] = 0x7f;
+                s_begins.fetch_add(1);
+                XAsyncComplete(data->async, S_OK, 0);
+            }
             return S_OK;
         };
         XAsyncBlock alloc_block{};
         using BeginAlloc = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, const void*, const char*, XAsyncProvider*,
                                                         size_t, size_t, void*);
+        uint8_t parameter[] = {0x12, 0x34, 0x56, 0x78};
+        s_parameter = parameter;
         const HRESULT alloc_hr =
-            reinterpret_cast<BeginAlloc>(slot(t, 8))(t, &alloc_block, nullptr, "test", provider, 16, 0, nullptr);
-        check(FAILED(alloc_hr) || s_begins.load() == 1,
-              "slot 8 (XAsyncBeginAlloc) never reports success for a call whose provider did not begin");
+            reinterpret_cast<BeginAlloc>(slot(t, 8))(t, &alloc_block, nullptr, "test", provider, 16, sizeof(parameter), parameter);
+        check(alloc_hr == S_OK && s_begins.load() == 1,
+              "slot 8 begins the allocated provider");
+        check(s_context_ok, "slot 8 provides a 16-byte context with a copied parameter block");
+        if (alloc_hr == S_OK) {
+            using Status = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, bool);
+            check(reinterpret_cast<Status>(slot(t, 3))(t, &alloc_block, true) == S_OK,
+                  "slot 8 provider completes successfully");
+        }
         void* unk = nullptr;
         const GUID iunknown = {0, 0, 0, {0xc0, 0, 0, 0, 0, 0, 0, 0x46}};
         using QI = HRESULT(STDMETHODCALLTYPE*)(void*, REFIID, void**);
@@ -433,7 +459,55 @@ void check_run_time_load() {
         const HRESULT reported = reinterpret_cast<Report>(slot(e, 3))(e, E_FAIL, "offline test");
         check(reported == S_OK && seen.hr == E_FAIL && std::strcmp(seen.msg, "offline test") == 0,
               "slot 3 is XErrorReport and reaches the callback slot 4 (XErrorSetCallback) set");
+        // The DLL export XGameRuntimeInitialize looks up: XErrorReport(HRESULT, const char*), two arguments, no `this`.
+        using ReportExport = HRESULT(WINAPI*)(HRESULT, const char*);
+        auto report_export = reinterpret_cast<ReportExport>(get_proc(rt_mod, "XErrorReport"));
+        seen = {};
+        check(report_export && report_export(E_OUTOFMEMORY, "export test") == S_OK && seen.hr == E_OUTOFMEMORY &&
+                  std::strcmp(seen.msg, "export test") == 0,
+              "the XErrorReport export takes (HRESULT, const char*) and reaches the same callback");
         reinterpret_cast<SetCallback>(slot(e, 4))(e, nullptr, nullptr);
+        // Re-entrancy: invoking XErrorReport and XErrorSetCallback from inside the callback must not deadlock.
+        struct Reentrant {
+            void* err_obj = nullptr;
+            Report report_fn = nullptr;
+            SetCallback set_cb_fn = nullptr;
+            int calls = 0;
+            HRESULT nested_hr = S_OK;
+        };
+        static Reentrant reentrant{};
+        reentrant = {e, reinterpret_cast<Report>(slot(e, 3)), reinterpret_cast<SetCallback>(slot(e, 4)), 0, S_OK};
+        Callback on_reentrant = [](HRESULT, const char*, void* ctx) {
+            auto* r = static_cast<Reentrant*>(ctx);
+            const int n = ++r->calls;
+            if (n == 1) {
+                r->nested_hr = r->report_fn(r->err_obj, E_ABORT, "nested report");
+                r->set_cb_fn(r->err_obj, nullptr, nullptr);
+            }
+            return true;
+        };
+        reentrant.set_cb_fn(e, on_reentrant, &reentrant);
+        HANDLE th = CreateThread(
+            nullptr, 0,
+            [](LPVOID param) -> DWORD {
+                auto* r = static_cast<Reentrant*>(param);
+                return r->report_fn(r->err_obj, E_FAIL, "outer report") == S_OK ? 0u : 1u;
+            },
+            &reentrant, 0, nullptr);
+        const DWORD waited = th ? WaitForSingleObject(th, 2000) : WAIT_FAILED;
+        DWORD thread_rc = 1;
+        if (waited == WAIT_OBJECT_0) GetExitCodeThread(th, &thread_rc);
+        if (th) CloseHandle(th);
+        const HRESULT after_clear =
+            (waited == WAIT_OBJECT_0) ? reentrant.report_fn(e, E_FAIL, "after clear") : E_FAIL;
+        check(waited == WAIT_OBJECT_0 && thread_rc == 0 && reentrant.calls == 2 && reentrant.nested_hr == S_OK &&
+                  after_clear == S_OK,
+              "XErrorReport invokes callback without holding g_error_mutex (re-entrant report + set_callback)");
+        if (waited != WAIT_OBJECT_0) {
+            std::printf("xgameruntime_test: %d of %d checks failed (deadlock in XErrorReport)\n", g_failures, g_checks);
+            std::fflush(stdout);
+            std::_Exit(1);
+        }
         using SetOptions = void(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t);  // void, per Microsoft's page
         reinterpret_cast<SetOptions>(slot(e, 5))(e, 0x01, 0x00);  // OutputDebugStringOnError / None
         release(e);
@@ -812,10 +886,152 @@ void check_run_time_load() {
         reinterpret_cast<CloseMount>(slot(pk, 26))(pk, handle);
         check(reinterpret_cast<PathSize>(slot(pk, 24))(pk, handle, &need) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
               "slot 26 (XPackageCloseMountHandle) closes the handle");
+        // Enumeration and installation monitors: what a title asks at boot to learn what is installed. The game
+        // package is the process's own; content packages are the ones LEONIDA_CONTENT_PACKAGES installs.
+        {
+            struct Seen {
+                std::vector<std::string> ids;
+                std::vector<uint32_t> kinds;
+                size_t stop_after = ~size_t(0);
+            };
+            struct Details {
+                const char* id;
+                uint64_t version;
+                uint32_t kind;
+                const char* name;
+                const char* description;
+                const char* publisher;
+                const char* store_id;
+                bool installing;
+            };
+            static_assert(sizeof(Details) == 64, "XPackageDetails is 64 bytes");
+            using Callback = bool(CALLBACK*)(void*, const Details*);
+            using Enumerate = HRESULT(__stdcall*)(uint32_t, uint32_t, void*, Callback);
+            static int dummy_callback = 0;
+            const auto collect = [](void* ctx, const Details* d) -> bool {
+                auto* seen = static_cast<Seen*>(ctx);
+                seen->ids.push_back(d->id);
+                seen->kinds.push_back(d->kind);
+                return seen->ids.size() < seen->stop_after;
+            };
+            const auto enumerate = reinterpret_cast<Enumerate>(rt::shims::find("xgameruntime.dll", "XPackageEnumeratePackages"));
+            check(enumerate != nullptr, "XPackageEnumeratePackages is exported");
+            if (enumerate) {
+                SetEnvironmentVariableA("LEONIDA_PACKAGE_ID", "ENUMGAME_12345678901234567890123");
+                SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", "DLCONE=C:\\one;DLCTWO=C:\\two");
+                Seen game, content, stopped;
+                check(enumerate(0, 0, &game, collect) == S_OK && game.ids.size() == 1 &&
+                          game.ids[0] == "ENUMGAME_12345678901234567890123" && game.kinds[0] == 0,
+                      "enumerating Game lists the process's own package, once");
+                check(enumerate(1, 1, &content, collect) == S_OK && content.ids.size() == 2 && content.ids[0] == "DLCONE" &&
+                          content.ids[1] == "DLCTWO" && content.kinds[0] == 1,
+                      "enumerating Content lists the installed content packages in order");
+                stopped.stop_after = 1;
+                check(enumerate(1, 0, &stopped, collect) == S_OK && stopped.ids.size() == 1,
+                      "a callback that returns false stops the enumeration");
+                check(enumerate(7, 0, &game, collect) == E_INVALIDARG && enumerate(0, 0, &game, nullptr) == E_INVALIDARG,
+                      "an unknown package kind or no callback is E_INVALIDARG");
+                // Slots 28, 35 (IXPackageImpl2) and 39 (IXPackageImpl3) enumerate as the export does, including the
+                // extended index/count/ageRestricted/titleID fields.
+                struct DetailsV3 {
+                    Details base;
+                    uint32_t index;
+                    uint32_t count;
+                    bool age_restricted;
+                    const char* title_id;
+                };
+                static_assert(sizeof(DetailsV3) == 88, "XPackageDetailsV3 is 88 bytes");
+                struct SeenV3 {
+                    std::vector<std::string> ids;
+                    std::vector<uint32_t> indices;
+                    uint32_t count = 0;
+                    bool ok_tail = true;
+                };
+                using CallbackV3 = bool(CALLBACK*)(void*, const DetailsV3*);
+                using EnumSlotV3 = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t, void*, CallbackV3);
+                const auto collect_v3 = [](void* ctx, const DetailsV3* d) -> bool {
+                    auto* s = static_cast<SeenV3*>(ctx);
+                    s->ids.push_back(d->base.id);
+                    s->indices.push_back(d->index);
+                    s->count = d->count;
+                    s->ok_tail = s->ok_tail && !d->age_restricted && d->title_id != nullptr;
+                    return true;
+                };
+                using EnumSlot = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t, void*, Callback);
+                Seen via_slot;
+                check(reinterpret_cast<EnumSlot>(slot(pk, 28))(pk, 1, 0, &via_slot, collect) == S_OK && via_slot.ids == content.ids,
+                      "slot 28 enumerates as the export does");
+                SeenV3 via_35, via_39;
+                check(reinterpret_cast<EnumSlotV3>(slot(pk, 35))(pk, 1, 0, &via_35, collect_v3) == S_OK &&
+                          via_35.ids == content.ids && via_35.count == 2 && via_35.indices == std::vector<uint32_t>({0, 1}) &&
+                          via_35.ok_tail,
+                      "slot 35 (IXPackageImpl2::EnumeratePackages) populates extended details");
+                check(reinterpret_cast<EnumSlotV3>(slot(pk, 39))(pk, 1, 0, &via_39, collect_v3) == S_OK &&
+                          via_39.ids == content.ids && via_39.count == 2 && via_39.indices == std::vector<uint32_t>({0, 1}) &&
+                          via_39.ok_tail,
+                      "slot 39 (IXPackageImpl3::EnumeratePackages) populates extended details");
+                // Slot 5/6 (CreateInstallationMonitor / CloseInstallationMonitorHandle) through the COM vtable.
+                using CreateSlot = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint32_t, const void*, uint32_t, void*, void**);
+                using CloseSlot = void(STDMETHODCALLTYPE*)(void*, void*);
+                void* vtable_mon = nullptr;
+                check(reinterpret_cast<CreateSlot>(slot(pk, 5))(pk, "ENUMGAME_12345678901234567890123", 0, nullptr, 1000, nullptr, &vtable_mon) == S_OK &&
+                          vtable_mon != nullptr,
+                      "slot 5 (XPackageCreateInstallationMonitor) opens a monitor via vtable");
+                if (vtable_mon) reinterpret_cast<CloseSlot>(slot(pk, 6))(pk, vtable_mon);
+
+                using Create = HRESULT(__stdcall*)(const char*, uint32_t, const void*, uint32_t, void*, void**);
+                using Close = void(__stdcall*)(void*);
+                using GetProgress = void(__stdcall*)(void*, void*);
+                using Register = HRESULT(__stdcall*)(void*, void*, void*, XTaskQueueRegistrationToken*);
+                using Unregister = bool(__stdcall*)(void*, XTaskQueueRegistrationToken, bool);
+                const auto create = reinterpret_cast<Create>(rt::shims::find("xgameruntime.dll", "XPackageCreateInstallationMonitor"));
+                const auto close = reinterpret_cast<Close>(rt::shims::find("xgameruntime.dll", "XPackageCloseInstallationMonitorHandle"));
+                const auto progress_of = reinterpret_cast<GetProgress>(rt::shims::find("xgameruntime.dll", "XPackageGetInstallationProgress"));
+                const auto reg = reinterpret_cast<Register>(rt::shims::find("xgameruntime.dll", "XPackageRegisterInstallationProgressChanged"));
+                const auto unreg = reinterpret_cast<Unregister>(rt::shims::find("xgameruntime.dll", "XPackageUnregisterInstallationProgressChanged"));
+                check(create && close && progress_of && reg && unreg, "the installation monitor calls are exported");
+                if (create && close && progress_of && reg && unreg) {
+                    void* monitor = nullptr;
+                    check(create("ENUMGAME_12345678901234567890123", 0, nullptr, 1000, nullptr, &monitor) == S_OK && monitor,
+                          "a monitor opens on the game's own package");
+                    struct Progress {
+                        uint64_t total, installed, launch;
+                        bool launchable, completed;
+                    } progress{1, 2, 3, false, false};
+                    progress_of(monitor, &progress);
+                    check(progress.launchable && progress.completed && progress.installed == progress.total,
+                          "its progress reads installed, launchable and completed");
+                    XTaskQueueRegistrationToken token{};
+                    check(reg(monitor, nullptr, static_cast<void*>(&dummy_callback), &token) == S_OK && token.token != 0 &&
+                              unreg(monitor, token, true),
+                          "a progress-changed registration gets a token and unregisters");
+                    void* other = nullptr;
+                    check(create("DLCTWO", 0, nullptr, 1000, nullptr, &other) == S_OK && other && other != monitor,
+                          "a monitor opens on an installed content package, and is a different handle");
+                    close(monitor);
+                    close(other);
+                    void* missing = &monitor;
+                    check(create("NOT_INSTALLED", 0, nullptr, 1000, nullptr, &missing) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND) &&
+                              missing == nullptr,
+                          "a package that is not installed has no monitor (ERROR_NOT_FOUND, handle cleared)");
+                    close(monitor);  // closing twice is harmless
+                }
+                using RegInstalled = HRESULT(__stdcall*)(void*, void*, void*, XTaskQueueRegistrationToken*);
+                const auto reg_installed = reinterpret_cast<RegInstalled>(rt::shims::find("xgameruntime.dll", "XPackageRegisterPackageInstalled"));
+                XTaskQueueRegistrationToken t1{}, t2{};
+                check(reg_installed && reg_installed(nullptr, nullptr, static_cast<void*>(&dummy_callback), &t1) == S_OK &&
+                          reg_installed(nullptr, nullptr, static_cast<void*>(&dummy_callback), &t2) == S_OK && t1.token != 0 &&
+                          t1.token != t2.token,
+                      "package-installed registrations get distinct tokens");
+                SetEnvironmentVariableA("LEONIDA_PACKAGE_ID", nullptr);
+            }
+        }
         SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", nullptr);
         using Stub = HRESULT(STDMETHODCALLTYPE*)(void*);
-        check(reinterpret_cast<Stub>(slot(pk, 5))(pk) == E_NOTIMPL && reinterpret_cast<Stub>(slot(pk, 40))(pk) == E_NOTIMPL,
-              "the slots without an offline answer (5, 40) are E_NOTIMPL");
+        check(reinterpret_cast<Stub>(slot(pk, 27))(pk) == E_NOTIMPL &&
+                  reinterpret_cast<Stub>(slot(pk, 40))(pk) == E_NOTIMPL &&
+                  reinterpret_cast<Stub>(slot(pk, 41))(pk) == E_NOTIMPL,
+              "the slots without an offline answer (27, 40, 41) are E_NOTIMPL");
         struct Progress {
             uint64_t total, installed, launch;
             bool launchable, completed;
@@ -833,18 +1049,20 @@ void check_run_time_load() {
                   reinterpret_cast<UnregInstalled>(slot(pk, 22))(pk, XTaskQueueRegistrationToken{1}, false) &&
                   !reinterpret_cast<Uninstall>(slot(pk, 34))(pk, "pkg"),
               "the bool slots 8, 10, 22 and 34 return their documented offline answers");
+        const GUID package4 = {0x0b9d556e, 0xab70, 0x43f4, {0xba, 0xa0, 0x99, 0x99, 0xac, 0x4c, 0xb0, 0x40}};
         const GUID chain[] = {
             package_cls,
             {0x3720de07, 0xe8e4, 0x44a3, {0xad, 0x32, 0xb3, 0x59, 0xe8, 0xad, 0xbe, 0x55}},
             {0xf92d8712, 0x2b27, 0x4d8a, {0xbf, 0x01, 0x11, 0xa6, 0xf8, 0xe3, 0xeb, 0x42}},
-            package3};
+            package3,
+            package4};
         bool all = true;
         for (const GUID& iid : chain) {
             void* same = nullptr;
             all = all && query(&package_cls, iid, &same) == S_OK && same == pk;
             if (same) release(same);
         }
-        check(all, "IXPackageImpl3 answers for IXPackageImpl and IXPackageImpl2 too");
+        check(all, "IXPackageImpl4 answers for IXPackageImpl, IXPackageImpl2, IXPackageImpl3 and IXPackageImpl4");
         release(pk);
     }
     {

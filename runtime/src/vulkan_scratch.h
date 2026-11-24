@@ -46,12 +46,16 @@ public:
         constexpr VkDeviceSize alignment = 256, minimum = 4u << 20;
         if (!loaded_ || !bytes) return false;
         for (auto& chunk : current_.chunks) {
-            const VkDeviceSize start = (chunk.used + alignment - 1) / alignment * alignment;
-            if (start <= chunk.size && bytes <= chunk.size - start) {
-                chunk.used = start + bytes;
-                buffer = chunk.buffer;
-                offset = start;
-                return true;
+            const VkDeviceSize rem = chunk.used % alignment;
+            const VkDeviceSize pad = rem ? alignment - rem : 0;
+            if (pad <= chunk.size - chunk.used) {
+                const VkDeviceSize start = chunk.used + pad;
+                if (bytes <= chunk.size - start) {
+                    chunk.used = start + bytes;
+                    buffer = chunk.buffer;
+                    offset = start;
+                    return true;
+                }
             }
         }
         Chunk chunk;
@@ -148,7 +152,8 @@ private:
     bool make_chunk(std::uint64_t size, Chunk& out) {
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = size;
-        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        // INDEX_BUFFER: a draw that reads past its index view's end binds a staged copy (vulkan_replay.h, prepare).
+        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
         if (vk_.vkCreateBuffer(device_, &info, nullptr, &out.buffer) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         vk_.vkGetBufferMemoryRequirements(device_, out.buffer, &requirements);

@@ -107,6 +107,10 @@ struct VulkanDeviceInfo {
     bool sampler_anisotropy = false;
     bool sampler_mirror_clamp_to_edge = false;
     bool sampler_filter_minmax = false;
+    // VkPhysicalDeviceSamplerFilterMinmaxProperties::filterMinmaxImageComponentMapping. Without it a minimum/maximum
+    // reduction defines only the R component of a sample, and only through an identity-swizzled view (Vulkan
+    // specification, Texel Filtering); G, B and A are undefined (D3D-994: Polaris on the AMD Windows driver).
+    bool sampler_filter_minmax_component_mapping = false;
     // VK_KHR_calibrated_timestamps or VK_EXT_calibrated_timestamps is enabled on `device` (QueueClock).
     bool calibrated_timestamps = false;
     // VK_EXT_conditional_rendering (with its conditionalRendering feature) is enabled: SetPredication works, and
@@ -117,6 +121,10 @@ struct VulkanDeviceInfo {
     // VK_EXT_conservative_rasterization is enabled on the logical device. Tier 1/2 depend on the physical
     // precision/overestimation properties; Tier 2 also requires post-snap degenerate triangles.
     bool conservative_rasterization = false;
+    // VK_EXT_line_rasterization features enabled on the logical device.
+    bool line_bresenham = false;
+    bool line_smooth = false;
+    bool line_rectangular = false;
     // Opt in only for shader libraries whose InnerCoverage input contract uses FullyCoveredEXT. The device
     // still checks physical Tier 2 and fullyCoveredFragmentShaderInputVariable properties. The standalone
     // device leaves this false until the Xbox PS input mapping is confirmed (synthetic GLSL is not that ABI).
@@ -156,6 +164,9 @@ struct VulkanDeviceInfo {
     bool fragment_shader_barycentric = false;
     bool fragment_shader_interlock = false;
     bool maintenance8 = false;
+    // VK_KHR_maintenance5, enabled where its VK_FORMAT_A8_UNORM_KHR can be sampled and is a colour attachment the GPU
+    // can blend: A8_UNORM render targets are then stored in that format (other A8_UNORM textures stay R8_UNORM).
+    bool a8_render_target = false;
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
     // do nothing.
     bool debug_utils = false;
@@ -175,6 +186,9 @@ struct VulkanDeviceInfo {
     // shaders have no amplification stage). Mesh-shader PSOs and DispatchMesh work, and CheckFeatureSupport reports
     // D3D12_MESH_SHADER_TIER_1; without it mesh PSOs are refused and the tier is NOT_SUPPORTED.
     bool mesh_shader = false;
+    // VK_EXT_mesh_shader's meshShaderQueries feature is enabled on `device`, so the clipping invocations of a mesh
+    // segment come from a mesh-primitives query (D3D-MESH-CLIPPING-COUNTER). Without it they read 0.
+    bool mesh_shader_queries = false;
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
     // depthBiasClamp or dualSrcBlend are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};
@@ -231,8 +245,11 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
 
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);
-// The VkBuffer behind a buffer created by such a device, or VK_NULL_HANDLE. For tests.
+// The VkBuffer of its own behind a buffer created by such a device, or VK_NULL_HANDLE: a buffer that is a range of the
+// GPU address arena (default, upload and readback buffers, placed ones) has none. For tests.
 VkBuffer vulkan_buffer(ID3D12Resource* resource);
+// The VkBuffer that holds a buffer and where in it the buffer starts (its own at 0, or the arena at its VA). For tests.
+bool vulkan_buffer_range(ID3D12Resource* resource, VkBuffer& buffer, VkDeviceSize& offset);
 // What a device from create_vulkan_device* was created with (enabled features included), or null. For tests.
 const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device);
 // True when `device` has VK_KHR_acceleration_structure + VK_KHR_ray_query enabled.

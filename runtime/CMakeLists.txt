@@ -113,6 +113,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/registry.cpp
     shims/file_system.cpp
     shims/winhttp_offline.cpp
+    shims/ws2_offline.cpp
     shims/xmem.cpp
     shims/xg_xs.cpp
     shims/acphal.cpp
@@ -252,7 +253,9 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
 
   # The Zen 2 instructions a desktop CPU may lack (src/cpu_emulation.h): decoded, emulated on a CONTEXT, and run for
   # real with the #UD handler installed, so an Intel host takes the emulated path and an AMD one the native path.
-  add_executable(cpu_emulation_test test/cpu_emulation_test.cpp)
+  add_executable(cpu_emulation_test test/cpu_emulation_test.cpp shims/xmem.cpp shims/registry.cpp)
+  target_link_options(cpu_emulation_test PRIVATE /OPT:NOREF)
+  target_link_libraries(cpu_emulation_test PRIVATE psapi)
   target_include_directories(cpu_emulation_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_compile_definitions(cpu_emulation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(cpu_emulation_test PRIVATE /W4 /permissive- /utf-8)
@@ -325,6 +328,18 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(winhttp_offline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(winhttp_offline_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(winhttp_offline_test PRIVATE /OPT:NOREF)
+
+  # Offline Winsock2 for mapped images (ws2_32.dll restricted to loopback); no external network is touched.
+  add_executable(ws2_offline_test
+    test/ws2_offline_test.cpp
+    shims/ws2_offline.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(ws2_offline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(ws2_offline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(ws2_offline_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(ws2_offline_test PRIVATE /OPT:NOREF)
+  target_link_libraries(ws2_offline_test PRIVATE ws2_32)
 
   # COM lifecycle and helper shims for api-ms-win-core-com-l1-1-*.dll.
   add_executable(com_shim_test
@@ -523,6 +538,9 @@ if(BUILD_TESTING)
 
   add_executable(retire_tickets_test test/retire_tickets_test.cpp)
   add_test(NAME retire_tickets COMMAND retire_tickets_test)
+
+  add_executable(queue_holds_test test/queue_holds_test.cpp)
+  add_test(NAME queue_holds COMMAND queue_holds_test)
   # VulkanContext::buffer_at's VA index (runtime/src/buffer_va_index.h): pure stdlib, no Vulkan instance.
   add_executable(buffer_va_index_test test/buffer_va_index_test.cpp)
   add_test(NAME buffer_va_index COMMAND buffer_va_index_test)
@@ -577,6 +595,10 @@ if(BUILD_TESTING)
     target_link_options(loader_test PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
     add_dependencies(loader_test gta6rt_tls_host)
     add_test(NAME loader COMMAND loader_test)
+    # It takes about 10 s under Wine and under a minute on a desktop with a virus scanner. Before #239 it waited on
+    # a "Bad Image" box on the Windows runner until the job's own timeout cancelled the whole job (every Windows
+    # run from 24 Nov 00:37 to 03:32 UTC); a hang like that now fails this test instead.
+    set_tests_properties(loader PROPERTIES TIMEOUT 180)
     # PE loader tests use two locally built fixtures: a DLL with exports, imports and relocations, and an EXE that
     # imports it so Loader::load exercises recursive module loading. They contain no game data.
     set(TINY_FIXTURE_DIR "${CMAKE_CURRENT_BINARY_DIR}/fixtures/$<CONFIG>")
@@ -610,6 +632,8 @@ if(BUILD_TESTING)
     add_executable(tiny_ga_tls test/fixtures/tiny_ga_tls.cpp)
     target_compile_definitions(tiny_ga_tls PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_ga_tls PRIVATE /W4 /permissive- /utf-8 /GS- /GA)
+    # /GA can remove the _tls_index reference that pulls in the CRT TLS directory.
+    target_link_options(tiny_ga_tls PRIVATE /INCLUDE:_tls_used)
     set_target_properties(tiny_ga_tls PROPERTIES
       OUTPUT_NAME tiny_ga_tls
       RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
@@ -770,7 +794,12 @@ if(BUILD_TESTING)
     target_link_libraries(tiny_game_fixed PRIVATE xgameruntime_stub)
     target_compile_definitions(tiny_game_fixed PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
     target_compile_options(tiny_game_fixed PRIVATE /W4 /permissive- /utf-8 /EHsc)
-    target_link_options(tiny_game_fixed PRIVATE /FIXED /DYNAMICBASE:NO /BASE:0x140000000)
+    # /INCREMENTAL:NO, here and on the fixtures linked with /NODEFAULTLIB below: such an image can have no base
+    # relocations, and VS 2026 18.6's linker (MSVC 14.51) crashes on an incremental relink of one ("LNK1000: Internal
+    # error during IncrCalcPtrs"). CMake's Ninja and Makefile generators relink every target once in each clean Debug
+    # or RelWithDebInfo build (/debug /INCREMENTAL by default), with only its manifest resource changed, to embed it.
+    # Fixed in VS 2026 18.7; tests/test_runtime_incremental_link.py keeps a new fixture of this kind covered.
+    target_link_options(tiny_game_fixed PRIVATE /FIXED /DYNAMICBASE:NO /BASE:0x140000000 /INCREMENTAL:NO)
     set_target_properties(tiny_game_fixed PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
@@ -877,7 +906,7 @@ if(BUILD_TESTING)
     add_library(tiny_tls_cb_only SHARED test/fixtures/tiny_tls_cb_only.cpp)
     target_compile_definitions(tiny_tls_cb_only PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_tls_cb_only PRIVATE /W4 /permissive- /utf-8 /GS-)
-    target_link_options(tiny_tls_cb_only PRIVATE /NODEFAULTLIB /ENTRY:DllMainCRTStartup)
+    target_link_options(tiny_tls_cb_only PRIVATE /NODEFAULTLIB /ENTRY:DllMainCRTStartup /INCREMENTAL:NO)
     target_link_libraries(tiny_tls_cb_only PRIVATE kernel32)
     set_target_properties(tiny_tls_cb_only PROPERTIES
       OUTPUT_NAME tiny_tls_cb_only
@@ -907,7 +936,7 @@ if(BUILD_TESTING)
     # DllMain's only work is that one call. No game files.
     add_library(dll_thread_calls SHARED test/fixtures/dll_thread_calls.cpp)
     target_compile_options(dll_thread_calls PRIVATE /W4 /permissive- /utf-8 /GS-)
-    target_link_options(dll_thread_calls PRIVATE /NODEFAULTLIB /ENTRY:dll_thread_calls_main)
+    target_link_options(dll_thread_calls PRIVATE /NODEFAULTLIB /ENTRY:dll_thread_calls_main /INCREMENTAL:NO)
     target_link_libraries(dll_thread_calls PRIVATE kernel32)
     set_target_properties(dll_thread_calls PROPERTIES
       OUTPUT_NAME dll_thread_calls
@@ -942,7 +971,7 @@ if(BUILD_TESTING)
     if(GAMEINPUT_LIBRARY)
       add_library(gameinput_host SHARED test/fixtures/gameinput_host.cpp)
       target_compile_options(gameinput_host PRIVATE /W4 /permissive- /utf-8 /GS-)
-      target_link_options(gameinput_host PRIVATE /NODEFAULTLIB /ENTRY:gameinput_host_main)
+      target_link_options(gameinput_host PRIVATE /NODEFAULTLIB /ENTRY:gameinput_host_main /INCREMENTAL:NO)
       target_link_libraries(gameinput_host PRIVATE kernel32 ${GAMEINPUT_LIBRARY})
       set_target_properties(gameinput_host PROPERTIES
         OUTPUT_NAME gameinput_host
@@ -1031,6 +1060,8 @@ if(BUILD_TESTING)
   endif()
   add_executable(command_list_test test/command_list_test.cpp)
   add_test(NAME command_list COMMAND command_list_test)
+  add_executable(command_list_query_oom_test test/command_list_query_oom_test.cpp)
+  add_test(NAME command_list_query_oom COMMAND command_list_query_oom_test)
   # Which SPIR-V modules declare a storage image or buffer they may write (src/spirv_stores.h), on hand-built words.
   add_executable(spirv_stores_test test/spirv_stores_test.cpp)
   add_test(NAME spirv_stores COMMAND spirv_stores_test)
@@ -1180,6 +1211,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
+  endif()
+  if(WIN32 AND TARGET ws2_offline_test)
+    add_test(NAME ws2_offline COMMAND ws2_offline_test)
   endif()
   if(WIN32 AND TARGET com_shim_test)
     add_test(NAME com_shim COMMAND com_shim_test)
@@ -1411,6 +1445,11 @@ if(TARGET Vulkan::Headers)
   add_executable(vk_shader_fma_test test/vk_shader_fma_test.cpp)
   target_link_libraries(vk_shader_fma_test PRIVATE Vulkan::Headers)
   add_test(NAME vk_shader_fma COMMAND vk_shader_fma_test)
+  add_executable(xdxr_builder_validation_test test/xdxr_builder_validation_test.cpp)
+  target_link_libraries(xdxr_builder_validation_test PRIVATE Vulkan::Headers)
+  if(BUILD_TESTING)
+    add_test(NAME xdxr_builder_validation COMMAND xdxr_builder_validation_test)
+  endif()
   # LEONIDA_VK_DEVICE names the GPU in every harness (docs/testing.md, "Choosing the GPU"): a filter that matches no
   # device fails the run in vk_descriptor_bench and vk_sandbox too, instead of testing another GPU (TEST-1141).
   find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -1610,6 +1649,18 @@ if(TARGET Vulkan::Headers)
   endif()
   if(BUILD_TESTING)
     add_test(NAME vk_buffer_registration_oom COMMAND vk_buffer_registration_oom_test)
+  endif()
+  # VulkanContext::replay_.host_at resolves aliasing placed upload buffers across the full requested byte range.
+  add_executable(vk_host_at_aliasing_test test/vk_host_at_aliasing_test.cpp)
+  target_link_libraries(vk_host_at_aliasing_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_host_at_aliasing_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    if(MSVC)
+      target_compile_options(vk_host_at_aliasing_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+    endif()
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_host_at_aliasing COMMAND vk_host_at_aliasing_test)
   endif()
   # CPU-only: ScratchBuffers chunk alignment, retire/collect/forget, and spare cap (runtime/src/vulkan_scratch.h).
   add_executable(vulkan_scratch_test test/vulkan_scratch_test.cpp)
@@ -1884,6 +1935,14 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_texture1d COMMAND d3d12_texture1d_test)
     set_tests_properties(d3d12_texture1d PROPERTIES SKIP_RETURN_CODE 77)
 
+    add_executable(d3d12_srv_validation_test test/d3d12_srv_validation_test.cpp)
+    target_link_libraries(d3d12_srv_validation_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_srv_validation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_srv_validation_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_srv_validation COMMAND d3d12_srv_validation_test)
+    set_tests_properties(d3d12_srv_validation PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+
     # Placed 1D and 3D textures against the host runtime and WARP, and a copy round trip through them.
     add_executable(d3d12_placed_dimensions_test test/d3d12_placed_dimensions_test.cpp)
     target_link_libraries(d3d12_placed_dimensions_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
@@ -2078,6 +2137,15 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_sampler2_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_sampler2 COMMAND d3d12_sampler2_test)
     set_tests_properties(d3d12_sampler2 PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Readback buffers stay out of the GPU address arena (a live one leaves it to default buffers; review of #444).
+    add_executable(d3d12_readback_arena_test test/d3d12_readback_arena_test.cpp)
+    target_link_libraries(d3d12_readback_arena_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_readback_arena_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_readback_arena_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_readback_arena COMMAND d3d12_readback_arena_test)
+    set_tests_properties(d3d12_readback_arena PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
     # Descriptors through the proxy: copies between heaps, what texture views and samplers write into their slots,
     # and (where glslangValidator is found) a compute shader the test runs on the device's bindless set, which
@@ -2402,10 +2470,14 @@ if(TARGET Vulkan::Headers)
     endif()
     find_program(LEONIDA_SPIRV_AS spirv-as HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
     find_program(LEONIDA_SPIRV_VAL spirv-val HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
-    if(LEONIDA_LLVM_MC AND LEONIDA_SPIRV_AS AND LEONIDA_SPIRV_VAL)
-      set(LEONIDA_M15_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/m15_shaders)
+    # Every shader test that runs test/shaders/build.py passes this folder as LEONIDA_SPIRV_TOOLS, which build.py
+    # puts on PATH, so spirv-as and spirv-val are found even when the SDK's Bin folder is not on PATH.
+    if(LEONIDA_SPIRV_AS)
       get_filename_component(LEONIDA_SPIRV_TOOLS_DIR ${LEONIDA_SPIRV_AS} DIRECTORY)
       file(TO_NATIVE_PATH "${LEONIDA_SPIRV_TOOLS_DIR}" LEONIDA_SPIRV_TOOLS_NATIVE)
+    endif()
+    if(LEONIDA_LLVM_MC AND LEONIDA_SPIRV_AS AND LEONIDA_SPIRV_VAL)
+      set(LEONIDA_M15_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/m15_shaders)
       set(LEONIDA_M15_FILES ${LEONIDA_M15_DIR}/spirv/index.json ${LEONIDA_M15_DIR}/fssm/vs_m15.fssm
                             ${LEONIDA_M15_DIR}/fssm/ps_m15.fssm)
       add_custom_command(
@@ -2567,6 +2639,32 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_m4_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_m4_compute COMMAND d3d12_m4_compute_test)
       set_tests_properties(d3d12_m4_compute PROPERTIES SKIP_RETURN_CODE 77)
+
+      # M8: upload and readback buffers in the GPU address arena; cs_upload_read.asm reads the upload buffer through a
+      # V# (LEONIDA_USER_DATA_SHIFT=4: root arguments from s4, as the M5 3D UAV shaders).
+      set(LEONIDA_UPLOAD_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/upload_shaders)
+      set(LEONIDA_UPLOAD_FILES ${LEONIDA_UPLOAD_DIR}/spirv/index.json ${LEONIDA_UPLOAD_DIR}/fssm/cs_upload_read.fssm)
+      add_custom_command(
+        OUTPUT ${LEONIDA_UPLOAD_FILES}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_UPLOAD_DIR}
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                LEONIDA_USER_DATA_SHIFT=4
+                $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${LEONIDA_UPLOAD_DIR} cs_upload_read
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_upload_read.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
+        COMMENT "Translating cs_upload_read for the upload-arena test"
+        VERBATIM)
+      add_executable(d3d12_upload_arena_test test/d3d12_upload_arena_test.cpp ${LEONIDA_UPLOAD_FILES})
+      target_link_libraries(d3d12_upload_arena_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_upload_arena_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_UPLOAD_DIR="${LEONIDA_UPLOAD_DIR}")
+      target_compile_options(d3d12_upload_arena_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_upload_arena COMMAND d3d12_upload_arena_test)
+      set_tests_properties(d3d12_upload_arena PROPERTIES SKIP_RETURN_CODE 77
+                           FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
       # Typed buffer UAVs and UAV counters: cs_buf_typed.asm writes typed views through V#s with a FORMAT, and
       # cs_buf_counter.asm appends to and consumes from a structured view whose counter is the second V# of its slot;
@@ -3036,6 +3134,7 @@ if(TARGET Vulkan::Headers)
           # The standalone harness runs these with the V# at s[0:3]; d3d12_subgroup_test passes it as four root
           # constants, which the D3D12 compute layout puts at s[4:7] (LEONIDA_USER_DATA_SHIFT=4, D3D-448).
           COMMAND ${CMAKE_COMMAND} -E env LLVM_MC=${LEONIDA_LLVM_MC} LEONIDA_W64_EMULATE=${emulate}
+                  LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}
                   LEONIDA_USER_DATA_SHIFT=4
                   $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                   ${LEONIDA_SG_DIR}/${folder} ${shader}
@@ -3076,6 +3175,13 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_clear_formats_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_clear_formats COMMAND d3d12_clear_formats_test)
     set_tests_properties(d3d12_clear_formats PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(d3d12_a8_dimensions_test test/d3d12_a8_dimensions_test.cpp)
+    target_link_libraries(d3d12_a8_dimensions_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_a8_dimensions_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_a8_dimensions_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_a8_dimensions COMMAND d3d12_a8_dimensions_test)
+    set_tests_properties(d3d12_a8_dimensions PROPERTIES SKIP_RETURN_CODE 77)
 
     # SetDescriptorHeaps validation, Reset/ClearState/bundle parity, lifetime pinning, direct-index flags.
     add_executable(d3d12_set_descriptor_heaps_test test/d3d12_set_descriptor_heaps_test.cpp)
@@ -3231,6 +3337,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_copy_offset_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_copy_offset COMMAND replay_copy_offset_test)
+    # An indexed draw's index buffer view size bounds the index fetch: past the view reads 0 (no GPU).
+    add_executable(replay_index_view_test test/replay_index_view_test.cpp)
+    target_link_libraries(replay_index_view_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_index_view_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_index_view COMMAND replay_index_view_test)
     # KHR CopyRaytracingAccelerationStructure (CLONE, COMPACT) and COMPACTED_SIZE postbuild (no GPU).
     add_executable(replay_khr_as_copy_postbuild_test test/replay_khr_as_copy_postbuild_test.cpp)
     target_link_libraries(replay_khr_as_copy_postbuild_test PRIVATE Vulkan::Headers)

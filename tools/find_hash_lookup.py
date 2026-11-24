@@ -63,7 +63,11 @@ def sections(data):
     for i in range(count):
         name, vsize, rva, rsize, raw = struct.unpack_from("<8sIIII", data, first + 40 * i)
         flags = struct.unpack_from("<I", data, first + 40 * i + 36)[0]
-        out.append((name.rstrip(b"\0").decode("ascii", "replace"), rva, raw, min(vsize or rsize, rsize),
+        # Clamp size to what is actually present in the file so truncated PEs
+        # never cause the caller to scan beyond the end of `data`.
+        file_avail = max(0, len(data) - raw)
+        size = min(vsize or rsize, rsize, file_avail)
+        out.append((name.rstrip(b"\0").decode("ascii", "replace"), rva, raw, size,
                     bool(flags & IMAGE_SCN_MEM_EXECUTE)))
     return out
 
@@ -81,6 +85,10 @@ def direct_calls(code, base_rva):
 
 
 def rank(data, hashes, window=48, top=15):
+    if window < 0:
+        raise ValueError(f"--window must be >= 0, got {window}")
+    if top <= 0:
+        raise ValueError(f"--top must be >= 1, got {top}")
     code_sections = [s for s in sections(data) if s[4]]
     if not code_sections:
         raise ValueError("no executable section")

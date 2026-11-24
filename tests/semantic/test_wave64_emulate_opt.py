@@ -411,6 +411,14 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
                     memory[p[1]] = v & MASK32
                 else:
                     p[0][p[1]] = v
+            elif op == "OpAtomicStore":   # pointer, scope, semantics, value: a store with no result
+                p = ptrs[a[0]]
+                v = vals[a[3]]
+                if p[0] == "psb":
+                    assert p[1] % 4 == 0, f"unaligned PSB store {p[1]:#x}"
+                    memory[p[1]] = v & MASK32
+                else:
+                    p[0][p[1]] = v
             elif op in ("OpAtomicOr", "OpAtomicIAdd", "OpAtomicAnd", "OpAtomicXor", "OpAtomicExchange"):
                 p = ptrs[a[1]]
                 old = memory.get(p[1], 0) if p[0] == "psb" else p[0][p[1]]
@@ -1752,6 +1760,110 @@ class StructuredEmulationTests(unittest.TestCase):
         # s_barrier cleared ("lds", "w"), and folded block 1 added ("mem", "r") after it.
         self.assertEqual(plan["dirty_in"][3], frozenset({("mem", "r")}))
         self.assertEqual(plan["dirty_in"][4], frozenset({("mem", "r")}))
+
+    def test_flow_sensitive_reused_scratch_saveexec_folds_without_barriers(self):
+        """Nested EXECZ region reusing s[40:41] via s_or/s_xor -1 before s_and_saveexec_b64 folds with 0 barriers."""
+        # Outer EXECZ keeps lanes with (lane & 1) == 0 active.
+        # Inside, s[40:41] is first computed with s_or_b64 + s_xor_b64 -1 (non-zero for inactive lanes),
+        # then overwritten with old EXEC by s_and_saveexec_b64 s[40:41], s[40:41], followed by an inner
+        # EXECZ branch that modifies v2 and restores EXEC via s_mov_b64 exec, s[40:41].
+        insns = [
+            ("v_mov_b32_e32 v1, 100", 4),                       # outer result
+            ("v_mov_b32_e32 v2, 200", 4),                       # inner result
+            ("v_and_b32_e32 v3, 1, v0", 4),
+            ("v_and_b32_e32 v4, 2, v0", 4),
+            ("v_and_b32_e32 v5, 4, v0", 4),
+            ("v_cmp_eq_u32_e64 s[4:5], 0, v4", 8),              # bit 1 == 0
+            ("v_cmp_eq_u32_e64 s[6:7], 0, v5", 8),              # bit 2 == 0
+            ("v_cmp_eq_u32_e64 s[8:9], 0, v3", 8),              # bit 0 == 0 (outer guard)
+            ("s_and_saveexec_b64 s[10:11], s[8:9]", 4),
+            ("s_cbranch_execz 9", 4),                           # skip to restore (9 dwords)
+            # --- folded outer region (9 dwords) ---
+            ("v_add_nc_u32_e32 v1, 10, v1", 4),                 # 1 dw: active if bit0==0 -> 110
+            ("s_or_b64 s[40:41], s[4:5], s[6:7]", 4),           # 1 dw: bit1==0 || bit2==0
+            ("s_xor_b64 s[40:41], s[40:41], -1", 4),            # 1 dw: bit1!=0 && bit2!=0 (non-zero on inactive!)
+            ("s_and_saveexec_b64 s[40:41], s[40:41]", 4),       # 1 dw: overwrites s[40:41] with old EXEC (0 on inactive)
+            ("s_cbranch_execz 1", 4),                           # 1 dw: skip 1 dw inner body
+            ("v_add_nc_u32_e32 v2, 33, v2", 4),                 # 1 dw: active if bit0==0 && bit1!=0 && bit2!=0 -> 233
+            ("s_mov_b64 exec, s[40:41]", 4),                    # 1 dw: restore outer EXEC from s[40:41]
+            ("v_add_nc_u32_e32 v1, 5, v1", 4),                  # 1 dw: active if bit0==0 -> 115
+            ("s_nop 0", 4),                                     # 1 dw
+            # --- outer join ---
+            ("s_or_b64 exec, exec, s[10:11]", 4),
+            ("v_add_nc_u32_e32 v3, v1, v2", 4),
+            ("v_lshlrev_b32_e32 v6, 2, v0", 4),
+            ("buffer_store_dword v3, v6, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        for wg in ((64, 1, 1), (128, 1, 1)):
+            spv, gen = _translate_encoded("cs_flow_sens_saveexec", insns, wg, emulate=True)
+            self.assertEqual(_switch_case_count(gen), 1,
+                             f"expected entire nested scratch-saveexec region to fold to 1 superblock (wg={wg})")
+            self.assertEqual(spv.count("OpAtomicOr"), 0,
+                             f"expected 0 wave votes when scratch saveexec region folds (wg={wg})")
+            self.assertNotIn("OpGroupNonUniform", spv)
+            mem, _ = run_emulated_workgroup(spv, wg, push_constants=VSHARP + [0] * 28)
+            for lane in range(wg[0]):
+                v1 = 100
+                v2 = 200
+                if (lane & 1) == 0:
+                    v1 += 10
+                    if (lane & 2) != 0 and (lane & 4) != 0:
+                        v2 += 33
+                    v1 += 5
+                self.assertEqual(mem[lane * 4], v1 + v2, f"wg={wg} lane={lane}")
+
+
+class SharedWordStoresTests(unittest.TestCase):
+    """The emulation resets %x_buf words every round. Lanes with nothing to reset aim the same store at one sink
+    word, and the prologue clamps its zeroing index, so several invocations write one word at once. A plain OpStore
+    there is a data race (GPU-assisted validation reports it in every emulated shader); OpAtomicStore is not."""
+
+    INSNS = [
+        ("v_cmp_lt_u32_e64 s[6:7], 20, v0", 8),
+        ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+        ("s_cselect_b32 s14, 111, 222", 4),
+        ("s_mov_b64 exec, -1", 4),
+        ("v_mov_b32_e32 v5, s14", 4),
+        ("v_lshlrev_b32_e32 v6, 2, v0", 4),
+        ("buffer_store_dword v5, v6, s[0:3], 0 offen", 8),
+        ("s_endpgm", 4),
+    ]
+
+    @staticmethod
+    def shared_word_stores(spv):
+        """(plain, atomic) stores into %x_buf whose index is not one invocation's own: it comes from an OpSelect
+        (the sink) or from the prologue's UMin clamp."""
+        defined_by, element = {}, {}
+        for line in spv.splitlines():
+            m = re.match(r"\s*(%\w+) = (\w+) (.*)", line)
+            if not m:
+                continue
+            defined_by[m.group(1)] = m.group(2)
+            chain = re.match(r"%_ptr_WG_uint_x %x_buf (%\w+)$", m.group(3)) if m.group(2) == "OpAccessChain" else None
+            if chain:
+                element[m.group(1)] = chain.group(1)
+        plain, atomic = [], []
+        for line in spv.splitlines():
+            m = re.match(r"\s*(OpStore|OpAtomicStore) (%\w+) ", line)
+            if m and defined_by.get(element.get(m.group(2))) in ("OpSelect", "OpExtInst"):
+                (plain if m.group(1) == "OpStore" else atomic).append(line.strip())
+        return plain, atomic
+
+    def test_stores_several_invocations_aim_at_one_word_are_atomic(self):
+        for threads in (64, 128):   # one wave, and two (the per-wave and per-workgroup resets differ)
+            with self.subTest(threads=threads):
+                spv, _ = _translate_encoded(f"cs_shared_words_{threads}", self.INSNS, (threads, 1, 1), emulate=True)
+                plain, atomic = self.shared_word_stores(spv)
+                self.assertEqual(plain, [])
+                self.assertTrue(atomic, "the emulated translation has no shared-word resets to check")
+                # Workgroup scope, relaxed semantics, value 0: the same operands as the OpAtomicOr on this buffer.
+                for line in atomic:
+                    self.assertRegex(line, r"^OpAtomicStore %\w+ %c2 %c0 %c0$")
+
+    def test_native_wave64_translation_is_unchanged(self):
+        spv, _ = _translate_encoded("cs_shared_words_native", self.INSNS, (64, 1, 1), emulate=False)
+        self.assertNotIn("OpAtomicStore", spv)
 
 
 if __name__ == "__main__":

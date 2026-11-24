@@ -188,9 +188,10 @@ What this does not show: `--run` has not been run, so the entry point has not be
 reached on the way to the first frame. A bound import is not a working one (the binding only says a function with
 that name exists), and an unimplemented import stops the run only if the title calls it
 ([When an unimplemented import is called](#when-an-unimplemented-import-is-called)). The executable imports 25
-functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo`) and the loader binds them to the
-host's, so a `--run` can open real sockets: run it with the network off. `winhttp.dll` is served by the offline shim,
-which opens none.
+functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo`). The `ws2_offline` shim now serves the
+outbound and name-resolution calls among them, loopback only (see the Winsock2 section below), and the remaining
+imports bind to the host's. `winhttp.dll` is served by the offline shim, which opens none. Known gap: `dnsapi.dll`
+(`DnsQuery*`) is not shimmed, so a title that calls it reaches the host's resolver.
 
 ## Console paths and the write overlay
 
@@ -256,7 +257,9 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   when its folder is missing, was removed, or is a file, and creates nothing (`T:` is the exception: a create there
   makes its parent folders); `FindFirstFile` fails the same way for a
   listing inside such a folder (a pattern that matches nothing in a folder that exists is still
-  `ERROR_FILE_NOT_FOUND`, and a listing directly below a file is `ERROR_DIRECTORY`, as on the host).
+  `ERROR_FILE_NOT_FOUND`, and a listing directly below a file is `ERROR_DIRECTORY`, as on the host). `DeleteFile*`,
+  `RemoveDirectory*`, `SetFileAttributes*` and the source of `MoveFile*` answer a name inside such a folder with
+  `ERROR_PATH_NOT_FOUND` too, and a missing name in a folder that exists with `ERROR_FILE_NOT_FOUND`, as on the host.
 - `MoveFile*` onto the same name succeeds and changes nothing. A rename that changes only the case renames the overlay
   entry; a package file gets an overlay copy under the new spelling, and a package folder is refused like any other
   move of one.
@@ -335,7 +338,7 @@ count and width, the function at that position of xgameruntime-docs' "Layout" li
 
 | Class | Slots called | Checked against the documented order |
 |---|---|---|
-| `XThreadingImpl` (`IXThreadingImpl`, 28 methods, slots 3-30) | 3-7 and 9-30 (`libHttpClient.GDK.dll`), 3, 5, 12, 16-18, 22, 29 (`XCurl.dll`) | e.g. 7 `XAsyncBegin` (5 args), 9 `XAsyncSchedule` (pointer, 32-bit), 10 `XAsyncComplete` (pointer, HRESULT, size), 12 `XTaskQueueCreate` (two 32-bit modes, pointer), 16 `XTaskQueueDispatch` (returns a byte), 19 `XTaskQueueSubmitDelayedCallback` (5 args), 22 `XTaskQueueTerminate` (pointer, bool, two pointers), 27 `XThreadSetTimeSensitive` (bool), 30 `XThreadIsTimeSensitive` (returns a byte). Slot 8 (`XAsyncBeginAlloc`, private) is never called; slot 28 (`XTaskQueueIsEmpty`, private) takes no arguments |
+| `XThreadingImpl` (`IXThreadingImpl`, 28 methods, slots 3-30) | 3-7 and 9-30 (`libHttpClient.GDK.dll`), 3, 5, 12, 16-18, 22, 29 (`XCurl.dll`) | e.g. 7 `XAsyncBegin` (5 args), 9 `XAsyncSchedule` (pointer, 32-bit), 10 `XAsyncComplete` (pointer, HRESULT, size), 12 `XTaskQueueCreate` (two 32-bit modes, pointer), 16 `XTaskQueueDispatch` (returns a byte), 19 `XTaskQueueSubmitDelayedCallback` (5 args), 22 `XTaskQueueTerminate` (pointer, bool, two pointers), 27 `XThreadSetTimeSensitive` (bool), 30 `XThreadIsTimeSensitive` (returns a byte). Slot 8 (`XAsyncBeginAlloc`, private) is never called; slot 28 (`XTaskQueueIsEmpty`, private) takes a queue and a port |
 | `XErrorImpl` (`IXErrorImpl`, slots 3-5) | 3 (`XCurl.dll`) | slot 3, the docs' `_unknown_`, takes an HRESULT and a pointer: `XErrorReport(HRESULT, const char*)` |
 | `XNetworkingImpl` (`IXNetworkingImpl2`, slots 3-20) | 11-17 (`XCurl.dll`), 3-20 (`libHttpClient.GDK.dll`, each in its documented argument shape, e.g. 18-20 (enum, u64 pointer / u64 / pointer)) | the Utf16 `XNetworkingQuerySecurityInformationForUrl*` trio, `XNetworkingVerifyServerCertificate`, `XNetworkingGetConnectivityHint`, `XNetworkingRegister/UnregisterConnectivityHintChanged` (pointer, bool). Served offline, asked for with `IXNetworkingImpl2`'s id |
 | `XSystemImpl` (`IXSystemImpl5`, slots 3-8 known) | 3-8 (`libHttpClient.GDK.dll`) | 3-5 `XSystemGetConsoleId` / `GetXboxLiveSandboxId` / `GetAppSpecificDeviceId` (size, pointer, pointer each), 6 `XSystemHandleTrack` (two pointers, IXSystemImpl3), 7 `XSystemIsHandleValid` (pointer), 8 `XSystemAllowFullDownloadBandwidth` (bool, IXSystemImpl4); IXSystemImpl2 and 5 add no known method. Served offline |
@@ -449,20 +452,32 @@ on the executable, the rest is not:
   card and text entry, which fail before starting.
 
 - **Accessibility and speech** (`IXAccessibilityImpl2`, slots 3-21): `XHighContrastGetMode` (5) answers Off and
-  `XClosedCaptionSetEnabled` (4) is accepted. No voice is installed: `XSpeechSynthesizerEnumerateInstalledVoices`
-  (8) calls back zero times and returns `S_OK`, `XSpeechSynthesizerCreate` (9) fails (`E_FAIL`) with a null handle,
-  and the handle calls (10-16, 21: close, default and custom voice, streams from text and SSML, stream size and
-  data) refuse the handle they were never given (`E_INVALIDARG`, outputs zeroed). The closed-caption properties (3)
-  and the speech-to-text display calls (6, 7, 17-20) fail with `E_FAIL`, writing nothing: their parameter lists
-  are not in the docs' layout.
-- **`XLauncherImpl`** (`IXLauncherImpl`, slots 3-5): `XLaunchUri`, `XDisplayAcquireTimeoutDeferral` (null handle)
-  and `XDisplayCloseTimeoutDeferralHandle` fail with `E_FAIL`; nothing is launched.
+  `XClosedCaptionSetEnabled` (4) is accepted. One silent voice is installed:
+  `XSpeechSynthesizerEnumerateInstalledVoices(context, callback)` (8) calls back once, with voice id `leonida-silent`
+  and language `en-US` (the GDK reference's `XSpeechSynthesizerVoiceInformation` layout), and returns `S_OK`
+  (`E_INVALIDARG` without a callback). `XSpeechSynthesizerCreate` (9) hands
+  out a synthesizer handle that speaks with it (`E_POINTER` for a null out pointer). Close (10), set default voice (11)
+  and set custom voice (12, only for that voice id) accept that handle and refuse any other with `E_INVALIDARG`.
+  Streams from text (13) and SSML (21) are created from it and return a
+  stream handle; its close (14) accepts it. Stream size (15) reports 44 bytes and stream data (16) copies them: a valid
+  RIFF/WAVE header for 16 kHz, 16-bit mono PCM with zero data bytes, so a title that plays narration reads a silent
+  stream (a buffer under 44 bytes gets `ERROR_INSUFFICIENT_BUFFER`). A foreign handle on 15 or 16 gets `E_INVALIDARG`,
+  outputs zeroed. The closed-caption properties (3) and the speech-to-text display calls (6, 7, 17-20) fail with
+  `E_FAIL`, writing nothing: their parameter lists are not in the docs' layout.
+- **`XLauncherImpl`** (`IXLauncherImpl`, slots 3-5): `XLaunchUri` fails with `E_FAIL`; nothing is launched.
+  `XDisplayAcquireTimeoutDeferral` (4) creates a Win32 `PowerRequestDisplayRequired` request and returns its handle (a
+  failing `PowerCreateRequest` or `PowerSetRequest` returns the Win32 error as an HRESULT).
+  `XDisplayCloseTimeoutDeferralHandle` (5) clears that request and closes the handle, so the display may sleep again.
+  Side effect on the host: while the title holds a deferral, Windows keeps the PC's display on.
 - **ASSUMPTION:** the parameter lists of the speech calls and `XHighContrastGetMode` (Off is 0), from the GDK
   reference; only the argument counts were measured, from `tools/gdk_runtime_calls.py` on the executable.
 - **HDR:** `XDisplayTryEnableHdrMode` answers Disabled, because the host output is SDR. With `LEONIDA_HDR=1` it
   answers Enabled with the documented default tone-map luminances (0.01, 1000, 1000 nits).
-- **Devices:** every device belongs to the offline user (`XUserFindForDevice` hands out an `XUserHandle` the title
-  closes). `XUserRegisterForDeviceAssociationChanged` (slot 4) and
+- **Devices:** every device belongs to the offline user, once the title has added it: `XUserFindForDevice` hands out
+  an `XUserHandle` the title closes only after `XUserAddAsync` (or the add-by-id call for the local user) has
+  completed. Before that it answers `E_GAMEUSER_USER_NOT_FOUND` and writes no handle, because the reference says it
+  "cannot return a user handle to a user that hasn't been signed in with a call to `XUserAddAsync`" (RT-382).
+  **ASSUMPTION:** that HRESULT; the reference page names no code for this case. `XUserRegisterForDeviceAssociationChanged` (slot 4) and
   `XUserRegisterForDefaultAudioEndpointUtf16Changed` (7) keep each registration (its queue, duplicated, its context
   and callback) under a token unique across both kinds and never 0; a null callback or token is `E_INVALIDARG`, and
   queue and context are optional. The matching unregister (5, 8) removes it at once, with or without `wait`, and
@@ -627,6 +642,50 @@ end to end with a synthetic bundled DLL importing `xmem.dll!XMemAlloc` and `XMem
 Each refused server is logged once (`[rt] winhttp: offline, refused <host>:<port>`), which records what a title
 tried to reach. `runtime/test/winhttp_offline_test.cpp` (ctest `winhttp_offline`) covers the synchronous and
 asynchronous paths with `.invalid` names; it opens no connection.
+
+## Winsock2 (`ws2_32.dll`) offline
+
+`runtime/shims/ws2_offline.cpp` intercepts outbound Winsock2 entry points — both by name and by standard Windows
+`ws2_32.dll` ordinal (`bind`/`#2`, `connect`/`#4`, `sendto`/`#20`, `setsockopt`/`#21`, `gethostbyaddr`/`#51`,
+`gethostbyname`/`#52`,
+`WSAAsyncGetHostByAddr`/`#102`, `WSAAsyncGetHostByName`/`#103`, `getaddrinfo`, `GetAddrInfoW`, `GetAddrInfoExA/W`,
+`getnameinfo`, `GetNameInfoW`, `WSAConnect`, `WSAConnectByNameA/W`, `WSAConnectByList`, `WSASendTo`, `WSASendMsg`,
+`WSALookupServiceBeginA/W`, `WSAJoinLeaf`, and `WSAIoctl` for `WSAID_CONNECTEX` and `WSAID_WSASENDMSG`). `wsock32.dll` maps its
+`bind`, `connect`, `sendto`, `gethostbyaddr`, `gethostbyname` and `WSAAsyncGetHostBy*` exports (and their ordinals) to
+the same wrappers, since its exports forward to `ws2_32.dll` natively; its `setsockopt` (`#21`) is its own export,
+which takes the Winsock 1.1 option numbers, so it has its own wrapper. Like `ws2_32.dll` it stays host-owned
+(`owns_dll`), so `LoadLibrary` returns the real module. The shim keeps `ws2_32.dll` partially overridden
+so local socket bookkeeping (`WSAStartup`, `socket`, `closesocket`, `select`, `recv`, `send`, byte-order helpers) still
+works for loopback traffic:
+
+- `connect`, `WSAConnect`, `ConnectEx`, `sendto`, `WSASendTo`, `WSASendMsg`, `WSAConnectByNameA/W` and
+  `WSAConnectByList` allow only IPv4 loopback (`127.0.0.0/8`), IPv6 loopback (`::1`) and IPv4-mapped loopback
+  (`::ffff:127.0.0.0/104`); everything else fails with `WSAENETUNREACH`.
+- `WSAConnectByNameA/W` pass `localhost` to the host as the literal `127.0.0.1`, so the host never reads its hosts
+  file. Numeric loopback literals pass through unchanged.
+- `ConnectEx` and `WSASendMsg` from `WSAIoctl` are the host's own pointers, fetched for the socket they are called on
+  (each Winsock provider has its own), after the same loopback check.
+- `bind` narrows wildcard binds (`0.0.0.0`, `::`) to loopback (`127.0.0.1`, `::1`) and refuses other non-loopback
+  addresses with `WSAEADDRNOTAVAIL`.
+- A send to a loopback address on an unbound socket (`sendto`, `WSASendTo`, `WSASendMsg`, `WSAJoinLeaf`) would bind it
+  to the wildcard address, as Microsoft's `sendto` remarks describe, and its port would then take datagrams from other
+  hosts. The shim first binds such a socket to `127.0.0.1`, `::1` or `::ffff:127.0.0.1` (matching the destination); if
+  it stays unbound the send fails with `WSAEADDRNOTAVAIL`.
+- Multicast group joins through `setsockopt` (`IP_ADD_MEMBERSHIP`, `IP_ADD_SOURCE_MEMBERSHIP`, `IPV6_ADD_MEMBERSHIP`,
+  `MCAST_JOIN_GROUP`, `MCAST_JOIN_SOURCE_GROUP`, and `wsock32.dll`'s Winsock 1.1 `IP_ADD_MEMBERSHIP` = 5) fail with
+  `WSAEADDRNOTAVAIL`; other options pass through. `WSAJoinLeaf` gets the same loopback check as `connect`, so a group
+  address is refused with `WSAENETUNREACH`.
+- Forward lookups refuse external names with `WSAHOST_NOT_FOUND` without sending DNS traffic. A dotted octet with a
+  leading zero (`0127.0.0.1`) is refused too: Windows reads it as octal, so it is not the loopback address it looks
+  like. `getnameinfo` / `GetNameInfoW` force `NI_NUMERICHOST` (or return `WSAHOST_NOT_FOUND` under `NI_NAMEREQD`) for
+  non-loopback addresses.
+- `WSALookupServiceBeginA/W` (name-service queries) always fail with `WSASERVICE_NOT_FOUND`.
+
+`runtime/test/ws2_offline_test.cpp` (ctest `ws2_offline`) verifies name and ordinal bindings, the `wsock32.dll`
+aliases, external refusals using RFC 5737 / RFC 3849 / `.invalid` targets, the `0127.0.0.1` refusal, the
+`WSASERVICE_NOT_FOUND` refusal, wildcard-bind narrowing, a `ConnectEx` pointer from `WSAIoctl` connecting to a loopback
+listener, a local loopback UDP round-trip, loopback binds for sends on unbound UDP sockets (with a control showing
+the host's own `sendto` binds to `0.0.0.0`), and the multicast and `WSAJoinLeaf` refusals.
 
 ## What this proves and what it does not
 

@@ -137,6 +137,8 @@ inline uint64_t extract_bits(uint64_t src, unsigned len, unsigned idx) {
 #include <atomic>
 #include <cstdio>
 
+#include "../shims/xmem.h"
+
 namespace rt::cpu_emulation {
 
 struct Host {
@@ -189,9 +191,16 @@ inline std::atomic<uint64_t>& count(Op op) {
 // 0 when the page holding `addr` can be written; otherwise the exception a write raises there. A guard page loses
 // its guard on that first touch and reports STATUS_GUARD_PAGE_VIOLATION, as the system does for a real access.
 inline DWORD writable(uint64_t addr) {
-    MEMORY_BASIC_INFORMATION mbi;
-    if (!VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof mbi) || mbi.State != MEM_COMMIT)
+    const auto* address = reinterpret_cast<const void*>(addr);
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(address, &mbi, sizeof mbi))
         return DWORD(STATUS_ACCESS_VIOLATION);
+    // A normal store can first-touch an XMem view itself. The emulated store has to commit the backing before
+    // checking permissions. Wine can also leave a view reserved after a normal store has already reached it.
+    if (mbi.State == MEM_RESERVE && mbi.Type == MEM_MAPPED &&
+        (!xmem::commit_physical_page_for_write(address) || !VirtualQuery(address, &mbi, sizeof mbi)))
+        return DWORD(STATUS_ACCESS_VIOLATION);
+    if (mbi.State != MEM_COMMIT) return DWORD(STATUS_ACCESS_VIOLATION);
     if (mbi.Protect & PAGE_GUARD) {
         DWORD old = 0;
         VirtualProtect(reinterpret_cast<void*>(addr & ~uint64_t(0xFFF)), 1, mbi.Protect & ~DWORD(PAGE_GUARD), &old);
@@ -272,6 +281,84 @@ inline bool apply(const Decoded& d, CONTEXT* c, EXCEPTION_RECORD* fault = nullpt
     return true;
 }
 
+inline uint64_t gpr_read(const CONTEXT* c, int r) {
+    switch (r) {
+    case 0: return c->Rax;   case 1: return c->Rcx;   case 2: return c->Rdx;   case 3: return c->Rbx;
+    case 4: return c->Rsp;   case 5: return c->Rbp;   case 6: return c->Rsi;   case 7: return c->Rdi;
+    case 8: return c->R8;    case 9: return c->R9;    case 10: return c->R10;  case 11: return c->R11;
+    case 12: return c->R12;  case 13: return c->R13;  case 14: return c->R14;  case 15: return c->R15;
+    default: return 0;
+    }
+}
+
+enum class ClzeroLoopResult { no_match, ok, faulted };
+
+inline void apply_cmp_flags(CONTEXT* c, uint64_t lhs, uint64_t rhs) {
+    const uint64_t diff = lhs - rhs;
+    uint32_t flags = c->EFlags & ~DWORD(0x8D5u);  // clear CF(0), PF(2), AF(4), ZF(6), SF(7), OF(11)
+    if (lhs < rhs) flags |= 0x1u;                         // CF
+    uint8_t lo8 = static_cast<uint8_t>(diff);
+    lo8 ^= lo8 >> 4;
+    lo8 ^= lo8 >> 2;
+    lo8 ^= lo8 >> 1;
+    if ((lo8 & 1u) == 0) flags |= 0x4u;                   // PF
+    if ((lhs ^ rhs ^ diff) & 0x10u) flags |= 0x10u;       // AF
+    if (diff == 0) flags |= 0x40u;                        // ZF
+    if (diff >> 63) flags |= 0x80u;                       // SF
+    if (((lhs ^ rhs) & (lhs ^ diff)) >> 63) flags |= 0x800u;  // OF
+    c->EFlags = flags;
+}
+
+// Fast-path for the Zen 2 zeroing loop: `clzero; add rax, 0x40; cmp rax, reg64; jb -12` (12 bytes).
+// Zeroes the entire writable span in one memset instead of raising #UD + VirtualQuery per 64-byte line.
+inline ClzeroLoopResult try_clzero_loop(const uint8_t* code, std::size_t avail, CONTEXT* c, EXCEPTION_RECORD* fault) {
+    if (avail < 12) return ClzeroLoopResult::no_match;
+    if (code[0] != 0x0F || code[1] != 0x01 || code[2] != 0xFC) return ClzeroLoopResult::no_match;
+    if (code[3] != 0x48 || code[4] != 0x83 || code[5] != 0xC0 || code[6] != 0x40) return ClzeroLoopResult::no_match;
+    if ((code[7] != 0x48 && code[7] != 0x4C) || code[8] != 0x39 || (code[9] & 0xC7) != 0xC0)
+        return ClzeroLoopResult::no_match;
+    if (code[10] != 0x72 || code[11] != 0xF4) return ClzeroLoopResult::no_match;
+
+    const int limit_reg = ((code[9] >> 3) & 7) | ((code[7] & 4) << 1);
+    if (limit_reg == 0 || limit_reg == 4) return ClzeroLoopResult::no_match;
+
+    const uint64_t start = c->Rax;
+    const uint64_t limit = gpr_read(c, limit_reg);
+    if ((start & 63) != 0 || limit <= start + 64) return ClzeroLoopResult::no_match;
+
+    uint64_t total = (limit - start + 63) & ~uint64_t(63);
+    constexpr uint64_t kMaxBatch = uint64_t(64) << 20;
+    if (total > kMaxBatch) total = kMaxBatch;
+    const uint64_t end = start + total;
+
+    for (uint64_t cur = start; cur < end;) {
+        const DWORD err = writable(cur);
+        if (err) {
+            if (cur > start) {
+                std::memset(reinterpret_cast<void*>(start), 0, std::size_t(cur - start));
+                c->Rax = cur;
+                apply_cmp_flags(c, cur, limit);
+            }
+            if (fault) {
+                std::memset(fault, 0, sizeof *fault);
+                fault->ExceptionCode = err;
+                fault->NumberParameters = 2;
+                fault->ExceptionInformation[0] = 1;
+                fault->ExceptionInformation[1] = ULONG_PTR(cur);
+            }
+            return ClzeroLoopResult::faulted;
+        }
+        const uint64_t next_page = (cur & ~uint64_t(0xFFF)) + 0x1000;
+        cur = next_page < end ? next_page : end;
+    }
+
+    std::memset(reinterpret_cast<void*>(start), 0, std::size_t(total));
+    c->Rax = end;
+    apply_cmp_flags(c, end, limit);
+    if (end >= limit) c->Rip += 12;
+    return ClzeroLoopResult::ok;
+}
+
 inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     if (info->ExceptionRecord->ExceptionCode != STATUS_ILLEGAL_INSTRUCTION) return EXCEPTION_CONTINUE_SEARCH;
     CONTEXT* c = info->ContextRecord;
@@ -281,6 +368,25 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     const Decoded d = decode(code, avail);
     if (d.op == Op::none) return EXCEPTION_CONTINUE_SEARCH;
     EXCEPTION_RECORD fault;
+    if (d.op == Op::clzero && !d.addr32 && d.length == 3) {
+        const uint64_t fault_rip = c->Rip;
+        const ClzeroLoopResult lr = try_clzero_loop(code, avail, c, &fault);
+        if (lr == ClzeroLoopResult::ok) {
+            if (count(d.op).fetch_add(1, std::memory_order_relaxed) == 0)
+                std::fprintf(stderr, "[rt] cpu: this CPU has no %s; emulating it (first at %p)\n", name(d.op),
+                             reinterpret_cast<void*>(fault_rip));
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if (lr == ClzeroLoopResult::faulted) {
+            EXCEPTION_RECORD* r = info->ExceptionRecord;
+            r->ExceptionCode = fault.ExceptionCode;
+            r->ExceptionFlags = 0;
+            r->NumberParameters = fault.NumberParameters;
+            r->ExceptionInformation[0] = fault.ExceptionInformation[0];
+            r->ExceptionInformation[1] = fault.ExceptionInformation[1];
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    }
     if (!apply(d, c, &fault)) {
         // CLZERO on a line it cannot write: the CPU would raise that fault at this instruction, so the next handlers
         // see it instead of the #UD (RIP still points at the instruction).

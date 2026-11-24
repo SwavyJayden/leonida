@@ -21,7 +21,7 @@ it is missing. Never share what it makes.
 Stages (each skips work that is already done, so a stopped build continues where it left off):
     check     always first: file names and sizes against game/<version>.json (add --full-check for SHA-256, slow)
     shaders   carve shaders.rpf, unpack the native RDNA2 code, disassemble, translate to SPIR-V; then the same for the
-              compute programs inside amd_fidelityfx_upscaler_xbox.dll and XboxBvhBuilder.dll
+              programs inside amd_fidelityfx_upscaler_xbox.dll, XboxBvhBuilder.dll and game_scarlett_master.exe
     assets    models (OBJ), texture dictionaries and texture pools (DDS), audio banks (AWC; --wav adds PCM WAV)
               BCPack uses strict decoding by default. For local calibration use <work>/bcpack-calibration.json.
     runtime   build the loader (needs the game's executable to run, not to build). On Linux it is cross-built with
@@ -61,7 +61,7 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 if __name__ == "__main__" and sys.version_info < (3, 12):   # before code an older Python can't run
     sys.exit("ERROR: Python 3.12 or newer is needed: https://www.python.org/downloads/")
@@ -1344,6 +1344,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     library_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
+    exe_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     log("shaders: done")
 
 
@@ -1633,6 +1634,88 @@ def bvh_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate:
         f.write(settings + "\n")
 
 
+EXE_FILE = "game_scarlett_master.exe"
+EXE_TOOLS = BVH_TOOLS   # pe_shader_containers.py, fssm_unpack.py and shader_disasm.py
+
+
+def exe_settings(exe: str, mc_signature: str, emulate: bool, fallbacks: tuple[str, ...]) -> str:
+    """What the executable's embedded shader outputs depend on, as one line: the executable, the extracting,
+    unpacking and translating tools, llvm-mc, the wave64 mode and the fallback flags."""
+    return json.dumps({"exe": file_sha256(exe), "tools": sources_digest(TOOLS, EXE_TOOLS),
+                       "translator": translation_sources_digest(), "llvm_mc": mc_signature,
+                       "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks)}, sort_keys=True)
+
+
+def exe_report(programs: "tuple[list[str], list[str]]") -> None:
+    """One line with the counts, and one that names every program left without a module. It is printed on every
+    run, also when the step itself is reused: a program the translator has no rule for is never dropped quietly."""
+    extracted, missing = programs
+    log(f"shaders: {len(extracted) - len(missing)} of {len(extracted)} {EXE_FILE} programs translated")
+    if missing:
+        log(f"shaders: NOT translated: {', '.join(missing)}. The runtime has no module for "
+            f"{'it' if len(missing) == 1 else 'them'}, so any pipeline using it will miss its shader. "
+            "When the step runs, rdna2spirv.py prints the instruction each one stops at "
+            "(docs/embedded_shaders.md, section 2)")
+
+
+def exe_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate: bool = False,
+                fallbacks: tuple[str, ...] = ()) -> None:
+    """game_scarlett_master.exe's embedded graphics shaders (docs/embedded_shaders.md, section 2):
+    pe_shader_containers.py extracts the executable's DXBC containers into <work>/shaders/exe, fssm_unpack.py and
+    shader_disasm.py unpack and disassemble their FSSM programs there, as for a shader from shaders.rpf, and
+    rdna2spirv.py translates them into <work>/shaders/spirv/exe, where the runtime's shader library finds them by
+    fssm_sha256. The game's RPF shaders neither feed nor depend on this step.
+
+    The 10 programs take seconds, so the step runs whole. Reuse requires both indexes, the translated modules and a
+    matching exe_build.json (exe_settings)."""
+    exe = os.path.join(game, EXE_FILE)
+    unpacked = os.path.join(work, "shaders", "exe")
+    spirv = os.path.join(work, "shaders", "spirv", "exe")
+    extracted = os.path.join(unpacked, "index.json")
+    unpack_index = os.path.join(unpacked, "fssm_index.json")
+    translated = os.path.join(spirv, "index.json")
+    settings_file = os.path.join(spirv, "exe_build.json")
+    if not os.path.isfile(exe):
+        # A work folder used before with a package that had the executable still holds that run's index, and the
+        # runtime loads <shaders>/exe/index.json whenever it is there. Without the index the old modules are not found.
+        drop(translated, settings_file)
+        log(f"shaders: no {EXE_FILE} in the game folder, so no executable shader programs to translate")
+        return
+    settings = exe_settings(exe, mc_signature, emulate, fallbacks)
+    programs = bvh_programs(unpacked, spirv) if read_shader_setting(settings_file) == settings else None
+    if programs:
+        exe_report(programs)
+        return
+    log(f"shaders: extracting and translating the embedded shader programs of {EXE_FILE}")
+    drop(translated, settings_file, extracted, unpack_index)
+    # pe_shader_containers.py never overwrites a container (a second run would write <stem>_NN.dxbc beside the
+    # first), and a program that no longer translates must not keep a module from the run before.
+    for folder, suffixes in ((unpacked, (".dxbc",)), (os.path.join(unpacked, "fssm"), (".fssm",)),
+                             (os.path.join(unpacked, "disasm"), (".s",)), (spirv, (".spv", ".spvasm"))):
+        if os.path.isdir(folder):
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
+                        os.unlink(entry.path)
+    py("pe_shader_containers.py", exe, "--extract", unpacked)
+    py("fssm_unpack.py", unpacked, "--carve-index", extracted)
+    # rdna2spirv.py reads each program's stage from index.json and its FSSM blob from fssm/, both in the parent of
+    # the listings' folder, so the disassembly sits inside the extraction folder as it does for shaders.rpf.
+    disasm = os.path.join(unpacked, "disasm")
+    py("shader_disasm.py", os.path.join(unpacked, "fssm"), "--unpack-index", unpack_index, "--out", disasm,
+       "--mcpu", "gfx1013", "--jobs", jobs)
+    extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
+    py("rdna2spirv.py", disasm, "--out", spirv, "--no-asm", *extra)
+    programs = bvh_programs(unpacked, spirv)
+    if not programs or len(programs[1]) == len(programs[0]):
+        drop(translated)   # an empty or unreadable index would read as a finished step
+        fail(f"shaders: none of the {EXE_FILE} programs translated, so their index is not kept. Run the shaders "
+             "stage again; if it happens again, the tool output above is why.")
+    exe_report(programs)
+    with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
+        f.write(settings + "\n")
+
+
 WAVE64_MODES = ("auto", "on", "off")
 
 # The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
@@ -1717,7 +1800,8 @@ def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, boo
     if exe:
         try:
             r = subprocess.run([exe], capture_output=True, text=True, errors="replace", timeout=120)
-            size = smallest_max_subgroup(r.stdout)
+            if r.returncode == 0:
+                size = smallest_max_subgroup(r.stdout)
         except (OSError, subprocess.SubprocessError):
             size = None
     if size is None:
@@ -2092,6 +2176,35 @@ def ttpf_manifest(pool_dir: str) -> dict | None:
     return doc
 
 
+class ExportFailed(Exception):
+    """An export step ended without its manifest; assets() turns it into the one build error."""
+
+
+def parallel_map(fn, items: list, workers: int, *, processes: bool = False, call=None, extra: tuple = (),
+                 on_done=None) -> list:
+    """Run fn(item) (or call(*item, *extra) in worker processes) for every item on up to `workers` workers and
+    return the results in item order. The first failure in item order is raised and the work not yet started is
+    dropped. One worker, or one item, runs inline: no pool, the same calls in the same order."""
+    if workers <= 1 or len(items) <= 1:
+        out = []
+        for item in items:
+            out.append(call(*item, *extra) if call else fn(item))
+            if on_done:
+                on_done()
+        return out
+    ex = (ProcessPoolExecutor if processes else ThreadPoolExecutor)(max_workers=min(workers, len(items)))
+    try:
+        futures = [ex.submit(call, *item, *extra) if call else ex.submit(fn, item) for item in items]
+        out = []
+        for fut in futures:
+            out.append(fut.result())
+            if on_done:
+                on_done()
+        return out
+    finally:
+        ex.shutdown(wait=True, cancel_futures=True)
+
+
 def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = None) -> None:
     # make_game.py also runs under python -I, which omits the script directory.
     if TOOLS not in sys.path:
@@ -2101,11 +2214,11 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
     get_exporter = functools.cache(rpf9dump)
     out = os.path.join(work, "assets")
 
-    def dump(*parts: str) -> None:
-        """Run rpf9dump; pass --jobs only when the build overlaps another CPU-heavy stage."""
+    def dump(*parts: str, jobs: int | None = None) -> None:
+        """Run rpf9dump; pass --jobs only when the build overlaps another CPU-heavy stage or runs exports side by side."""
         cmd = [get_exporter(work), *parts]
-        if dump_jobs is not None:
-            cmd.extend(["--jobs", str(dump_jobs)])
+        if jobs is not None:
+            cmd.extend(["--jobs", str(jobs)])
         run(cmd)
 
     # An export also depends on the decoder, so its digest is kept beside the manifest, written before the export
@@ -2186,30 +2299,54 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
              + int(need_wav) + int(need_xma) + int(need_xma_decode))
     progress = Progress("assets", total, every_s=2.0)
 
-    for rel, mode, folder, record, src in archive_todo:
-        log(f"assets: {mode} from {rel}")
+    # Each step below is independent of the others in its list, so it runs on up to --jobs workers. Results are
+    # taken in list order, so logs, the first failure and every output file are the same as in a serial run.
+    # rpf9dump is itself multi-threaded: the workers share the budget instead of each taking all of it.
+    def share(count: int) -> tuple[int, int | None]:
+        workers = max(1, min(jobs, count))
+        each = max(1, (dump_jobs or jobs) // workers) if workers > 1 else dump_jobs
+        return workers, each
+
+    def export_archive(item, each):
+        rel, mode, folder, record, src = item
         os.makedirs(folder, exist_ok=True)
         with open(record, "w", encoding="utf-8", newline="\n") as f:
             f.write(decoder + "\n")
-        dump(mode, src, out)
+        dump(mode, src, out, jobs=each)
         progress.tick(force=True)
-    for p, name, root, pool_dir, record in pool_todo:
-        log(f"assets: texture pool {os.path.relpath(p, game)}")
+
+    def export_pool(item, each):
+        p, name, root, pool_dir, record = item
         os.makedirs(pool_dir, exist_ok=True)
         with open(record, "w", encoding="utf-8", newline="\n") as f:
             f.write(decoder + "\n")
-        dump("ttpf", p, root)
+        dump("ttpf", p, root, jobs=each)
+        if ttpf_manifest(pool_dir) is None:
+            raise ExportFailed(f"Texture exporter did not publish a complete manifest in {pool_dir}")
+        progress.tick(force=True)
+
+    try:
+        for rel, mode, *_ in archive_todo:
+            log(f"assets: {mode} from {rel}")
+        workers, each = share(len(archive_todo))
+        parallel_map(lambda item: export_archive(item, each), archive_todo, workers)
+        for p, *_ in pool_todo:
+            log(f"assets: texture pool {os.path.relpath(p, game)}")
+        workers, each = share(len(pool_todo))
+        parallel_map(lambda item: export_pool(item, each), pool_todo, workers)
+    except ExportFailed as exc:
+        fail(str(exc))
+    for p, name, root, pool_dir, record in pool_follow:
         if ttpf_manifest(pool_dir) is None:
             fail(f"Texture exporter did not publish a complete manifest in {pool_dir}")
-        progress.tick(force=True)
-    for p, name, root, pool_dir, record in pool_follow:
-        manifest = ttpf_manifest(pool_dir)
-        if manifest is None:
-            fail(f"Texture exporter did not publish a complete manifest in {pool_dir}")
-        written, blocked = ttpf_assets.complete_pool(p, pool_dir, manifest, settings)
+    # Pure-Python decoding, so processes. The manifest is read here, the pool's files are written by the worker.
+    follow = [(p, pool_dir, ttpf_manifest(pool_dir)) for p, _, _, pool_dir, _ in pool_follow]
+    workers, _ = share(len(follow))
+    done = parallel_map(None, follow, workers, processes=True, call=ttpf_assets.complete_pool, extra=(settings,),
+                        on_done=lambda: progress.tick(force=True))
+    for (_, name, *_), (written, blocked) in zip(pool_follow, done):
         if written or blocked:
             log(f"assets: {name}: {written} full BCPack DDS written, {blocked} limited (see manifest.json)")
-        progress.tick(force=True)
     if need_audio:
         log("assets: audio banks")
         dump("audio", os.path.join(game, "audio.rpf"), out)
@@ -2517,7 +2654,12 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     inflight = os.path.join(out, "pipeline_inflight.txt")
     skip = os.path.join(out, "pipeline_crashes.txt")
     report = os.path.join(out, "pipeline_crashes.json")
-    drop(inflight, skip, report)   # every module gets a fresh chance on each run (a new translator may have fixed it)
+    drop(inflight, skip)   # every module gets a fresh chance on each run (a new translator may have fixed it)
+    try:
+        drop(report)
+    except OSError as error:
+        log(f"pipelines: cannot remove old pipeline_crashes.json ({error.strerror or error}). "
+            "That report may be stale.")
     # --jobs: make_game.py's own; without it vk_pipeline_check uses half the hardware threads whatever was asked
     base = [exe, spirv, cache, *(["--jobs", str(jobs)] if jobs else [])]
     if not checker_supports(exe, "--inflight-file", "--skip-file"):
@@ -2594,19 +2736,19 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
             break
     if crashed and not code:
         code = 1
-    if crashed:
-        record_crashes(out, spirv, crashed)
+    report_written = bool(crashed) and record_crashes(out, spirv, crashed)
     drop(inflight)
     if code != 0:
-        why = f"; {len(crashed)} module(s) took the driver down and were counted as failed (with their SPIR-V " \
-              f"hashes in pipeline_crashes.json): " + ", ".join(crashed) if crashed else ""
+        report_note = " (with their SPIR-V hashes in pipeline_crashes.json)" if report_written else ""
+        why = f"; {len(crashed)} module(s) took the driver down and were counted as failed{report_note}: " \
+              + ", ".join(crashed) if crashed else ""
         fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
     log("pipelines: done")
 
 
-def record_crashes(out: str, spirv: str, crashed: "list[str]") -> None:
-    """pipeline_crashes.json: name and SHA-256 of each module that took the driver down, so a report names the
-    exact translation without attaching the shader. OSError (a missing .spv) leaves that module's hash null."""
+def record_crashes(out: str, spirv: str, crashed: "list[str]") -> bool:
+    """Write confirmed module names and hashes to pipeline_crashes.json and return whether it was written.
+    An unreadable .spv leaves its hash null."""
     def digest(name: str) -> "str | None":
         try:
             with open(os.path.join(spirv, name + ".spv"), "rb") as f:
@@ -2622,6 +2764,8 @@ def record_crashes(out: str, spirv: str, crashed: "list[str]") -> None:
         # The durable record is best-effort. A report path that cannot be written must not
         # replace the checker diagnostic that names the modules which took the driver down.
         log(f"pipelines: cannot write pipeline_crashes.json: {error.strerror or error}")
+        return False
+    return True
 
 
 # How many times the pipelines stage restarts vk_pipeline_check after a module takes it down (each costs at most the

@@ -102,10 +102,14 @@ public:
     bool partially_bound = false;  // and its slots can stay empty
     bool image_view_min_lod = false;
     bool sampler_filter_minmax = false;
+    bool sampler_filter_minmax_component_mapping = false;  // filterMinmaxImageComponentMapping (D3D-994)
     bool vertex_attribute_divisor = false;
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
+    // VK_KHR_maintenance5 enabled, where VK_FORMAT_A8_UNORM_KHR can be sampled and blended as a colour attachment, as
+    // gta6rt enables it (VulkanDeviceInfo::a8_render_target).
+    bool a8_render_target = false;
     // create(true) only: VK_KHR (else EXT) swapchain_maintenance1 and its feature enabled, with the surface half on the
     // instance, so a vsync swapchain can switch to IMMEDIATE or FIFO_RELAXED per present.
     bool swapchain_maintenance1 = false;
@@ -116,8 +120,11 @@ public:
     bool request_buffer_device_address = false;  // set before create(): enable bufferDeviceAddress where supported
     bool buffer_device_address = false;  // enabled: buffer() memory and buffers can be addressed (device_address())
     bool conservative_rasterization = false; // VK_EXT_conservative_rasterization enabled where available
+    bool request_line_rasterization = false;  // set before create(): enable VK_EXT_line_rasterization where available
+    bool line_bresenham = false, line_smooth = false, line_rectangular = false;  // the line features enabled
     bool request_mesh_shader = false;  // set before create(): enable VK_EXT_mesh_shader (meshShader) where available
     bool mesh_shader = false;          // VK_EXT_mesh_shader and meshShader are enabled
+    bool mesh_shader_queries = false;  // the meshShaderQueries feature is enabled on the device
     bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
     // The subgroup sizes of the device, with subgroupSizeControl and computeFullSubgroups enabled where it has them.
     leonida::SubgroupSizeCaps subgroup;
@@ -398,6 +405,13 @@ public:
         enable12.descriptorBindingPartiallyBound = partially_bound;
         sampler_filter_minmax = features12.samplerFilterMinmax == VK_TRUE;
         enable12.samplerFilterMinmax = sampler_filter_minmax;
+        if (sampler_filter_minmax) {
+            VkPhysicalDeviceSamplerFilterMinmaxProperties minmax{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_FILTER_MINMAX_PROPERTIES};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &minmax};
+            instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(physical, &properties);
+            sampler_filter_minmax_component_mapping = minmax.filterMinmaxImageComponentMapping == VK_TRUE;
+        }
         enable12.bufferDeviceAddress = VK_TRUE;
 
         const std::uint32_t graphics_count = std::max(1u, std::min(queue_count_wanted, family_queue_count));
@@ -499,6 +513,29 @@ public:
             host_copy.pNext = *v13_.next();  // after the conditional rendering features, if any
             *v13_.next() = &host_copy;
         }
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+        VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+        if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) == 0;
+            })) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &maintenance5};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            VkFormatProperties a8{};
+            instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(
+                physical, VK_FORMAT_A8_UNORM_KHR, &a8);
+            const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                                VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                                                VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+                                                VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+            a8_render_target =
+                maintenance5.maintenance5 == VK_TRUE && (a8.optimalTilingFeatures & needed) == needed;
+        }
+        if (a8_render_target) {
+            maintenance5.pNext = *v13_.next();
+            *v13_.next() = &maintenance5;
+        }
+#endif
 
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
         // VK_KHR_shader_fma where the device has it: translated shaders built with --fma khr use OpFmaKHR.
@@ -523,10 +560,13 @@ public:
             VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &mesh_features};
             instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
             mesh_shader = mesh_features.meshShader == VK_TRUE;
+            mesh_shader_queries = mesh_features.meshShaderQueries == VK_TRUE;
         }
         if (mesh_shader) {
             mesh_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT, *v13_.next()};
             mesh_features.meshShader = VK_TRUE;
+            // The mesh-primitives query, which counts the primitives a mesh shader emits (D3D-MESH-CLIPPING-COUNTER).
+            mesh_features.meshShaderQueries = mesh_shader_queries ? VK_TRUE : VK_FALSE;
             *v13_.next() = &mesh_features;
         }
         enable.occlusionQueryPrecise = features.features.occlusionQueryPrecise;  // query heaps, where available
@@ -560,6 +600,25 @@ public:
             host_pointer_alignment = host_memory.minImportedHostPointerAlignment;
         }
 
+        // VK_EXT_line_rasterization (Bresenham, smooth and rectangular lines only; no stippling), for the tests that ask.
+        VkPhysicalDeviceLineRasterizationFeaturesEXT line_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_EXT};
+        const bool has_line_rasterization =
+            request_line_rasterization && std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME) == 0;
+            });
+        if (has_line_rasterization) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &line_features};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            line_bresenham = line_features.bresenhamLines == VK_TRUE;
+            line_smooth = line_features.smoothLines == VK_TRUE;
+            line_rectangular = line_features.rectangularLines == VK_TRUE;
+            line_features.stippledRectangularLines = line_features.stippledBresenhamLines =
+                line_features.stippledSmoothLines = VK_FALSE;
+            line_features.pNext = *v13_.next();
+            *v13_.next() = &line_features;
+        }
+
         VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
         device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
         device_info.pQueueCreateInfos = queue_infos.data();
@@ -575,6 +634,9 @@ public:
         if (vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+        if (a8_render_target) device_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+#endif
         if (host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
         const char* swapchain = "VK_KHR_swapchain";
         if (presentation) device_extensions.push_back(swapchain);
@@ -605,6 +667,7 @@ public:
         if (shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
         if (custom_border_color) device_extensions.push_back(custom_border_color_name);
+        if (has_line_rasterization) device_extensions.push_back(VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME);
         if (mesh_shader) device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();

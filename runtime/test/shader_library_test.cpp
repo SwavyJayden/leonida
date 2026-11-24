@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -570,6 +571,10 @@ int main() {
     broken.resize(100);  // truncated
     CHECK(!zlib_inflate(broken, out));
     CHECK(!zlib_inflate(dynamic, out, 599));  // larger than the limit
+    const auto max_limit = (std::numeric_limits<std::size_t>::max)();
+    CHECK(zlib_inflate(stored, out, max_limit) && out.size() == 40);
+    CHECK(zlib_inflate(fixed, out, max_limit) && out == bytes("hello hello hello leonida"));
+    CHECK(zlib_inflate(dynamic, out, max_limit) && out == skewed(600));
     CHECK(!zlib_inflate(bytes("not zlib"), out));
 
     Json json;
@@ -642,7 +647,9 @@ int main() {
                  "{\"semantic\": \"TEXCOORD\", \"semantic_index\": 3, \"register\": -1, \"system_value\": 0, "
                  "\"component_type\": \"float\"}]},\n"
                  " \"ps_out\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash << "\", \"inputs\": [0, 1, 28, 29], "
-                 "\"outputs\": [0, 2], \"f16_halves\": {\"0\": [28, 29], \"bad\": [1], \"7\": [20, 21]}},\n"
+                 "\"outputs\": [0, 2], \"f16_halves\": {\"0\": [28, 29], \"bad\": [1], \"-1\": [1, 2], "
+                 "\"+2\": [3, 4], \" 3\": [5, 6], \"4294967296\": [9, 10], \"99999999999999999999\": [11, 12], "
+                 "\"7\": [20, 21]}},\n"
                  " \"ps_native\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
                  "\"subgroup_size\": 64},\n"
                  " \"cs_emulated\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
@@ -886,6 +893,66 @@ int main() {
         write(dir / "fspx" / "index.json", "{broken");
         CHECK(bvh.load(dir.string(), &error) && bvh.size() == 2 && bvh.bvh_size() == 1 && bvh.fspx_size() == 0 &&
               bvh.program_candidates("cs", program).size() == 1);
+        std::filesystem::remove_all(dir);
+    }
+
+    // Executable embedded shaders (<dir>/exe/index.json): graphics (vs/ps) FSSM programs indexed alongside the game's
+    // own shaders, counted apart via exe_size(), and optional when missing or malformed.
+    {
+        const auto vs_container = container({{fixed, 25}});
+        const auto ps_container = container({{stored, 40}});
+        const std::string vs_hash = sha256_hex(fssm_program(vs_container));
+        const std::string ps_hash = sha256_hex(fssm_program(ps_container));
+        const auto code = fspx_code(0x5000);
+        const std::uint32_t words[5] = {0x07230203, 0x00010500, 0, 1, 0};
+        const auto write = [&](const std::filesystem::path& file, const std::string& text) {
+            std::ofstream out(file, std::ios::binary | std::ios::trunc);
+            out << text;
+        };
+        const std::string game = "\"cs_game\": {\"stage\": \"cs\", \"fssm_sha256\": \"" + hash + "\"}";
+        const std::string vs_entry = "{\"stage\": \"vs\", \"fssm_sha256\": \"" + vs_hash +
+                                     "\", \"input_signature\": [{\"semantic\": \"POSITION\", \"semantic_index\": 0, "
+                                     "\"register\": 0, \"system_value\": 0, \"component_type\": \"float\"}]}";
+        const std::string ps_entry = "{\"stage\": \"ps\", \"fssm_sha256\": \"" + ps_hash + "\"}";
+        std::filesystem::create_directories(dir / "fspx");
+        std::filesystem::create_directories(dir / "bvh");
+        std::filesystem::create_directories(dir / "exe");
+        write(dir / "index.json", "{" + game + "}");
+        write(dir / "fspx" / "index.json",
+              "{\"upscaler_00\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" + sha256_hex(code) + "\"}}");
+        write(dir / "bvh" / "index.json",
+              "{\"BuilderProgram\": {\"stage\": \"cs\", \"fssm_sha256\": \"" + hash + "\"}}");
+        write(dir / "exe" / "index.json",
+              "{\"container_00\": " + vs_entry + ",\n \"container_01\": " + ps_entry +
+                  ",\n \"NoKey\": {\"error\": \"ValueError: synthetic\"}}");
+        {
+            std::ofstream spv(dir / "exe" / "container_00.spv", std::ios::binary);
+            spv.write(reinterpret_cast<const char*>(words), sizeof(words));
+            std::ofstream spv_ps(dir / "exe" / "container_01.spv", std::ios::binary);
+            spv_ps.write(reinterpret_cast<const char*>(words), sizeof(words));
+        }
+        ShaderLibrary exe;
+        CHECK(exe.load(dir.string(), &error) && exe.size() == 5 && exe.fspx_size() == 1 && exe.bvh_size() == 1 &&
+              exe.exe_size() == 2);
+        const ShaderEntry* vs = exe.find("vs", vs_hash);
+        const ShaderEntry* ps = exe.find("ps", ps_hash);
+        CHECK(vs && vs->name == "exe/container_00" && vs->input_signature.size() == 1 &&
+              vs->input_signature[0].semantic == "POSITION" && exe.spirv(*vs).size() == 5);
+        CHECK(ps && ps->name == "exe/container_01" && exe.spirv(*ps).size() == 5);
+        CHECK(exe.candidates("ps", vs_hash).empty() && exe.candidates("vs", ps_hash).empty() &&
+              exe.fspx_candidates("vs", vs_hash).empty());
+        // Same program in main index and exe/: main comes first (index order).
+        write(dir / "index.json", "{" + game + ",\n \"vs_same\": " + vs_entry + "}");
+        CHECK(exe.load(dir.string(), &error) && exe.size() == 6 && exe.exe_size() == 2);
+        const auto both = exe.candidates("vs", vs_hash);
+        CHECK(both.size() == 2 && both[0]->name == "vs_same" && both[1]->name == "exe/container_00");
+        write(dir / "index.json", "{" + game + "}");
+        // Broken or missing exe/index.json leaves main, fspx, and bvh loaded and resets exe_size() to 0.
+        write(dir / "exe" / "index.json", "{broken");
+        CHECK(exe.load(dir.string(), &error) && exe.size() == 3 && exe.exe_size() == 0 && exe.bvh_size() == 1 &&
+              exe.fspx_size() == 1 && !exe.find("vs", vs_hash));
+        std::filesystem::remove(dir / "exe" / "index.json");
+        CHECK(exe.load(dir.string(), &error) && exe.size() == 3 && exe.exe_size() == 0 && exe.find("cs", hash));
         std::filesystem::remove_all(dir);
     }
 

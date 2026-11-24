@@ -54,6 +54,7 @@ struct Blob {
 
 constexpr HRESULT E_GS_INVALID_CONTAINER_NAME = static_cast<HRESULT>(0x80830001);
 constexpr HRESULT E_GS_UPDATE_TOO_BIG = static_cast<HRESULT>(0x80830005);
+constexpr HRESULT E_GS_QUOTA_EXCEEDED = static_cast<HRESULT>(0x80830006);
 constexpr HRESULT E_GS_PROVIDED_BUFFER_TOO_SMALL = static_cast<HRESULT>(0x80830007);
 constexpr HRESULT E_GS_BLOB_NOT_FOUND = static_cast<HRESULT>(0x80830008);
 constexpr HRESULT E_GS_HANDLE_EXPIRED = static_cast<HRESULT>(0x8083000D);
@@ -360,6 +361,59 @@ int main() {
         if (manual) XTaskQueueCloseHandle(manual);
         std::filesystem::remove_all(root / L"local-user" / L"first", ec);
         std::filesystem::remove_all(root / L"local-user" / L"second", ec);
+    }
+
+    // ---- quota underflow on case-insensitive blob aliases ----
+    // On Windows NTFS, "story" and "STORY" refer to the same on-disk file; subtracting its existing size twice in
+    // one update used to underflow uint64_t and fail a tiny update or delete with E_GS_QUOTA_EXCEEDED.
+    {
+        Handle qc = nullptr, qu = nullptr;
+        const std::string payload(5000, 'Q');
+        check(at<Create>(save, 16)(save, provider, "quota_case", &qc) == S_OK && qc,
+              "CreateContainer for case-alias quota check");
+        check(at<Create>(save, 23)(save, qc, nullptr, &qu) == S_OK &&
+                  at<Write>(save, 25)(save, qu, "story", reinterpret_cast<const uint8_t*>(payload.data()),
+                                      payload.size()) == S_OK &&
+                  at<Submit>(save, 27)(save, qu) == S_OK,
+              "seed blob \"story\" for case-alias quota check");
+        at<Close>(save, 24)(save, qu);
+
+        qu = nullptr;
+        check(at<Create>(save, 23)(save, qc, nullptr, &qu) == S_OK &&
+                  at<ByName>(save, 26)(save, qu, "story") == S_OK &&
+                  at<ByName>(save, 26)(save, qu, "STORY") == S_OK,
+              "queue case-colliding deletes in one update");
+        const HRESULT del_hr = at<Submit>(save, 27)(save, qu);
+        check(del_hr == S_OK && del_hr != E_GS_QUOTA_EXCEEDED,
+              "case-colliding deletes do not underflow quota to E_GS_QUOTA_EXCEEDED");
+        check(!std::filesystem::exists(root / L"local-user" / L"quota_case" / L"story"),
+              "case-colliding delete removes the on-disk blob");
+        at<Close>(save, 24)(save, qu);
+
+        int64_t rem = 0;
+        check(at<Quota>(save, 7)(save, provider, &rem) == S_OK && rem == (int64_t{1} << 30),
+              "remaining quota returns to full capacity after case-colliding delete");
+
+        // Re-seed and test write + case-colliding delete in one update.
+        qu = nullptr;
+        check(at<Create>(save, 23)(save, qc, nullptr, &qu) == S_OK &&
+                  at<Write>(save, 25)(save, qu, "story", reinterpret_cast<const uint8_t*>(payload.data()),
+                                      payload.size()) == S_OK &&
+                  at<Submit>(save, 27)(save, qu) == S_OK,
+              "re-seed blob \"story\" for write+delete case-alias check");
+        at<Close>(save, 24)(save, qu);
+
+        qu = nullptr;
+        check(at<Create>(save, 23)(save, qc, nullptr, &qu) == S_OK &&
+                  at<Write>(save, 25)(save, qu, "story", reinterpret_cast<const uint8_t*>("abc"), 3) == S_OK &&
+                  at<ByName>(save, 26)(save, qu, "STORY") == S_OK,
+              "queue write and case-colliding delete in one update");
+        const HRESULT wd_hr = at<Submit>(save, 27)(save, qu);
+        check(wd_hr == S_OK && wd_hr != E_GS_QUOTA_EXCEEDED,
+              "write + case-colliding delete does not underflow quota to E_GS_QUOTA_EXCEEDED");
+        at<Close>(save, 24)(save, qu);
+        at<Close>(save, 17)(save, qc);
+        check(at<ByName>(save, 10)(save, provider, "quota_case") == S_OK, "clean up quota_case container");
     }
 
     at<Close>(save, 6)(save, provider);

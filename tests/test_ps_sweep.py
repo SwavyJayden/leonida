@@ -326,6 +326,40 @@ class CompareCommand(unittest.TestCase):
             self.assertEqual(ps_sweep.depth_measurements(0, rec, rec), {"depth_class": "incompatible"})
             self.assertEqual(ps_sweep.depth_measurements(0, {"code": 0}, rec), {"depth_class": "missing"})
 
+    def test_exact_keeps_color_mismatch_with_bad_depth(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            pixels = ps_sweep.W * ps_sweep.H
+            floats = pixels * 4
+            color_a = struct.pack("<f", 0.5) * floats
+            color_b = struct.pack("<f", 0.75) * floats
+            clear_depth = struct.pack("<f", 1.0) * pixels
+            # 0: color mismatch + one absent depth file; 1: color mismatch + short depth
+            # file; 2: matching-color control with the same absent depth file.
+            colors = [(color_a, color_b), (color_a, color_b), (color_a, color_a)]
+            (out / "sample.json").write_text(json.dumps([{}] * len(colors)), encoding="utf-8", newline="\n")
+            for side, tag in enumerate(("a", "b")):
+                folder = out / f"{tag}_z"
+                folder.mkdir()
+                with (folder / "results_0.jsonl").open("w", encoding="utf-8", newline="\n") as log:
+                    for i, pair in enumerate(colors):
+                        rec = {"i": i, "code": 0, "targets": 1, "depth": True, "samples_passed": pixels}
+                        print(json.dumps(rec), file=log)
+                        (folder / f"{i}.raw").write_bytes(pair[side])
+            (out / "a_z" / "0.raw.depth").write_bytes(clear_depth)
+            (out / "a_z" / "1.raw.depth").write_bytes(clear_depth)
+            (out / "a_z" / "2.raw.depth").write_bytes(clear_depth)
+            (out / "b_z" / "1.raw.depth").write_bytes(b"short")
+            with contextlib.redirect_stdout(io.StringIO()):
+                ps_sweep.main(["compare", "--exact", "--out", tmp])
+            report = json.loads((out / "exact_z.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["draws"], {"mismatch": 2, "missing": 1})
+            self.assertEqual([r["class"] for r in report["rows"]], ["mismatch", "mismatch", "missing"])
+            self.assertEqual([r["depth_class"] for r in report["rows"]], ["missing", "incompatible", "missing"])
+            self.assertEqual(report["rows"][0]["targets"], ["mismatch"])
+            self.assertEqual(report["rows"][1]["targets"], ["mismatch"])
+            self.assertEqual(report["rows"][2]["targets"], ["non-clear exact"])
+
     @unittest.skipUnless(os.environ.get("PS_SWEEP_TEST_EXE"), "requires a Vulkan worker")
     def test_integer_texture_fetch(self):
         from pathlib import Path

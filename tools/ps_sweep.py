@@ -467,7 +467,8 @@ def compare_exact(a, sample, ra, rb):
         left, right = ra.get(i), rb.get(i)
         outcome, targets = exact_pair(i, left, right)
         depth = depth_measurements(i, left, right)
-        if depth.get("depth_class") in ("missing", "incompatible", "mismatch"):
+        # Unusable depth cannot undo an observed color mismatch; the row still records depth_class separately.
+        if outcome != "mismatch" and depth.get("depth_class") in ("missing", "incompatible", "mismatch"):
             outcome = depth["depth_class"]
         elif outcome == "clear-only exact" and (any(depth.get("depth_nonclear_pixels", [])) or
                                                 any(depth.get("zero_depth_nonclear_pixels", []))):

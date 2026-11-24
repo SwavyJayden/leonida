@@ -9,12 +9,15 @@
 
 #include <algorithm>
 #include <clocale>
+#include <cstring>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <initializer_list>
+#include <iterator>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
@@ -183,6 +186,63 @@ bool host_renames_case(const std::filesystem::path& folder) {
 
 void run_checks(const std::filesystem::path& root);
 
+// Title memory committed on first touch, as xmem maps physical pages: a view of a reserve-only pagefile section whose
+// pages a vectored handler commits when user-mode code faults on them. The kernel's write in ReadFile raises no such
+// fault, so the host ReadFile fails with ERROR_NOACCESS; the shim commits the pages and reads again.
+char* g_first_touch = nullptr;
+SIZE_T g_first_touch_size = 0;
+
+LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS* info) {
+    const EXCEPTION_RECORD* r = info->ExceptionRecord;
+    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    auto* at = reinterpret_cast<char*>(r->ExceptionInformation[1]);
+    if (at < g_first_touch || at >= g_first_touch + g_first_touch_size) return EXCEPTION_CONTINUE_SEARCH;
+    auto* page = reinterpret_cast<char*>(reinterpret_cast<uintptr_t>(at) & ~uintptr_t{0xfff});
+    return VirtualAlloc(page, 0x1000, MEM_COMMIT, PAGE_READWRITE) ? EXCEPTION_CONTINUE_EXECUTION
+                                                                  : EXCEPTION_CONTINUE_SEARCH;
+}
+
+void check_read_file_first_touch(const std::filesystem::path& root) {
+    using ReadFileFn = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+    const auto shim_read = reinterpret_cast<ReadFileFn>(rt::shims::find("kernel32.dll", "ReadFile"));
+    check(shim_read != nullptr, "ReadFile is served by the file shims");
+    if (!shim_read) return;
+
+    std::filesystem::create_directories(root);
+    const std::filesystem::path file = root / "first_touch.bin";
+    constexpr DWORD kSize = 3 * 0x10000 + 123;  // crosses several pages and ends inside one
+    std::vector<unsigned char> data(kSize);
+    for (DWORD i = 0; i < kSize; ++i) data[i] = static_cast<unsigned char>(i * 7 + 3);
+    std::ofstream(file, std::ios::binary).write(reinterpret_cast<const char*>(data.data()), kSize);
+
+    g_first_touch_size = 4 * 0x10000;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE, 0,
+                                        static_cast<DWORD>(g_first_touch_size), nullptr);
+    g_first_touch = section ? static_cast<char*>(MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 0)) : nullptr;
+    check(g_first_touch != nullptr, "a reserve-only section view stands in for first-touch title memory");
+    if (!g_first_touch) return;
+    void* const handler = AddVectoredExceptionHandler(1, &commit_on_touch);
+
+    auto read_into_view = [&](ReadFileFn read) {
+        HANDLE h = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        DWORD got = 0;
+        const BOOL ok = read(h, g_first_touch + 0x800, kSize, &got, nullptr);
+        const DWORD error = ok ? 0 : GetLastError();
+        CloseHandle(h);
+        return std::make_pair(ok ? got : 0, error);
+    };
+    const auto host = read_into_view(&::ReadFile);
+    check(host.second == ERROR_NOACCESS, "the host ReadFile into uncommitted pages fails with ERROR_NOACCESS");
+    const auto shimmed = read_into_view(shim_read);
+    check(shimmed.second == 0 && shimmed.first == kSize, "the shimmed ReadFile commits the pages and reads it all");
+    check(std::memcmp(g_first_touch + 0x800, data.data(), kSize) == 0, "the bytes read are the file's");
+
+    RemoveVectoredExceptionHandler(handler);
+    UnmapViewOfFile(g_first_touch);
+    CloseHandle(section);
+    g_first_touch = nullptr;
+}
+
 }  // namespace
 
 int main() {
@@ -198,6 +258,7 @@ int main() {
     // An exception from one check (std::filesystem throws on a host error) ends the checks, not the run: it is a
     // failure, the folder is still removed and the summary is still printed.
     try {
+        check_read_file_first_touch(root / "first_touch");
         run_checks(root);
     } catch (const std::exception& e) {
         check(false, (std::string("the checks run to the end (stopped by: ") + e.what() + ")").c_str());
@@ -222,6 +283,103 @@ void run_checks(const std::filesystem::path& root) {
     check(rt::fs::game_dir() == package, "configure() sets the game folder");
     check(rt::fs::overlay_dir() == overlay, "configure() sets the overlay folder");
 
+    {
+        const auto info = resolve<decltype(&::GetVolumeInformationW)>("kernel32.dll", "GetVolumeInformationW");
+        const auto missing_overlay = root / "missing-overlay" / "child";
+        rt::fs::configure(package, missing_overlay);
+        check(info && info(L"GAME:\\", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
+              !std::filesystem::exists(missing_overlay.parent_path()),
+              "volume query succeeds without creating the overlay");
+        const auto info_a_missing = resolve<decltype(&::GetVolumeInformationA)>("kernel32.dll", "GetVolumeInformationA");
+        const auto path_w_missing = resolve<decltype(&::GetVolumePathNameW)>("kernel32.dll", "GetVolumePathNameW");
+        const auto path_a_missing = resolve<decltype(&::GetVolumePathNameA)>("kernel32.dll", "GetVolumePathNameA");
+        wchar_t package_root[MAX_PATH]{}, overlay_root[MAX_PATH]{};
+        DWORD package_serial{}, package_flags{}, overlay_serial{}, overlay_flags{};
+        wchar_t package_fs[MAX_PATH]{}, overlay_fs[MAX_PATH]{};
+        const bool host_volumes = ::GetVolumePathNameW(package.c_str(), package_root, MAX_PATH) &&
+            ::GetVolumePathNameW(root.c_str(), overlay_root, MAX_PATH) &&
+            ::GetVolumeInformationW(package_root, nullptr, 0, &package_serial, nullptr, &package_flags, package_fs, MAX_PATH) &&
+            ::GetVolumeInformationW(overlay_root, nullptr, 0, &overlay_serial, nullptr, &overlay_flags, overlay_fs, MAX_PATH);
+        auto matches_volume = [&](const wchar_t* virtual_root, DWORD serial, DWORD flags, const wchar_t* fs) {
+            DWORD actual_serial{}, actual_flags{};
+            wchar_t actual_fs[MAX_PATH]{};
+            return info && info(virtual_root, nullptr, 0, &actual_serial, nullptr, &actual_flags, actual_fs, MAX_PATH) &&
+                actual_serial == serial && actual_flags == flags && std::wstring(actual_fs) == fs;
+        };
+        check(host_volumes && matches_volume(L"G:\\", package_serial, package_flags, package_fs),
+              "G: volume identity matches the host package volume");
+        check(host_volumes && matches_volume(L"T:\\", overlay_serial, overlay_flags, overlay_fs),
+              "T: volume identity matches the host overlay ancestor volume");
+        wchar_t root_w[MAX_PATH]{};
+        char root_a[MAX_PATH]{};
+        check(info && !info(L"T:\\..\\bad", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
+              !std::filesystem::exists(missing_overlay.parent_path()), "rejected T: volume information W leaves overlay absent");
+        check(info_a_missing && !info_a_missing("T:\\..\\bad", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
+              !std::filesystem::exists(missing_overlay.parent_path()), "rejected T: volume information A leaves overlay absent");
+        check(path_w_missing && !path_w_missing(L"T:\\..\\bad", root_w, MAX_PATH) &&
+              !std::filesystem::exists(missing_overlay.parent_path()), "rejected T: volume path W leaves overlay absent");
+        check(path_a_missing && !path_a_missing("T:\\..\\bad", root_a, MAX_PATH) &&
+              !std::filesystem::exists(missing_overlay.parent_path()), "rejected T: volume path A leaves overlay absent");
+        check(info && info(L"T:\\", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
+              info_a_missing && info_a_missing("T:\\", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
+              path_w_missing && path_w_missing(L"T:\\file", root_w, MAX_PATH) && std::wstring(root_w) == L"T:\\" &&
+              path_a_missing && path_a_missing("T:\\file", root_a, MAX_PATH) && std::string(root_a) == "T:\\" &&
+              !std::filesystem::exists(missing_overlay.parent_path()), "valid T: volume queries succeed without creating overlay");
+        DWORD serial_before{}, flags_before{}, serial_after{}, flags_after{};
+        DWORD serial_a_before{}, flags_a_before{}, serial_a_after{}, flags_a_after{};
+        wchar_t fs_before[MAX_PATH]{}, fs_after[MAX_PATH]{};
+        char fs_a_before[MAX_PATH]{}, fs_a_after[MAX_PATH]{};
+        const bool before = info && info(L"T:\\", nullptr, 0, &serial_before, nullptr, &flags_before, fs_before, MAX_PATH) &&
+            info_a_missing && info_a_missing("T:\\", nullptr, 0, &serial_a_before, nullptr, &flags_a_before, fs_a_before, MAX_PATH);
+        std::filesystem::create_directories(missing_overlay);
+        check(host_volumes && matches_volume(L"G:\\", package_serial, package_flags, package_fs) &&
+              matches_volume(L"T:\\", overlay_serial, overlay_flags, overlay_fs),
+              "G: and T: retain their host volume identities after overlay creation");
+        const bool after = info && info(L"T:\\", nullptr, 0, &serial_after, nullptr, &flags_after, fs_after, MAX_PATH) &&
+            info_a_missing && info_a_missing("T:\\", nullptr, 0, &serial_a_after, nullptr, &flags_a_after, fs_a_after, MAX_PATH);
+        check(before && after && serial_before == serial_after && flags_before == flags_after &&
+              std::wstring(fs_before) == fs_after && serial_a_before == serial_a_after &&
+              flags_a_before == flags_a_after && std::string(fs_a_before) == fs_a_after,
+              "T: volume identity stays stable when the overlay is created (W and A)");
+        std::filesystem::remove_all(missing_overlay.parent_path());
+        const auto missing_game = root / "missing-game";
+        rt::fs::configure(missing_game, missing_overlay);
+        check(info && !info(L"GAME:\\", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
+              !std::filesystem::exists(missing_game) && !std::filesystem::exists(missing_overlay.parent_path()),
+              "volume query does not recreate a missing game or overlay");
+        rt::fs::configure(package, overlay);
+        const auto path = resolve<decltype(&::GetVolumePathNameW)>("kernel32.dll", "GetVolumePathNameW");
+        wchar_t fs[MAX_PATH]{}, actual[MAX_PATH]{}, expected[MAX_PATH]{};
+        check(info && info(L"GAME:\\", nullptr, 0, nullptr, nullptr, nullptr, fs, MAX_PATH) && fs[0],
+              "GetVolumeInformationW returns the GAME filesystem");
+        check(path && path(L"GAME:\\sub\\f.bin", actual, MAX_PATH) && std::wstring(actual) == L"GAME:\\",
+              "GetVolumePathNameW returns the virtual root");
+        const BOOL host_ok = ::GetVolumePathNameW(package.c_str(), expected, MAX_PATH);
+        check(path && host_ok && path(package.c_str(), actual, MAX_PATH) && std::wstring(actual) == expected,
+              "GetVolumePathNameW preserves host paths");
+        const auto info_a = resolve<decltype(&::GetVolumeInformationA)>("kernelbase.dll", "GetVolumeInformationA");
+        char ansi_label[MAX_PATH]{}, ansi_fs[MAX_PATH]{};
+        wchar_t wide_label[MAX_PATH]{}, wide_fs[MAX_PATH]{};
+        check(info && info_a && info(L"GAME:\\", wide_label, MAX_PATH, nullptr, nullptr, nullptr, wide_fs, MAX_PATH) &&
+              info_a("GAME:\\", ansi_label, MAX_PATH, nullptr, nullptr, nullptr, ansi_fs, MAX_PATH),
+              "both volume query variants return strings");
+        char expected_fs[MAX_PATH]{};
+        check(::WideCharToMultiByte(CP_ACP, 0, wide_fs, -1, expected_fs, MAX_PATH, nullptr, nullptr) &&
+              std::string(ansi_fs) == expected_fs, "ANSI volume filesystem matches the converted wide result");
+        const auto path_a = resolve<decltype(&::GetVolumePathNameA)>("kernelbase.dll", "GetVolumePathNameA");
+        char fs_a[MAX_PATH]{}, actual_a[MAX_PATH]{};
+        for (const char* drive : {"GAME:\\", "G:\\", "T:\\"}) {
+            check(info_a && info_a(drive, nullptr, 0, nullptr, nullptr, nullptr, fs_a, MAX_PATH) && fs_a[0],
+                  "GetVolumeInformationA returns the virtual drive filesystem");
+            check(path_a && path_a(drive, actual_a, MAX_PATH) && std::string(actual_a) == drive,
+                  "GetVolumePathNameA returns the virtual drive root");
+        }
+        check(path && path(L"G:\\sub\\f.bin", actual, MAX_PATH) && std::wstring(actual) == L"G:\\" &&
+              path(L"T:\\sub\\f.bin", actual, MAX_PATH) && std::wstring(actual) == L"T:\\",
+              "GetVolumePathNameW returns G and T roots");
+        check(path && !path(L"GAME:\\sub", actual, 2), "GetVolumePathNameW rejects a short buffer");
+    }
+
     // The table the runtime installs: kernel32 and the api sets a GDK title links against.
     const auto create_w = resolve<CreateFileWFn>("kernel32.dll", "CreateFileW");
     const auto create_a = resolve<CreateFileAFn>("kernelbase.dll", "CreateFileA");
@@ -237,6 +395,128 @@ void run_checks(const std::filesystem::path& root) {
     check(create_w && create_a && first_w && first_a && next_w && find_close && attributes_w && attributes_a &&
               attributes_ex_w && delete_w && delete_a,
           "the file API resolves through the registry under kernel32/kernelbase and the api sets");
+
+    {
+        using PathW = DWORD(WINAPI*)(DWORD, LPWSTR);
+        using PathA = DWORD(WINAPI*)(DWORD, LPSTR);
+        using NameW = UINT(WINAPI*)(LPCWSTR, LPCWSTR, UINT, LPWSTR);
+        using NameA = UINT(WINAPI*)(LPCSTR, LPCSTR, UINT, LPSTR);
+        auto pw = resolve<PathW>("kernel32.dll", "GetTempPathW");
+        auto pa = resolve<PathA>("kernelbase.dll", "GetTempPathA");
+        auto nw = resolve<NameW>("kernel32.dll", "GetTempFileNameW");
+        auto na = resolve<NameA>("kernelbase.dll", "GetTempFileNameA");
+        check(pw && pa && nw && na, "temporary file APIs resolve in the registry");
+        if (!pw) pw = ::GetTempPathW;
+        if (!pa) pa = ::GetTempPathA;
+        if (!nw) nw = ::GetTempFileNameW;
+        if (!na) na = ::GetTempFileNameA;
+        wchar_t old_tmp[32768]{};
+        DWORD old_len = ::GetEnvironmentVariableW(L"TMP", old_tmp, 32768);
+        wchar_t old_temp[32768]{};
+        DWORD old_temp_len = ::GetEnvironmentVariableW(L"TEMP", old_temp, 32768);
+        wchar_t host[MAX_PATH]{}, actual[MAX_PATH]{}, filename[MAX_PATH]{}, second[MAX_PATH]{};
+        ::GetTempPathW(MAX_PATH, host);
+        check(pw(MAX_PATH, actual) && std::wstring(actual) == host, "host temporary path passes through unchanged");
+        wchar_t host_name[MAX_PATH]{}, shim_name[MAX_PATH]{};
+        UINT host_id = ::GetTempFileNameW(host, L"hst", 0x1234, host_name);
+        check(nw(host, L"hst", 0x1234, shim_name) == host_id && std::wstring(host_name) == shim_name,
+              "host temporary file name passes through unchanged");
+        const auto scratch = overlay / L".gta6rt-temp";
+        const auto subdir = scratch / L"existing";
+        std::filesystem::create_directories(subdir);
+        ::SetEnvironmentVariableW(L"TMP", L"T:\\existing");
+        check(pw(MAX_PATH, actual) && std::wstring(actual) == subdir.wstring() + L"\\",
+              "GetTempPathW preserves the configured subdirectory");
+        char sub_path[MAX_PATH]{};
+        check(pa(MAX_PATH, sub_path) && std::filesystem::path(sub_path).parent_path() == subdir,
+              "GetTempPathA preserves the configured subdirectory");
+        ::SetEnvironmentVariableW(L"TMP", nullptr);
+        ::SetEnvironmentVariableW(L"TEMP", L"GAME:\\existing");
+        check(pw(MAX_PATH, actual) && std::wstring(actual) == subdir.wstring() + L"\\",
+              "GetTempPathW preserves the TEMP subdirectory when TMP is absent");
+        check(nw(L"T:\\existing", L"sub", 0, filename) &&
+                  std::filesystem::path(filename).parent_path() == subdir && std::filesystem::exists(filename),
+              "GetTempFileNameW creates the file in the requested subdirectory");
+        char sub_name[MAX_PATH]{};
+        check(na("T:\\existing", "sub", 0, sub_name) &&
+                  std::filesystem::path(sub_name).parent_path() == subdir && std::filesystem::exists(sub_name),
+              "GetTempFileNameA creates the file in the requested subdirectory");
+        // Exercise an overlay component that the active ANSI code page cannot round-trip, when available.
+        const wchar_t unicode_component[] = L"\u6f22\u5b57";
+        char encoded[32]{};
+        wchar_t decoded[32]{};
+        const int encoded_len = ::WideCharToMultiByte(CP_ACP, 0, unicode_component, -1, encoded, 32, nullptr, nullptr);
+        if (encoded_len && ::MultiByteToWideChar(CP_ACP, 0, encoded, -1, decoded, 32) &&
+            std::wstring(decoded) != unicode_component) {
+            const auto unicode_overlay = root / unicode_component;
+            const auto unicode_scratch = unicode_overlay / L".gta6rt-temp";
+            std::filesystem::create_directories(unicode_scratch);
+            rt::fs::configure(package, unicode_overlay);
+            char unicode_path[MAX_PATH]{};
+            ::SetLastError(0);
+            const DWORD path_result = pa(MAX_PATH, unicode_path);
+            const DWORD path_error = ::GetLastError();
+            check(!path_result && path_error == ERROR_NO_UNICODE_TRANSLATION,
+                  "GetTempPathA rejects an unrepresentable overlay path");
+            char unicode_name[MAX_PATH]{};
+            ::SetLastError(0);
+            const UINT unicode_result = na("T:\\", "uni", 0, unicode_name);
+            const DWORD unicode_error = ::GetLastError();
+            check(!unicode_result && unicode_error == ERROR_NO_UNICODE_TRANSLATION &&
+                      std::filesystem::is_empty(unicode_scratch),
+                  "GetTempFileNameA rejects unrepresentable output and removes the created file");
+            rt::fs::configure(package, overlay);
+        } else {
+            std::printf("NOTE active ANSI code page represents the Unicode test path; conversion failure test skipped\n");
+        }
+        ::SetLastError(0);
+        const UINT missing = nw(L"T:\\missing", L"sub", 0, filename);
+        const DWORD missing_error = ::GetLastError();
+        if (missing || missing_error != ERROR_PATH_NOT_FOUND)
+            std::printf("NOTE missing temporary directory: result %u, error %lu\n", missing, missing_error);
+        check(!missing && missing_error == ERROR_PATH_NOT_FOUND && !std::filesystem::exists(scratch / L"missing"),
+              "a missing temporary subdirectory fails without creating it");
+        const auto entries_before = std::distance(std::filesystem::recursive_directory_iterator(scratch),
+                                                  std::filesystem::recursive_directory_iterator());
+        ::SetLastError(0);
+        const UINT refused = nw(L"GAME:\\..\\outside", L"bad", 0, filename);
+        check(!refused && ::GetLastError() == ERROR_INVALID_NAME && !std::filesystem::exists(overlay / L"outside") &&
+                  entries_before == std::distance(std::filesystem::recursive_directory_iterator(scratch),
+                                                  std::filesystem::recursive_directory_iterator()),
+              "a refused temporary path fails without creating a file");
+        for (const wchar_t* drive : {L"GAME:\\", L"G:\\", L"T:\\"}) {
+            ::SetEnvironmentVariableW(L"TMP", drive);
+            DWORD host_result = ::GetTempPathW(MAX_PATH, host);
+            std::printf("NOTE host GetTempPathW %ls -> %lu %ls\n", drive, host_result, host);
+            DWORD result = pw(MAX_PATH, actual);
+            check(result && std::wstring(actual) == scratch.wstring() + L"\\",
+                  "console temporary path resolves to overlay scratch");
+            DWORD required = pw(0, nullptr);
+            check(required == result + 1, "GetTempPathW reports required size including terminator");
+            UINT first = nw(drive, L"abcd", 0, filename);
+            UINT other = nw(drive, L"abcd", 0, second);
+            check(first && other && std::wstring(filename) != second && std::filesystem::exists(filename) &&
+                      std::filesystem::exists(second) && std::filesystem::path(filename).parent_path() == scratch,
+                  "console temporary names are unique files in scratch");
+        }
+        char a_path[MAX_PATH]{}, a_name[MAX_PATH]{};
+        check(pa(MAX_PATH, a_path) && std::filesystem::path(a_path).parent_path() == scratch,
+              "GetTempPathA resolves console path");
+        check(pa(0, nullptr) == std::strlen(a_path) + 1, "GetTempPathA reports required size including terminator");
+        const DWORD a_length = static_cast<DWORD>(std::strlen(a_path));
+        char exact_buffer[MAX_PATH];
+        std::memset(exact_buffer, 0x5a, sizeof(exact_buffer));
+        check(pa(a_length, exact_buffer) == a_length && exact_buffer[a_length] == 0x5a,
+              "GetTempPathA returns path length when capacity excludes the terminator");
+        check(na("GAME:\\", "abcdef", 0x1234, a_name) == 0x1234 &&
+                  std::filesystem::path(a_name).parent_path() == scratch &&
+                  !std::filesystem::exists(a_name) &&
+                  std::filesystem::path(a_name).filename().string().find("abc") == 0,
+              "GetTempFileNameA honours the prefix and nonzero unique value");
+        check(!std::filesystem::exists(package / L".gta6rt-temp"), "temporary files never enter the package");
+        ::SetEnvironmentVariableW(L"TMP", old_len && old_len < 32768 ? old_tmp : nullptr);
+        ::SetEnvironmentVariableW(L"TEMP", old_temp_len && old_temp_len < 32768 ? old_temp : nullptr);
+    }
 
     // A read of a package file, through the mixed-case prefix and through forward slashes.
     {
@@ -492,8 +772,8 @@ void run_checks(const std::filesystem::path& root) {
         check(delete_w(L"GAME:\\data\\bye.txt") == FALSE && GetLastError() == ERROR_FILE_NOT_FOUND,
               "deleting an already hidden file reports ERROR_FILE_NOT_FOUND");
         SetLastError(0);
-        check(delete_w(L"GAME:\\nope\\missing.txt") == FALSE && GetLastError() == ERROR_FILE_NOT_FOUND,
-              "deleting a file that never existed reports ERROR_FILE_NOT_FOUND");
+        check(delete_w(L"GAME:\\nope\\missing.txt") == FALSE && GetLastError() == ERROR_PATH_NOT_FOUND,
+              "deleting a file in a folder that never existed reports ERROR_PATH_NOT_FOUND");
 
         // Deleting a nested package file creates parent directories inside .gta6rt-deleted/; those marker parent
         // directories must not hide the corresponding ancestor directories in the package.
@@ -709,6 +989,49 @@ void run_checks(const std::filesystem::path& root) {
               "and the new folder is empty: only . and ..");
     }
 
+    {
+        const std::filesystem::path host = root / "host_missing";
+        write_path(host / "file.txt", "file");
+        const std::wstring host_dest = (host / "dest.txt").wstring();
+        auto error_of = [](BOOL ok) { return ok ? DWORD{0} : GetLastError(); };
+        struct Name {
+            const wchar_t* game;
+            std::filesystem::path host;
+            DWORD expected;
+            const char* what;
+        };
+        const Name names[] = {
+            {L"GAME:\\nowhere\\x.txt", host / "nowhere" / "x.txt", ERROR_PATH_NOT_FOUND, "inside a missing folder"},
+            {L"GAME:\\misc\\keep.txt\\x.txt", host / "file.txt" / "x.txt", ERROR_PATH_NOT_FOUND, "below a file"},
+            {L"GAME:\\misc\\absent.txt", host / "absent.txt", ERROR_FILE_NOT_FOUND, "missing from a folder that exists"},
+        };
+        for (const Name& n : names) {
+            const std::wstring native = n.host.wstring();
+            const std::string suffix = std::string(" of a name ") + n.what + " fails as on the host";
+            SetLastError(0);
+            const DWORD host_delete = error_of(::DeleteFileW(native.c_str()));
+            SetLastError(0);
+            check(error_of(delete_w(n.game)) == n.expected && host_delete == n.expected, ("DeleteFileW" + suffix).c_str());
+            SetLastError(0);
+            const DWORD host_rmdir = error_of(::RemoveDirectoryW(native.c_str()));
+            SetLastError(0);
+            check(error_of(rmdir_w(n.game)) == n.expected && host_rmdir == n.expected,
+                  ("RemoveDirectoryW" + suffix).c_str());
+            SetLastError(0);
+            const DWORD host_setattr = error_of(::SetFileAttributesW(native.c_str(), FILE_ATTRIBUTE_NORMAL));
+            SetLastError(0);
+            check(error_of(setattr_w(n.game, FILE_ATTRIBUTE_NORMAL)) == n.expected && host_setattr == n.expected,
+                  ("SetFileAttributesW" + suffix).c_str());
+            SetLastError(0);
+            const DWORD host_move = error_of(::MoveFileExW(native.c_str(), host_dest.c_str(), MOVEFILE_REPLACE_EXISTING));
+            SetLastError(0);
+            check(error_of(move_ex_w(n.game, L"GAME:\\misc\\dest.txt", MOVEFILE_REPLACE_EXISTING)) == n.expected &&
+                      host_move == n.expected,
+                  ("MoveFileExW" + suffix).c_str());
+        }
+        check(!std::filesystem::exists(overlay / "nowhere") && !std::filesystem::exists(overlay / "misc" / "dest.txt"),
+              "and none of them leaves anything in the overlay");
+    }
     // Recreating a removed package directory clears its own marker, but not nested deletion markers.
     {
         std::filesystem::create_directories(package / "recreate_dir");
@@ -777,7 +1100,9 @@ void run_checks(const std::filesystem::path& root) {
         check(move_w(L"GAME:\\misc", L"GAME:\\misc2") == FALSE && GetLastError() == ERROR_ACCESS_DENIED,
               "a package folder is not moved");
         SetLastError(0);
-        check(move_w(L"GAME:\\misc\\keep.txt", (root / "host.txt").c_str()) == FALSE &&
+        // G: and T: outside the configured roots are console aliases, even when TEMP uses that host drive.
+        // Paths within the synthetic package root are explicitly host paths on every drive.
+        check(move_w(L"GAME:\\misc\\keep.txt", (package / "host.txt").c_str()) == FALSE &&
                   GetLastError() == ERROR_NOT_SAME_DEVICE,
               "a move between GAME: and a host path is refused as cross-volume");
         SetLastError(0);
@@ -821,7 +1146,8 @@ void run_checks(const std::filesystem::path& root) {
         check(copy_a("GAME:\\misc\\keep.txt", "GAME:\\misc\\target.txt", FALSE) != FALSE &&
                   read_path(overlay / "misc" / "target.txt") == "keep" && read_path(package / "misc" / "target.txt") == "target",
               "CopyFileA overwrites through the overlay and leaves the package file alone");
-        const std::filesystem::path host_copy = root / "host_copy.txt";
+        // Keep this host path inside a configured root too; an unqualified G:/T: path is virtual.
+        const std::filesystem::path host_copy = package / "host_copy.txt";
         check(copy_w(L"GAME:\\misc\\keep.txt", host_copy.c_str(), TRUE) != FALSE && read_path(host_copy) == "keep",
               "a copy from GAME: to a host path works");
         check(copy_ex_w(host_copy.c_str(), L"GAME:\\cache\\from_host.txt", nullptr, nullptr, nullptr, COPY_FILE_FAIL_IF_EXISTS) !=

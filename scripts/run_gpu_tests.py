@@ -258,6 +258,8 @@ def read_raw_u32(path: str) -> list[tuple[int, int, int, int]]:
     return [struct.unpack_from("<4I", data, 16 * i) for i in range(n)]
 
 
+# cs_div_fmas_f64_rt's operands a = 1 + 2^-30, c = -(1 + 2^-29) as s4..s7 (low word first).
+DIV_FMAS_F64_SGPRS = "0x00400000,0x3ff00000,0x00800000,0xbff00000"
 UNSUPPORTED = 77   # vk_harness: the device lacks a stage the test draws with (geometry or mesh shaders)
 
 
@@ -656,6 +658,7 @@ OTHER_HARNESS = {"ps_m15": "d3d12_translated_draw_test", "vs_m15": "d3d12_transl
                  "ps_m3": "d3d12_m3_frame_test", "vs_m3": "d3d12_m3_frame_test",
                  "ps_m3_post": "d3d12_m3_frame_test", "ps_m3_query": "d3d12_m3_frame_test",
                  "cs_m4_fill": "d3d12_m4_compute_test", "cs_m4_indirect": "d3d12_m4_compute_test",
+                 "cs_upload_read": "d3d12_upload_arena_test",
                  "cs_buf_typed": "d3d12_buffer_uav_test", "cs_buf_counter": "d3d12_buffer_uav_test",
                  "ps_live_width": "w64_graphics.py",
                  "ps_heap_index": "d3d12_heap_index_test"}
@@ -1055,6 +1058,7 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_tbuffer_store":
             # tbuffer_store_format_*: the instruction's format, words measured natively on a Radeon 680M (the .asm header)
             problem = tbuffer_store_test(a.build, spirv_dir, cs_env)
+            results.append((name, not problem, problem or "192/192 dumped words exact"))
         elif name == "cs_fmt_d16_xyz":
             # d16_xyz / d16_xy typed-buffer loads and d16_xyz stores (cs_fmt_d16_xyz.asm header)
             problem = fmt_d16_xyz_test(a.build, spirv_dir, cs_env)
@@ -1091,10 +1095,12 @@ def run_suite(a, work: str) -> int:
                 ok, detail = judge_cs_dump(rc, msg, [0, 0x40040000], wave64=False, partial=False, emulated=False,
                                            hexwords=True)
                 results.append((name, ok, detail))
-        elif name == "cs_div_fmas_f64":
+        elif name in ("cs_div_fmas_f64", "cs_div_fmas_f64_rt"):
             # One-rounding binary64 FMA: strict where the translator emitted OpFmaKHR on doubles (shaderFmaFloat64,
             # --fma khr); under the default GLSL Fma the split result (0) is allowed, as cs_fma_fused allows it.
-            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
+            # The _rt fixture reads the same operands from s4..s7, so the driver cannot fold the Fma at compile time.
+            env = dict(cs_env or os.environ, VKC_SGPRS=DIV_FMAS_F64_SGPRS) if name.endswith("_rt") else cs_env
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=env)
             if rc == UNSUPPORTED:      # no shaderFloat64, or (--fma khr) no shaderFmaFloat64
                 results.append((name, None, unsupported_skip(msg)))
             else:
@@ -1104,7 +1110,8 @@ def run_suite(a, work: str) -> int:
                 ok = rc == 0 and (words == fused or (not strict and words == split))
                 detail = " ".join(hex(x) for x in words) if words else msg
                 if ok and words == split:
-                    detail += " (split: the driver rounds GLSL Fma on doubles twice; --fma khr fixes it)"
+                    detail += (" (split: the driver rounded GLSL Fma on doubles twice%s; --fma khr fixes it)"
+                               % ("" if name.endswith("_rt") else " when folding the constants"))
                 results.append((name, ok, detail))
         elif name == "cs_cvt_f32_sat":
             # #300's saturating float -> int conversions: one dispatch per input word in s4 (VKC_SGPRS).

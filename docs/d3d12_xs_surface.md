@@ -67,7 +67,7 @@ and the individual stubs in
 | 4 | `D3D12ConfigureVirtualMemoryX` | console | present (returns `S_OK`) | VM policy; PC/Vulkan owns it. Measured: one pointer argument (a zeroed 32-byte block, dword +4 set to a count); the title only tests the result for failure |
 | 5 | `D3D12CreateDevice` | standard | **absent** | Leonida exports only the Xbox entry point; see §2.3 |
 | 6 | `D3D12CreateRootSignatureDeserializer` | standard | present | forwarded |
-| 7 | `D3D12CreateVersionedRootSignatureDeserializer` | standard | absent | forward if imported |
+| 7 | `D3D12CreateVersionedRootSignatureDeserializer` | standard | present | forwarded, Xbox flags cleared on a copy |
 | 8 | `D3D12EnableExperimentalFeatures` | standard | absent | forward if imported |
 | 9 | `D3D12GetDebugInterface` | standard | absent | forward if imported |
 | 10 | `D3D12SerializeRootSignature` | standard | present | forwarded, flags cleared on a copy |

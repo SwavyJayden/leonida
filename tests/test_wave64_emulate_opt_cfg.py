@@ -277,5 +277,97 @@ class TreeAndRegionGuardTest(unittest.TestCase):
         self.assertEqual(out, [("guard", 2, [("block", 1)])])
 
 
+class FlowSensitiveExecInactiveTest(unittest.TestCase):
+    """Flow-sensitive must-be-zero proof in `_exec_writes_stay_inactive`."""
+
+    def _run_check(self, blocks, succ, region=None, run=0, run_live_in=0):
+        active_blocks = [w._active_insns(b) for b in blocks]
+        blk_info = [w._classify_block_body(b, {}, set(), set()) for b in active_blocks]
+        if region is None:
+            region = frozenset(range(len(blocks)))
+        return w._exec_writes_stay_inactive(
+            region, blk_info, run_live_in, run=run, succ=succ, active_blocks=active_blocks
+        )
+
+    def test_scratch_pair_clobbered_before_saveexec_then_restored_is_safe(self):
+        # s[40:41] first receives a non-zero mask via s_xor_b64 -1, then is overwritten
+        # by s_and_saveexec_b64 (old EXEC == 0 for inactive lanes) before restoring EXEC.
+        imm = lambda v: {"k": "imm", "v": v}
+        vgpr = lambda r: {"k": "vgpr", "r": r, "n": 1}
+        blocks = blocks_of(
+            [
+                ins("s_or_b64", sgpr(40, 2), sgpr(4, 2), sgpr(6, 2)),
+                ins("s_xor_b64", sgpr(40, 2), sgpr(40, 2), imm(-1)),
+                ins("s_and_saveexec_b64", sgpr(40, 2), sgpr(40, 2)),
+                ins("s_cbranch_execz", imm(1)),
+            ],
+            [ins("v_add_nc_u32", vgpr(0), vgpr(0), imm(1))],
+            [ins("s_mov_b64", special("exec"), sgpr(40, 2))],
+        )
+        self.assertTrue(self._run_check(blocks, succ=[[2, 1], [2], []]))
+
+    def test_vcmp_and_cselect_zero_masks_preserve_inactive_lanes(self):
+        imm = lambda v: {"k": "imm", "v": v}
+        vgpr = lambda r: {"k": "vgpr", "r": r, "n": 1}
+        blocks = blocks_of(
+            [
+                ins("v_cmp_eq_u32_e64", sgpr(40, 2), vgpr(0), imm(0)),
+                ins("s_cselect_b64", sgpr(42, 2), sgpr(40, 2), imm(0)),
+                ins("s_or_b64", special("exec"), special("exec"), sgpr(42, 2)),
+            ],
+        )
+        self.assertTrue(self._run_check(blocks, succ=[[]]))
+
+    def test_unoverwritten_xor_mask_into_exec_is_rejected(self):
+        imm = lambda v: {"k": "imm", "v": v}
+        blocks = blocks_of(
+            [
+                ins("s_xor_b64", sgpr(40, 2), sgpr(40, 2), imm(-1)),
+                ins("s_mov_b64", special("exec"), sgpr(40, 2)),
+            ],
+        )
+        self.assertFalse(self._run_check(blocks, succ=[[]]))
+
+    def test_diamond_merge_with_one_nonzero_branch_is_rejected(self):
+        imm = lambda v: {"k": "imm", "v": v}
+        blocks = blocks_of(
+            [ins("s_cbranch_scc1", imm(1))],
+            [ins("s_and_saveexec_b64", sgpr(40, 2), sgpr(4, 2))],       # zero
+            [ins("s_mov_b64", sgpr(40, 2), imm(-1))],                  # non-zero
+            [ins("s_mov_b64", special("exec"), sgpr(40, 2))],
+        )
+        self.assertFalse(self._run_check(blocks, succ=[[2, 1], [3], [3], []]))
+
+    def test_loop_backedge_clobbering_saved_pair_is_rejected(self):
+        imm = lambda v: {"k": "imm", "v": v}
+        blocks = blocks_of(
+            [ins("s_and_saveexec_b64", sgpr(40, 2), sgpr(4, 2))],
+            [ins("s_mov_b64", special("exec"), sgpr(40, 2)), ins("s_cbranch_scc1", imm(1))],
+            [ins("s_mov_b64", sgpr(40, 2), imm(-1)), ins("s_branch", imm(-2))],
+        )
+        self.assertFalse(self._run_check(blocks, succ=[[1], [2], [1]]))
+
+    def test_partial_sgpr_overwrite_kills_overlapping_pair(self):
+        imm = lambda v: {"k": "imm", "v": v}
+        blocks = blocks_of(
+            [
+                ins("s_and_saveexec_b64", sgpr(40, 2), sgpr(4, 2)),
+                ins("s_mov_b32", sgpr(41, 1), imm(1)),                 # clobbers high half of s[40:41]
+                ins("s_mov_b64", special("exec"), sgpr(40, 2)),
+            ],
+        )
+        self.assertFalse(self._run_check(blocks, succ=[[]]))
+
+    def test_vop3b_carry_out_does_not_mark_pair_zero(self):
+        vgpr = lambda r: {"k": "vgpr", "r": r, "n": 1}
+        blocks = blocks_of(
+            [
+                ins("v_add_co_u32", vgpr(0), sgpr(40, 2), vgpr(1), vgpr(2)),
+                ins("s_mov_b64", special("exec"), sgpr(40, 2)),
+            ],
+        )
+        self.assertFalse(self._run_check(blocks, succ=[[]]))
+
+
 if __name__ == "__main__":
     unittest.main()

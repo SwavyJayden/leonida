@@ -184,7 +184,7 @@ Drive console_drive(const std::wstring& path, size_t& prefix_length) {
     return letter == L'g' ? Drive::Game : Drive::Scratch;
 }
 
-Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts) {
+Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts, bool create_scratch = true) {
     size_t prefix_length = 0;
     const Drive drive = console_drive(path, prefix_length);
     if (drive == Drive::None) return Parsed::Host;
@@ -194,7 +194,7 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
         const std::filesystem::path overlay = roots().overlay;
         const DWORD last_error = ::GetLastError();
         std::error_code ec;
-        if (!overlay.empty()) std::filesystem::create_directories(win32_io_path(overlay / kScratchDir), ec);
+        if (create_scratch && !overlay.empty()) std::filesystem::create_directories(win32_io_path(overlay / kScratchDir), ec);
         ::SetLastError(last_error);
     }
     const size_t floor = parts.size();  // ".." may not climb out of the drive's own root
@@ -353,6 +353,10 @@ bool same_entry(const std::vector<std::wstring>& a, const std::vector<std::wstri
 
 std::vector<std::wstring> parent_of(const std::vector<std::wstring>& parts) {
     return parts.empty() ? parts : std::vector<std::wstring>(parts.begin(), parts.end() - 1);
+}
+
+DWORD missing_error(const Roots& r, const std::vector<std::wstring>& parts) {
+    return is_folder(r, parent_of(parts)) ? ERROR_FILE_NOT_FOUND : ERROR_PATH_NOT_FOUND;
 }
 
 // Whether a folder has nothing in the title's view: no overlay entry and no package entry that is not deleted.
@@ -701,6 +705,41 @@ void note_open_failure(const char* api, LPCWSTR name, DWORD error, const void* c
             rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller))));
 }
 
+// Reads one byte of every 4 KiB page of [buffer, buffer + size) from user mode, so that pages committed on first
+// touch (xmem's physical-page views: a reserve-only section committed by its vectored handler) are committed before
+// the kernel writes into them. A page that is not valid at all is left for the caller's ReadFile to refuse. No C++
+// objects here: the function has __try.
+bool touch_pages(void* buffer, DWORD size) {
+    auto* p = static_cast<volatile const unsigned char*>(buffer);
+    const uintptr_t first = reinterpret_cast<uintptr_t>(buffer) & ~uintptr_t{0xfff};
+    const uintptr_t end = reinterpret_cast<uintptr_t>(buffer) + size;
+    bool all = true;
+    for (uintptr_t page = first; page < end; page += 0x1000) {
+        const uintptr_t at = page < reinterpret_cast<uintptr_t>(p) ? reinterpret_cast<uintptr_t>(p) : page;
+        __try {
+            (void)*reinterpret_cast<volatile const unsigned char*>(at);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            all = false;
+        }
+    }
+    return all;
+}
+
+// ReadFile with one retry for a destination the kernel cannot write yet. The retail title reads into title memory
+// that xmem maps from physical pages committed on first touch; the kernel's write raises no user-mode fault, so
+// ReadFile fails with ERROR_NOACCESS (998), and the title's read loop sleeps 1 ms and retries forever (measured on
+// 1.0.2.1, native Windows). Touching the pages from user mode commits them; the read is then retried once.
+BOOL WINAPI read_file(HANDLE file, LPVOID buffer, DWORD size, LPDWORD read, LPOVERLAPPED overlapped) {
+    if (ReadFile(file, buffer, size, read, overlapped)) return TRUE;
+    if (GetLastError() != ERROR_NOACCESS || !buffer || !size) return FALSE;
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true))
+        std::fprintf(stderr, "[rt] fs: ReadFile into uncommitted title memory (ERROR_NOACCESS): committing the "
+                             "destination pages and retrying (logged once)\n");
+    touch_pages(buffer, size);
+    return ReadFile(file, buffer, size, read, overlapped);
+}
+
 HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES attributes,
                             DWORD disposition, DWORD flags, HANDLE template_file) {
     if (!name) {
@@ -989,10 +1028,7 @@ BOOL WINAPI delete_file_w(LPCWSTR name) {
             removed = true;
         }
     }
-    if (!removed) {
-        SetLastError(ERROR_FILE_NOT_FOUND);
-        return FALSE;
-    }
+    if (!removed) return fail_bool(missing_error(r, parts));
     return TRUE;
 }
 
@@ -1081,7 +1117,7 @@ BOOL WINAPI remove_directory_w(LPCWSTR name) {
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (drive_root(name, parts)) return fail_bool(ERROR_ACCESS_DENIED);  // "GAME:" and "T:" themselves stay
     const View v = view(r, parts);
-    if (v.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
+    if (v.kind == Kind::None) return fail_bool(missing_error(r, parts));
     if (v.kind == Kind::File) return fail_bool(ERROR_DIRECTORY);
     if (!empty_in_view(r, parts)) return fail_bool(ERROR_DIR_NOT_EMPTY);
 
@@ -1118,7 +1154,7 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (drive_root(from, src) || drive_root(to, dst)) return fail_bool(ERROR_ACCESS_DENIED);
     const View from_view = view(r, src);
-    if (from_view.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
+    if (from_view.kind == Kind::None) return fail_bool(missing_error(r, src));
     const std::filesystem::path overlay_from = disk_path(r.overlay, src), overlay_to = disk_path(r.overlay, dst);
     if (same_entry(src, dst)) {
         // The destination is the source, so it is not "already there". The host succeeds at a move onto the same
@@ -1369,7 +1405,7 @@ BOOL WINAPI set_file_attributes_w(LPCWSTR name, DWORD attributes) {
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (parts.empty()) return fail_bool(ERROR_ACCESS_DENIED);
     const View v = view(r, parts);
-    if (v.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
+    if (v.kind == Kind::None) return fail_bool(missing_error(r, parts));
 
     // The attributes belong to the overlay copy: a package file is copied up and a package folder mirrored first,
     // so the package keeps its own attributes and reads, which prefer the overlay, see the new ones.
@@ -1393,6 +1429,215 @@ BOOL WINAPI set_file_attributes_a(LPCSTR name, DWORD attributes) {
     return set_file_attributes_w(wide.c_str(), attributes);
 }
 
+// Resolve the backing volume without exposing its host root to the title.
+bool volume_host_root(const std::wstring& name, std::wstring& result) {
+    const Roots r = roots();
+    size_t prefix = 0;
+    const Drive drive = console_drive(name, prefix);
+    const bool package_volume = drive == Drive::Game && prefix == 2;
+    auto dir = package_volume ? r.game : r.overlay;
+    const DWORD attributes = dir.empty() ? INVALID_FILE_ATTRIBUTES : ::GetFileAttributesW(dir.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        if (package_volume || r.game.empty() || ::GetFileAttributesW(r.game.c_str()) == INVALID_FILE_ATTRIBUTES)
+            return fail_bool(ERROR_PATH_NOT_FOUND);
+        if (dir.empty()) dir = r.game;
+        while (!dir.empty() && ::GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            const auto parent = dir.parent_path();
+            if (parent == dir) break;
+            dir = parent;
+        }
+    }
+    if (dir.empty() || ::GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES)
+        return fail_bool(ERROR_PATH_NOT_FOUND);
+    wchar_t root[MAX_PATH]{};
+    if (!::GetVolumePathNameW(dir.c_str(), root, MAX_PATH)) return false;
+    result = root;
+    return true;
+}
+
+BOOL WINAPI get_volume_information_w(LPCWSTR name, LPWSTR label, DWORD label_size, LPDWORD serial,
+                                     LPDWORD max_component, LPDWORD flags, LPWSTR filesystem, DWORD filesystem_size) {
+    if (!name) return ::GetVolumeInformationW(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(name, parts, false);
+    if (parsed == Parsed::Host) return ::GetVolumeInformationW(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+    if (parsed == Parsed::Refused || !drive_root(name, parts)) return fail_bool(ERROR_INVALID_NAME);
+    std::wstring root;
+    if (!volume_host_root(name, root)) return FALSE;
+    return ::GetVolumeInformationW(root.c_str(), label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+}
+
+BOOL WINAPI get_volume_information_a(LPCSTR name, LPSTR label, DWORD label_size, LPDWORD serial,
+                                     LPDWORD max_component, LPDWORD flags, LPSTR filesystem, DWORD filesystem_size) {
+    if (!name) return ::GetVolumeInformationA(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+    const std::wstring wide = widen_ansi(name);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(wide, parts, false);
+    if (parsed == Parsed::Host) return ::GetVolumeInformationA(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+    if (parsed == Parsed::Refused || !drive_root(wide, parts)) return fail_bool(ERROR_INVALID_NAME);
+    std::wstring root;
+    if (!volume_host_root(wide, root)) return FALSE;
+    // Keep the mount path Unicode; only the two returned strings use the caller's ANSI code page.
+    wchar_t wide_label[MAX_PATH]{}, wide_filesystem[MAX_PATH]{};
+    if (!::GetVolumeInformationW(root.c_str(), label && label_size ? wide_label : nullptr,
+                                 label && label_size ? MAX_PATH : 0, serial, max_component, flags,
+                                 filesystem && filesystem_size ? wide_filesystem : nullptr,
+                                 filesystem && filesystem_size ? MAX_PATH : 0)) return FALSE;
+    if (label && label_size && !::WideCharToMultiByte(CP_ACP, 0, wide_label, -1, label,
+                                                       static_cast<int>(label_size > 0x7fffffffU ? 0x7fffffffU : label_size), nullptr, nullptr)) return FALSE;
+    if (filesystem && filesystem_size && !::WideCharToMultiByte(CP_ACP, 0, wide_filesystem, -1, filesystem,
+                                                                static_cast<int>(filesystem_size > 0x7fffffffU ? 0x7fffffffU : filesystem_size), nullptr, nullptr)) return FALSE;
+    return TRUE;
+}
+
+BOOL WINAPI get_volume_path_name_w(LPCWSTR name, LPWSTR output, DWORD size) {
+    if (!name) return ::GetVolumePathNameW(name, output, size);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(name, parts, false);
+    if (parsed == Parsed::Host) return ::GetVolumePathNameW(name, output, size);
+    if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
+    size_t prefix = 0;
+    console_drive(name, prefix);
+    const std::wstring root = std::wstring(name, prefix) + L"\\";
+    if (!output || size <= root.size()) return fail_bool(ERROR_FILENAME_EXCED_RANGE);
+    std::wmemcpy(output, root.c_str(), root.size() + 1);
+    return TRUE;
+}
+
+BOOL WINAPI get_volume_path_name_a(LPCSTR name, LPSTR output, DWORD size) {
+    if (!name) return ::GetVolumePathNameA(name, output, size);
+    const std::wstring wide = widen_ansi(name);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(wide, parts, false);
+    if (parsed == Parsed::Host) return ::GetVolumePathNameA(name, output, size);
+    if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
+    size_t prefix = 0;
+    console_drive(wide, prefix);
+    if (!output || size <= prefix + 1) return fail_bool(ERROR_FILENAME_EXCED_RANGE);
+    std::memcpy(output, name, prefix);
+    output[prefix] = '\\';
+    output[prefix + 1] = '\0';
+    return TRUE;
+}
+
+// Console temporary directories always live in the writable overlay, independent of the package tree.
+static Target temp_directory(const std::wstring& path, bool& console) {
+    size_t prefix_length = 0;
+    const Drive drive = console_drive(path, prefix_length);
+    console = drive != Drive::None;
+    if (!console) return {};
+    std::vector<std::wstring> parts;
+    if (parse_console(path, parts) == Parsed::Refused) return fail(ERROR_INVALID_NAME);
+    const auto overlay = roots().overlay;
+    if (overlay.empty()) return fail(ERROR_PATH_NOT_FOUND);
+    std::error_code ec;
+    const auto scratch = overlay / kScratchDir;
+    std::filesystem::create_directories(scratch, ec);
+    if (ec) return fail(static_cast<DWORD>(ec.value()));
+    Target target;
+    if (drive == Drive::Scratch) parts.erase(parts.begin());
+    target.path = join(scratch, parts);
+    return target;
+}
+
+static std::wstring temp_environment() {
+    for (const wchar_t* key : {L"TMP", L"TEMP"}) {
+        const DWORD size = ::GetEnvironmentVariableW(key, nullptr, 0);
+        if (!size) continue;
+        std::vector<wchar_t> value(size);
+        const DWORD length = ::GetEnvironmentVariableW(key, value.data(), size);
+        if (length && length < size) return std::wstring(value.data(), length);
+    }
+    return {};
+}
+
+static void temp_name_error(const std::filesystem::path& directory) {
+    const DWORD error = ::GetLastError();
+    if (::GetFileAttributesW(directory.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        const DWORD attributes_error = ::GetLastError();
+        if (attributes_error == ERROR_FILE_NOT_FOUND || attributes_error == ERROR_PATH_NOT_FOUND) {
+            ::SetLastError(ERROR_PATH_NOT_FOUND);
+            return;
+        }
+    }
+    ::SetLastError(error);
+}
+
+DWORD WINAPI get_temp_path_w(DWORD size, LPWSTR buffer) {
+    bool console = false;
+    const Target target = temp_directory(temp_environment(), console);
+    if (!console) return ::GetTempPathW(size, buffer);
+    if (target.error) return fail_bool(target.error);
+    std::wstring path = target.path.wstring();
+    if (path.empty() || !is_separator(path.back())) path += static_cast<wchar_t>(92);
+    const DWORD required = static_cast<DWORD>(path.size() + 1);
+    if (size < required) return required;
+    std::wmemcpy(buffer, path.c_str(), required);
+    return required - 1;
+}
+
+DWORD WINAPI get_temp_path_a(DWORD size, LPSTR buffer) {
+    bool console = false;
+    const Target target = temp_directory(temp_environment(), console);
+    if (!console) return ::GetTempPathA(size, buffer);
+    if (target.error) return fail_bool(target.error);
+    std::wstring path = target.path.wstring();
+    if (path.empty() || !is_separator(path.back())) path += static_cast<wchar_t>(92);
+    const bool utf8 = ::GetACP() == CP_UTF8;
+    const DWORD flags = utf8 ? 0 : WC_NO_BEST_FIT_CHARS;
+    BOOL used_default = FALSE;
+    BOOL* const used_default_ptr = utf8 ? nullptr : &used_default;
+    const int required = ::WideCharToMultiByte(CP_ACP, flags, path.c_str(), -1, nullptr, 0, nullptr, used_default_ptr);
+    if (!required) return 0;
+    if (used_default) {
+        ::SetLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return 0;
+    }
+    if (size < static_cast<DWORD>(required))
+        return size && size == static_cast<DWORD>(required - 1) ? size : static_cast<DWORD>(required);
+    if (!::WideCharToMultiByte(CP_ACP, flags, path.c_str(), -1, buffer, required, nullptr, used_default_ptr)) return 0;
+    if (used_default) {
+        ::SetLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return 0;
+    }
+    return static_cast<DWORD>(required - 1);
+}
+
+UINT WINAPI get_temp_file_name_w(LPCWSTR path, LPCWSTR prefix, UINT unique, LPWSTR name) {
+    if (!path) return ::GetTempFileNameW(path, prefix, unique, name);
+    bool console = false;
+    const Target target = temp_directory(path, console);
+    if (!console) return ::GetTempFileNameW(path, prefix, unique, name);
+    if (target.error) return fail_bool(target.error);
+    const UINT result = ::GetTempFileNameW(target.path.c_str(), prefix, unique, name);
+    if (!result) temp_name_error(target.path);
+    return result;
+}
+
+UINT WINAPI get_temp_file_name_a(LPCSTR path, LPCSTR prefix, UINT unique, LPSTR name) {
+    if (!path) return ::GetTempFileNameA(path, prefix, unique, name);
+    bool console = false;
+    const Target target = temp_directory(widen_ansi(path), console);
+    if (!console) return ::GetTempFileNameA(path, prefix, unique, name);
+    if (target.error) return fail_bool(target.error);
+    const std::wstring wide_prefix = widen_ansi(prefix);
+    wchar_t wide_name[MAX_PATH]{};
+    const UINT result = ::GetTempFileNameW(target.path.c_str(), prefix ? wide_prefix.c_str() : nullptr, unique, wide_name);
+    if (!result) {
+        temp_name_error(target.path);
+        return 0;
+    }
+    char converted[MAX_PATH]{};
+    const int length = ::WideCharToMultiByte(CP_ACP, 0, wide_name, -1, converted, MAX_PATH, nullptr, nullptr);
+    if (!length || widen_ansi(converted) != wide_name) {
+        if (!unique) ::DeleteFileW(wide_name);
+        ::SetLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return 0;
+    }
+    std::memcpy(name, converted, static_cast<size_t>(length));
+    return result;
+}
+
 }  // namespace rt::fs
 
 namespace {
@@ -1402,9 +1647,18 @@ using namespace rt::fs;
 // imports and through the api sets a GDK title is linked against (file-l1-1-0 for the find and attribute calls,
 // file-l1-2-0 and file-l2-1-0 for CreateFile).
 #define FILE_API(dll)                                                                                    \
+    {dll, "GetVolumeInformationA", reinterpret_cast<void*>(&get_volume_information_a)},                   \
+        {dll, "GetVolumeInformationW", reinterpret_cast<void*>(&get_volume_information_w)},             \
+        {dll, "GetVolumePathNameA", reinterpret_cast<void*>(&get_volume_path_name_a)},                   \
+        {dll, "GetVolumePathNameW", reinterpret_cast<void*>(&get_volume_path_name_w)},                   \
+    {dll, "GetTempPathA", reinterpret_cast<void*>(&get_temp_path_a)},                                  \
+    {dll, "GetTempPathW", reinterpret_cast<void*>(&get_temp_path_w)},                                  \
+    {dll, "GetTempFileNameA", reinterpret_cast<void*>(&get_temp_file_name_a)},                          \
+    {dll, "GetTempFileNameW", reinterpret_cast<void*>(&get_temp_file_name_w)},                          \
     {dll, "CreateFileA", reinterpret_cast<void*>(&create_file_a)},                                       \
         {dll, "CreateFileW", reinterpret_cast<void*>(&create_file_w)},                                   \
         {dll, "CreateFile2", reinterpret_cast<void*>(&create_file2)},                                    \
+        {dll, "ReadFile", reinterpret_cast<void*>(&read_file)},                                          \
         {dll, "FindFirstFileA", reinterpret_cast<void*>(&find_first_file_a)},                            \
         {dll, "FindFirstFileW", reinterpret_cast<void*>(&find_first_file_w)},                            \
         {dll, "FindFirstFileExA", reinterpret_cast<void*>(&find_first_file_ex_a)},                       \

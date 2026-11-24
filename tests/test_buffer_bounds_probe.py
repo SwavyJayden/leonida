@@ -29,6 +29,12 @@ class BufferBoundsProbeTests(unittest.TestCase):
                               capture_output=True, text=True, check=False)
         self.assertEqual(proc.returncode, 2, proc.stderr or proc.stdout)
 
+    def test_waves_that_are_not_numbers(self):
+        proc = subprocess.run([sys.executable, "-I", PROBE, "--waves", "32,abc"],
+                              capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 2, proc.stderr or proc.stdout)
+        self.assertNotIn("Traceback", proc.stderr)
+
     def test_json_folder_is_refused_before_the_gpu_run(self):
         with tempfile.TemporaryDirectory() as folder:
             proc = subprocess.run([sys.executable, "-I", PROBE, "--json", folder],

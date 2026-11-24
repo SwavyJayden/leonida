@@ -927,13 +927,116 @@ def _write_preserves_zero(op, a, zero_pairs, *, for_exec):
     return False
 
 
-def _exec_writes_stay_inactive(region_blocks, blk_info, run_live_in):
+_BIT_ZERO_VCC = 127
+_ALL_ZERO_BITS = (1 << 128) - 1
+_SGPR_PAIR_MASK = (1 << 127) - 1
+
+
+def _is_zero_bit(x, zmask):
+    if _is_exec_op_arg(x):
+        return True
+    if x.get("k") == "imm" and x.get("v", 1) == 0:
+        return True
+    if x.get("k") == "special" and x.get("t") == "vcc":
+        return bool(zmask & (1 << _BIT_ZERO_VCC))
+    r = _sgpr_pair(x)
+    return r is not None and bool(zmask & (1 << r))
+
+
+def _exec_write_preserves_zero(op, a, zmask):
+    """True iff an EXEC-writing instruction keeps EXEC == 0 when entry EXEC == 0 and `zmask` holds."""
+    if op.startswith("v_cmpx") or op in (
+            "s_and_saveexec_b64", "s_and_saveexec_b32",
+            "s_andn1_saveexec_b64", "s_andn1_saveexec_b32",
+            "s_andn1_wrexec_b64", "s_andn1_wrexec_b32"):
+        return True
+    if op in ("s_andn2_saveexec_b64", "s_or_saveexec_b64", "s_xor_saveexec_b64", "s_andn2_wrexec_b64"):
+        return len(a) >= 2 and _is_zero_bit(a[1], zmask)
+    if not a or not _is_exec_op_arg(a[0]):
+        return False  # partial exec_lo/exec_hi or unknown EXEC write
+    if op == "s_and_b64" and len(a) == 3:
+        return _is_zero_bit(a[1], zmask) or _is_zero_bit(a[2], zmask)
+    if op == "s_andn2_b64" and len(a) == 3:
+        return _is_zero_bit(a[1], zmask)
+    if op in ("s_or_b64", "s_xor_b64") and len(a) == 3:
+        return _is_zero_bit(a[1], zmask) and _is_zero_bit(a[2], zmask)
+    if op == "s_mov_b64" and len(a) == 2:
+        return _is_zero_bit(a[1], zmask)
+    if op == "s_cselect_b64" and len(a) == 3:
+        return _is_zero_bit(a[1], zmask) and _is_zero_bit(a[2], zmask)
+    if op == "s_cmov_b64" and len(a) == 2:
+        return _is_zero_bit(a[1], zmask)
+    return False
+
+
+def _mask64_write_preserves_zero(op, a, zmask):
+    """True iff a 64-bit mask write to `a[0]` (SGPR pair or VCC) produces 0 when EXEC == 0 and `zmask` holds."""
+    if op.endswith("_saveexec_b64") or op == "s_andn1_wrexec_b64":
+        return True  # saves old EXEC (or ~S0 & EXEC), both 0 when EXEC == 0
+    if op == "s_andn2_wrexec_b64":
+        return len(a) >= 2 and _is_zero_bit(a[1], zmask)
+    if op.startswith("v_cmp") and not op.startswith("v_cmpx"):
+        return True  # inactive lanes (EXEC == 0) always produce 0 in v_cmp_*
+    if op == "s_and_b64" and len(a) == 3:
+        return _is_zero_bit(a[1], zmask) or _is_zero_bit(a[2], zmask)
+    if op == "s_andn2_b64" and len(a) == 3:
+        return _is_zero_bit(a[1], zmask)
+    if op in ("s_or_b64", "s_xor_b64") and len(a) == 3:
+        return _is_zero_bit(a[1], zmask) and _is_zero_bit(a[2], zmask)
+    if op == "s_mov_b64" and len(a) == 2:
+        return _is_zero_bit(a[1], zmask)
+    if op == "s_cselect_b64" and len(a) == 3:
+        return _is_zero_bit(a[1], zmask) and _is_zero_bit(a[2], zmask)
+    if op == "s_cmov_b64" and len(a) == 2:
+        return _is_zero_bit(a[0], zmask) and _is_zero_bit(a[1], zmask)
+    return False
+
+
+def _transfer_zero_ins(ins, zmask):
+    """Step forward must-be-zero state across one instruction; return `(exec_ok, new_zmask)`."""
+    m = _OP_META_CACHE.get(ins["op"])
+    if m is None:
+        m = _get_op_meta(ins["op"])
+    if m[1]:  # terminator
+        return True, zmask
+    op = m[0]
+    a = ins["args"]
+    flags = m[8]
+    writes_exec = bool(flags & _FLAG_WRITES_EXEC_OP) or (
+        bool(a) and a[0].get("k") == "special" and a[0].get("t", "").startswith("exec")
+    )
+    if writes_exec and not _exec_write_preserves_zero(op, a, zmask):
+        return False, zmask
+
+    _, ins_mw, _ = _scalar_rw_with_meta(ins, m)
+    new_zmask = zmask
+    s_bits = ins_mw & _ALL_SGPRS
+    if s_bits:
+        # Pair r covers SGPRs r and r+1; kill every pair overlapping any written SGPR.
+        kill_pairs = (s_bits | (s_bits >> 1)) & _SGPR_PAIR_MASK
+        new_zmask &= ~kill_pairs
+        r = _sgpr_pair(a[0]) if a else None
+        if r is not None and s_bits == (3 << r) and _mask64_write_preserves_zero(op, a, zmask):
+            new_zmask |= 1 << r
+    if ins_mw & (1 << _BIT_VCC):
+        is_full_vcc = bool(a) and a[0].get("k") == "special" and a[0].get("t") == "vcc"
+        if is_full_vcc and _mask64_write_preserves_zero(op, a, zmask):
+            new_zmask |= 1 << _BIT_ZERO_VCC
+        else:
+            new_zmask &= ~(1 << _BIT_ZERO_VCC)
+    return True, new_zmask
+
+
+def _exec_writes_stay_inactive(region_blocks, blk_info, run_live_in, *, run=None, succ=None, active_blocks=None):
     """Return True iff every EXEC write in `region_blocks` preserves `active == False` for inactive lanes.
 
-    Inductive proof over all execution steps in `region_blocks`: any SGPR pair `s[r:r+1]` not live-in at
-    the region entry (`run_live_in`) cannot be read before being written in the region. If every write to
-    `s[r:r+1]` and every write to `EXEC` produces 0 whenever `EXEC == 0` and all such pairs are 0, then
-    an inactive lane stays inactive across arbitrary nested / reused saveexec if-else diamonds.
+    When `run`, `succ` and `active_blocks` are supplied, runs a sound forward must-be-zero dataflow over
+    `region_blocks` tracking which 64-bit SGPR pairs `s[r:r+1]` (and `vcc`) are provably 0 for any lane with
+    entry `EXEC == 0`. This proves patterns where a scratch pair is computed with non-zero-preserving ops
+    (e.g. `s_or_b64` / `s_xor_b64 s[r:r+1], ..., -1`) and then overwritten with old `EXEC` by
+    `s_and_saveexec_b64 s[r:r+1], s[r:r+1]` before `s_mov_b64 exec, s[r:r+1]`, as well as `v_cmp_*` mask
+    writes (which always write 0 for inactive lanes). Falls back to the legacy flow-insensitive check when
+    called without CFG context.
     """
     has_exec_write = False
     for u in region_blocks:
@@ -942,6 +1045,58 @@ def _exec_writes_stay_inactive(region_blocks, blk_info, run_live_in):
             break
     if not has_exec_write:
         return True
+
+    if run is not None and succ is not None and active_blocks is not None:
+        r_preds = {u: [] for u in region_blocks}
+        for u in region_blocks:
+            for s in succ[u]:
+                if s in region_blocks:
+                    r_preds[s].append(u)
+        out_z = {}
+        work = collections.deque([run])
+        in_work = {run}
+        while work:
+            u = work.popleft()
+            in_work.discard(u)
+            if u == run:
+                cur = 0
+            else:
+                cur = _ALL_ZERO_BITS
+                seen_pred = False
+                for p in r_preds[u]:
+                    if p in out_z:
+                        cur &= out_z[p]
+                        seen_pred = True
+                if not seen_pred:
+                    cur = 0
+            for ins in active_blocks[u]:
+                ok, cur = _transfer_zero_ins(ins, cur)
+                if not ok:
+                    return False
+            if out_z.get(u) != cur:
+                out_z[u] = cur
+                for s in succ[u]:
+                    if s in region_blocks and s not in in_work:
+                        work.append(s)
+                        in_work.add(s)
+        if len(out_z) != len(region_blocks):
+            return False
+        # Post-convergence verification pass over every block with its final meet state.
+        for u in region_blocks:
+            if u == run:
+                cur = 0
+            else:
+                cur = _ALL_ZERO_BITS
+                for p in r_preds[u]:
+                    cur &= out_z[p]
+                if not r_preds[u]:
+                    cur = 0
+            for ins in active_blocks[u]:
+                ok, cur = _transfer_zero_ins(ins, cur)
+                if not ok:
+                    return False
+        return True
+
     sgpr_writers = collections.defaultdict(list)
     for u in region_blocks:
         for item in blk_info[u][4]:
@@ -1037,70 +1192,8 @@ def _drop_tree_block(tree, b):
 
 
 def _unwrap_known_pc_guards(tree, out_pcs, entry_pc=0):
-    """Unwrap `("guard", g, body)` nodes whenever abstract interpretation proves `%pc == g` on all incoming paths.
-
-    In `cfg_structure.structure`, every post-dominating join block `g` after a conditional diamond or loop is
-    still wrapped in `("guard", g, ...)`. Because `%pc` is a Function-scope variable in SPIR-V, LLVM/NVVM's
-    `SROA`/`Mem2Reg` promotes `%pc` at the same time as `%vgpr[0..255]` and `%sgpr[0..127]`, before `%pc == g`
-    can be constant-folded, forcing ~384 redundant Phi nodes at every spine guard merge block (and preventing
-    early block merging across convergent `OpControlBarrier`s).
-
-    Tracks the exact finite set `cur_pc` of values `%pc` can hold before each item in `tree`:
-      - `("block", b)` overwrites `%pc` with `out_pcs[b]`.
-      - `("guard", g, gbody)`: if `cur_pc == {g}`, `%pc == g` is tautologically true on every path reaching
-        this item, so the guard unwraps in place; otherwise `gbody` is processed starting from `{g}` and its
-        exit `%pc` set merges with the skip path `cur_pc - {g}`.
-      - `("loop", h, lbody)`: `lbody` is processed starting from `cur_pc | {h}`; exiting the loop proves
-        `%pc != h`, leaving `pc_after_lbody - {h}`.
-    """
-    root_out = []
-    stack = [[collections.deque(tree), root_out, {entry_pc}, None]]
-    while stack:
-        frame = stack[-1]
-        q, dst, cur_pc, tag = frame
-        if not q:
-            if len(stack) > 1 and tag[0] == "guard" and len(cur_pc) == 1:
-                nxt_g = next(iter(cur_pc))
-                skip_pc = tag[3]
-                parent_q = stack[-2][0]
-                if parent_q and parent_q[0][0] == "guard" and parent_q[0][1] == nxt_g and nxt_g not in skip_pc:
-                    for child in reversed(parent_q.popleft()[2]):
-                        q.appendleft(child)
-                    continue
-            stack.pop()
-            if not stack:
-                break
-            parent = stack[-1]
-            if tag[0] == "guard":
-                _, g, child_dst, skip_pc = tag
-                parent[1].append(("guard", g, child_dst))
-                parent[2] = skip_pc | cur_pc
-            else:
-                _, h, child_dst = tag
-                parent[1].append(("loop", h, child_dst))
-                parent[2] = cur_pc - {h}
-            continue
-        it = q.popleft()
-        kind = it[0]
-        if kind == "block":
-            b = it[1]
-            dst.append(it)
-            frame[2] = set(out_pcs[b])
-        elif kind == "guard":
-            g, gbody = it[1], it[2]
-            if cur_pc == {g}:
-                for child in reversed(gbody):
-                    q.appendleft(child)
-            else:
-                child_dst = []
-                skip_pc = set(cur_pc)
-                skip_pc.discard(g)
-                stack.append([collections.deque(gbody), child_dst, {g}, ("guard", g, child_dst, skip_pc)])
-        else:
-            h, lbody = it[1], it[2]
-            child_dst = []
-            stack.append([collections.deque(lbody), child_dst, set(cur_pc) | {h}, ("loop", h, child_dst)])
-    return root_out
+    """Unwrap `("guard", g, body)` nodes whenever abstract interpretation proves `%pc == g` on all incoming paths."""
+    return cfg_structure.unwrap_known_pc_guards(tree, out_pcs, entry_pc=entry_pc)
 
 
 def _region_has_cycle(region, succ):
@@ -1328,7 +1421,8 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
         if region_may_w & scalar_live_in[skip]:
             continue
         # EXEC must stay inactive for any lane that skipped R.
-        if not _exec_writes_stay_inactive(region, blk_info, scalar_live_in[run]):
+        if not _exec_writes_stay_inactive(region, blk_info, scalar_live_in[run],
+                                          run=run, succ=succ, active_blocks=active_blocks):
             continue
         candidates.append((len(region), b, run, skip, frozenset(region),
                            (mem_ops, mem_r, mem_w, lds_ops, lds_r, lds_w)))

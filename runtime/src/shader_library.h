@@ -246,7 +246,7 @@ inline ZlibError inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, co
         if (d < 0 || d >= 30) return ZlibError::data;
         const std::size_t distance = std::size_t(distance_base[d]) + in.bits(distance_extra[d]);
         if (in.failed() || distance > out.size()) return ZlibError::data;
-        if (out.size() + length > limit) return ZlibError::limit;
+        if (out.size() > limit || length > limit - out.size()) return ZlibError::limit;
         const std::size_t from = out.size() - distance;
         for (std::size_t i = 0; i < length; ++i) out.push_back(out[from + i]);
     }
@@ -284,7 +284,7 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
                 if (!reader.byte(x)) return fail(ZlibError::data);
             const unsigned length = b[0] | (b[1] << 8), complement = b[2] | (b[3] << 8);
             if (length != (~complement & 0xffff)) return fail(ZlibError::data);
-            if (out.size() + length > limit) return fail(ZlibError::limit);
+            if (out.size() > limit || length > limit - out.size()) return fail(ZlibError::limit);
             for (unsigned i = 0; i < length; ++i) {
                 std::uint8_t x;
                 if (!reader.byte(x)) return fail(ZlibError::data);
@@ -349,7 +349,7 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
     }
     // Adler-32, big-endian, after the deflate data's last whole byte.
     const std::size_t at = 2 + reader.position();
-    if (at + 4 > in.size()) return fail(ZlibError::data);
+    if (at > in.size() || in.size() - at < 4) return fail(ZlibError::data);
     std::uint32_t a = 1, b = 0;
     for (const std::uint8_t x : out) {
         a = (a + x) % 65521;
@@ -843,16 +843,18 @@ struct ShaderEntry {
 
 class ShaderLibrary {
 public:
-    // Reads <dir>/index.json, then the indexes of the programs make_game.py translates from the package's DLLs, each
-    // when it is there:
+    // Reads <dir>/index.json, then the indexes of the programs make_game.py translates from the package's PE images,
+    // each when it is there:
     //   - <dir>/fspx/index.json, the FidelityFX DLL's FSPX programs, entries named "fspx/<name>" (docs/fspx.md);
     //   - <dir>/bvh/index.json, XboxBvhBuilder.dll's FSSM programs, entries named "bvh/<name>" and found by
     //     fssm_sha256 like the game's own shaders (docs/embedded_shaders.md);
     //   - <dir>/library/index.json, the compute programs of the pipeline library in shaders.rpf, which the executable
     //     creates with slot 67; entries named "library/<name>" and found by fspx_code_sha256 and fspx_state_sha256
-    //     like the FSPX ones (docs/shader_library.md).
-    // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. Both folders
-    // are optional: a missing or unreadable index there leaves the main one, and the other folder's, loaded.
+    //     like the FSPX ones (docs/shader_library.md);
+    //   - <dir>/exe/index.json, game_scarlett_master.exe's embedded FSSM programs, entries named "exe/<name>" and
+    //     found by fssm_sha256 like the game's own shaders (docs/embedded_shaders.md).
+    // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. The folders
+    // are optional: a missing or unreadable index there leaves the main one, and the other folders', loaded.
     bool load(const std::filesystem::path& dir, std::string* error = nullptr) {
         const auto fail = [&](const std::string& why) {
             if (error) *error = why;
@@ -870,7 +872,7 @@ public:
         } catch (...) {
             return fail("index.json could not be read");
         }
-        for (const char* sub_folder : {"fspx", "bvh", "library"}) {
+        for (const char* sub_folder : {"fspx", "bvh", "library", "exe"}) {
             try {
                 const auto ignore = [](const std::string&) { return false; };
                 const std::filesystem::path sub = folder / sub_folder;
@@ -893,6 +895,9 @@ public:
     // Entries loaded from <dir>/bvh/index.json. No RPF container reaches these either: XboxBvhBuilder.dll passes
     // their containers itself.
     std::size_t bvh_size() const { return bvh_count_; }
+    // Entries loaded from <dir>/exe/index.json. No RPF container reaches these either: game_scarlett_master.exe
+    // embeds their containers itself.
+    std::size_t exe_size() const { return exe_count_; }
 
     // The first entry for this program. Two containers can hold the same FSSM program with different input
     // signatures; `candidates` returns all of them.
@@ -1000,6 +1005,7 @@ private:
             count_ = 0;
             fspx_count_ = 0;
             bvh_count_ = 0;
+            exe_count_ = 0;
         }
         for (const auto& [name, meta] : root.object) {
             const Json* hash = meta.find("fssm_sha256");
@@ -1045,9 +1051,20 @@ private:
             if (const Json* fh = meta.find("f16_halves"); fh && fh->kind == Json::Kind::object) {
                 for (const auto& [key, val] : fh->object) {
                     if (key.empty() || val.kind != Json::Kind::array || val.array.size() != 2) continue;
-                    char* end = nullptr;
-                    const unsigned long param = std::strtoul(key.c_str(), &end, 10);
-                    if (!end || *end != '\0') continue;
+                    std::uint64_t param = 0;
+                    bool ok = true;
+                    for (const char c : key) {
+                        if (c < '0' || c > '9') {
+                            ok = false;
+                            break;
+                        }
+                        param = param * 10u + std::uint64_t(c - '0');
+                        if (param > UINT32_MAX) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (!ok) continue;
                     e.f16_halves[std::uint32_t(param)] = {u32(&val.array[0]), u32(&val.array[1])};
                 }
             }
@@ -1065,6 +1082,7 @@ private:
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
             if (by_fspx && (prefix == "fspx/" || prefix == "library/")) ++fspx_count_;
             if (prefix == "bvh/") ++bvh_count_;
+            if (prefix == "exe/") ++exe_count_;
             ++count_;
         }
         return true;
@@ -1074,6 +1092,7 @@ private:
     std::size_t count_ = 0;
     std::size_t fspx_count_ = 0;
     std::size_t bvh_count_ = 0;
+    std::size_t exe_count_ = 0;
     // Entries by (stage, fssm_sha256) and by (stage, fspx_code_sha256), in index order.
     Entries entries_;
     Entries fspx_entries_;

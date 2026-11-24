@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -17,6 +18,29 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import make_game  # noqa: E402
 import ttpf_assets  # noqa: E402
+
+
+def meet(directory, name, count, seconds=8):
+    """Return True once `count` workers (threads or processes) have all called meet in directory."""
+    open(os.path.join(directory, name), "w").close()
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if len(os.listdir(directory)) >= count:
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def follow_that_needs_company(source, pool_dir, manifest, settings):
+    # Module level so a worker process can pick it up. Finishes with a result only if the other pool's call runs now.
+    meeting = os.path.join(os.path.dirname(os.path.dirname(pool_dir)), "meeting")
+    if not meet(meeting, os.path.basename(pool_dir), 2):
+        raise RuntimeError("pool follow-up ran alone")
+    return (1, 0)
+
+
+def follow_that_does_nothing(source, pool_dir, manifest, settings):
+    return (0, 0)
 
 
 class AssetsPoolsTest(unittest.TestCase):
@@ -155,6 +179,85 @@ class AssetsPoolsTest(unittest.TestCase):
         self.assertIn("ERROR:", stderr.getvalue())
         self.assertIn("bcpack-calibration.json", stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
+
+
+    def two_pools(self):
+        self.pool("data/ttdb/one.ttpf")
+        self.pool("data/ttdb/two.ttpf", 101)
+        os.makedirs(os.path.join(self.out, "meeting"))
+
+    def test_exports_run_side_by_side_within_the_jobs_budget(self):
+        self.two_pools()
+        seen = []
+
+        def fake_run(cmd, *a, **k):
+            # Only returns if the other pool's export is running now.
+            if not meet(os.path.join(self.out, "meeting"), os.path.basename(cmd[2]), 2):
+                raise AssertionError("export ran alone")
+            src, dest = cmd[2], cmd[3]
+            pool_dir = os.path.join(dest, os.path.splitext(os.path.basename(src))[0])
+            os.makedirs(pool_dir, exist_ok=True)
+            with open(os.path.join(pool_dir, "manifest.json"), "w") as f:
+                json.dump({"Count": 0, "Textures": []}, f)
+            seen.append(cmd)
+
+        digest = make_game.decoder_digest()
+        with mock.patch.object(make_game, "rpf9dump", lambda w: "rpf9dump"), \
+             mock.patch.object(make_game, "run", fake_run), \
+             mock.patch.object(make_game.shutil, "which", lambda n: None), \
+             mock.patch.object(make_game, "log", lambda *a: None), \
+             mock.patch.object(ttpf_assets, "complete_pool", follow_that_does_nothing):
+            make_game.assets(self.game, self.work, False, 4, dump_jobs=4)
+        self.assertEqual(len(seen), 2)
+        # 4 jobs over 2 side-by-side exports: 2 each, never more than the budget in total.
+        for cmd in seen:
+            self.assertEqual(cmd[cmd.index("--jobs") + 1], "2")
+        self.assertEqual(digest, make_game.decoder_digest())
+
+    def test_one_job_runs_exports_one_at_a_time_as_before(self):
+        self.two_pools()
+        calls = self.run_assets()
+        self.assertEqual([os.path.basename(src) for src, _ in calls], ["one.ttpf", "two.ttpf"])
+
+    def test_pool_follow_ups_run_side_by_side_and_log_in_pool_order(self):
+        self.two_pools()
+        logged = []
+        digest = make_game.decoder_digest()
+
+        def fake_run(cmd, *a, **k):
+            src, dest = cmd[2], cmd[3]
+            pool_dir = os.path.join(dest, os.path.splitext(os.path.basename(src))[0])
+            os.makedirs(pool_dir, exist_ok=True)
+            with open(os.path.join(pool_dir, "manifest.json"), "w") as f:
+                json.dump({"Count": 0, "Textures": []}, f)
+
+        with mock.patch.object(make_game, "rpf9dump", lambda w: "rpf9dump"), \
+             mock.patch.object(make_game, "run", fake_run), \
+             mock.patch.object(make_game.shutil, "which", lambda n: None), \
+             mock.patch.object(make_game, "log", lambda *a: logged.append(a[0])), \
+             mock.patch.object(ttpf_assets, "complete_pool", follow_that_needs_company):
+            make_game.assets(self.game, self.work, False, 2)
+        written = [line for line in logged if "full BCPack DDS written" in line]
+        self.assertEqual(len(written), 2)
+        self.assertIn("one:", written[0])
+        self.assertIn("two:", written[1])
+        self.assertEqual(digest, make_game.decoder_digest())
+
+    def test_the_first_failure_in_pool_order_is_the_one_reported(self):
+        self.two_pools()
+
+        def fake_run(cmd, *a, **k):
+            pass   # no manifest published
+
+        stderr = io.StringIO()
+        with mock.patch.object(make_game, "rpf9dump", lambda w: "rpf9dump"), \
+             mock.patch.object(make_game, "run", fake_run), \
+             mock.patch.object(make_game.shutil, "which", lambda n: None), \
+             mock.patch.object(make_game, "log", lambda *a: None), \
+             contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+            make_game.assets(self.game, self.work, False, 2)
+        self.assertIn(os.path.join("ttpf", "one"), stderr.getvalue())
+        self.assertNotIn(os.path.join("ttpf", "two"), stderr.getvalue())
 
 
 if __name__ == "__main__":
