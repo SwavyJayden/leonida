@@ -1037,70 +1037,8 @@ def _drop_tree_block(tree, b):
 
 
 def _unwrap_known_pc_guards(tree, out_pcs, entry_pc=0):
-    """Unwrap `("guard", g, body)` nodes whenever abstract interpretation proves `%pc == g` on all incoming paths.
-
-    In `cfg_structure.structure`, every post-dominating join block `g` after a conditional diamond or loop is
-    still wrapped in `("guard", g, ...)`. Because `%pc` is a Function-scope variable in SPIR-V, LLVM/NVVM's
-    `SROA`/`Mem2Reg` promotes `%pc` at the same time as `%vgpr[0..255]` and `%sgpr[0..127]`, before `%pc == g`
-    can be constant-folded, forcing ~384 redundant Phi nodes at every spine guard merge block (and preventing
-    early block merging across convergent `OpControlBarrier`s).
-
-    Tracks the exact finite set `cur_pc` of values `%pc` can hold before each item in `tree`:
-      - `("block", b)` overwrites `%pc` with `out_pcs[b]`.
-      - `("guard", g, gbody)`: if `cur_pc == {g}`, `%pc == g` is tautologically true on every path reaching
-        this item, so the guard unwraps in place; otherwise `gbody` is processed starting from `{g}` and its
-        exit `%pc` set merges with the skip path `cur_pc - {g}`.
-      - `("loop", h, lbody)`: `lbody` is processed starting from `cur_pc | {h}`; exiting the loop proves
-        `%pc != h`, leaving `pc_after_lbody - {h}`.
-    """
-    root_out = []
-    stack = [[collections.deque(tree), root_out, {entry_pc}, None]]
-    while stack:
-        frame = stack[-1]
-        q, dst, cur_pc, tag = frame
-        if not q:
-            if len(stack) > 1 and tag[0] == "guard" and len(cur_pc) == 1:
-                nxt_g = next(iter(cur_pc))
-                skip_pc = tag[3]
-                parent_q = stack[-2][0]
-                if parent_q and parent_q[0][0] == "guard" and parent_q[0][1] == nxt_g and nxt_g not in skip_pc:
-                    for child in reversed(parent_q.popleft()[2]):
-                        q.appendleft(child)
-                    continue
-            stack.pop()
-            if not stack:
-                break
-            parent = stack[-1]
-            if tag[0] == "guard":
-                _, g, child_dst, skip_pc = tag
-                parent[1].append(("guard", g, child_dst))
-                parent[2] = skip_pc | cur_pc
-            else:
-                _, h, child_dst = tag
-                parent[1].append(("loop", h, child_dst))
-                parent[2] = cur_pc - {h}
-            continue
-        it = q.popleft()
-        kind = it[0]
-        if kind == "block":
-            b = it[1]
-            dst.append(it)
-            frame[2] = set(out_pcs[b])
-        elif kind == "guard":
-            g, gbody = it[1], it[2]
-            if cur_pc == {g}:
-                for child in reversed(gbody):
-                    q.appendleft(child)
-            else:
-                child_dst = []
-                skip_pc = set(cur_pc)
-                skip_pc.discard(g)
-                stack.append([collections.deque(gbody), child_dst, {g}, ("guard", g, child_dst, skip_pc)])
-        else:
-            h, lbody = it[1], it[2]
-            child_dst = []
-            stack.append([collections.deque(lbody), child_dst, set(cur_pc) | {h}, ("loop", h, child_dst)])
-    return root_out
+    """Unwrap `("guard", g, body)` nodes whenever abstract interpretation proves `%pc == g` on all incoming paths."""
+    return cfg_structure.unwrap_known_pc_guards(tree, out_pcs, entry_pc=entry_pc)
 
 
 def _region_has_cycle(region, succ):

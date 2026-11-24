@@ -18035,6 +18035,8 @@ def capped_tree(succ):
     tree = cfg_structure.structure(succ) if STRUCTURED else None
     if tree is None:
         return None, None
+    out_pcs = {b: (set(succ[b]) if succ[b] else {cfg_structure.END}) for b in range(len(succ))}
+    tree = cfg_structure.unwrap_known_pc_guards(tree, out_pcs)
     nesting = cfg_structure.depth(tree)
     if MAX_STRUCTURED_DEPTH and nesting > MAX_STRUCTURED_DEPTH:
         return None, nesting                         # too deep to validate cheaply: use the flat form
