@@ -267,6 +267,8 @@ def query(*, stage_caps=False) -> dict:
         device_filter = os.environ.get("LEONIDA_VK_DEVICE", "")
         wanted = device_filter.lower()
         chosen = None
+        chosen_d = None
+        chosen_extensions = None
         chosen_rank = -1
         for d in devs:
             d = ctypes.c_void_p(d)
@@ -330,13 +332,13 @@ def query(*, stage_caps=False) -> dict:
             rank = device_rank(dtype, vendor_id)
             if rank > chosen_rank:
                 chosen_rank = rank
+                chosen_d = d
+                chosen_extensions = None if core13 else extensions
                 chosen = (dev_name,
                           subgroup.subgroupSize, subgroup.supportedStages, sg.minSubgroupSize, sg.maxSubgroupSize,
                           sg.requiredSubgroupSizeStages, sg.maxComputeWorkgroupSubgroups,
                           sgc,
-                          # The feature counts only with its extension listed (RADV sets it on gfx90c without one).
-                          bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK
-                          and FRAGMENT_SHADER_BARYCENTRIC_EXTENSION in device_extensions(vk, d),
+                          bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
                           int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
                           int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16))
@@ -349,6 +351,11 @@ def query(*, stage_caps=False) -> dict:
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
         (name, subgroup_size, supported_stages, lo, hi, required_stages, max_workgroup_subgroups,
          sgc, per_vertex, max_push_constants_size, vendor, device, driver) = chosen
+        if per_vertex:
+            # The feature counts only with its extension listed (RADV sets it on gfx90c without one).
+            # Reuse the Vulkan 1.2 extension set already fetched above, and query Vulkan 1.3 devices only once chosen.
+            exts = device_extensions(vk, chosen_d) if chosen_extensions is None else chosen_extensions
+            per_vertex = FRAGMENT_SHADER_BARYCENTRIC_EXTENSION in exts
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
