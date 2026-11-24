@@ -977,6 +977,34 @@ void test_release_mapped_window(const PhysicalApi& api) {
     }
     check(api.free_pages(2, pages) == TRUE, "M8: free the pages");
     check(title_free(nullptr, 0, MEM_RELEASE) == FALSE, "M8: other calls pass through to the host");
+
+    // Review of #417: a release after a partial commit frees the whole original reservation, as on Win32, whether the
+    // committed page is the first, an interior or the last one (the commit cut it out of the window's bookkeeping).
+    struct Case {
+        int committed_page;
+        const char* what;
+    } const cases[] = {{0, "M8: release after committing the first page frees all 4 pages"},
+                       {1, "M8: release after committing an interior page frees all 4 pages"},
+                       {3, "M8: release after committing the last page frees all 4 pages"}};
+    for (const Case& c : cases) {
+        auto* const reserved = static_cast<uint8_t*>(
+            api.virtual_alloc(nullptr, 4 * kPage64k, MEM_RESERVE | kXmem64kPages, 0x27, PAGE_READWRITE));
+        if (!reserved) {
+            check(false, c.what);
+            continue;
+        }
+        auto* const page = static_cast<uint8_t*>(api.virtual_alloc(reserved + c.committed_page * kPage64k, kPage64k,
+                                                                   MEM_COMMIT | kXmem64kPages, 0x27, PAGE_READWRITE));
+        if (page) page[0] = 0x5a;
+        const BOOL released = title_free(reserved, 0, MEM_RELEASE);
+        int freed = 0;
+        for (int i = 0; i < 4; ++i) {
+            MEMORY_BASIC_INFORMATION info{};
+            freed += VirtualQuery(reserved + i * kPage64k, &info, sizeof info) && info.State == MEM_FREE;
+        }
+        if (freed != 4) std::fprintf(stderr, "  committed page %d: %d of 4 pages free\n", c.committed_page, freed);
+        check(page != nullptr && released == TRUE && freed == 4, c.what);
+    }
 }
 
 // Review B8: a title's VirtualAlloc with the console page-size bits (2 MiB: MEM_LARGE_PAGES; 64 KiB: | MEM_PHYSICAL)

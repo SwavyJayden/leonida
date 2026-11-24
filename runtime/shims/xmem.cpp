@@ -263,6 +263,10 @@ constexpr uint64_t kPageSlotLimit = uint64_t{1} << 21;
 
 std::mutex g_phys_mutex;
 std::map<uintptr_t, Window> g_windows;              // base -> window
+// base -> size of each window as it was reserved. A commit cuts the committed range out of g_windows (it can no longer
+// take a page), but VirtualFree(base, 0, MEM_RELEASE) still releases the whole original reservation, committed parts
+// included (review of #417: a release after a partial commit left the rest behind).
+std::map<uintptr_t, SIZE_T> g_reservations;
 std::unordered_map<uint64_t, PhysicalPage> g_pages;  // page number -> backing
 std::vector<uint64_t> g_free_slots;
 uint64_t g_next_slot = 1;
@@ -301,6 +305,10 @@ void record_window(void* base, SIZE_T size, DWORD protect) {
     }
     while (it != g_windows.end() && it->first < end) it = g_windows.erase(it);
     g_windows[start] = Window{size, protect};
+    auto r = g_reservations.lower_bound(start);
+    if (r != g_reservations.begin() && std::prev(r)->first + std::prev(r)->second > start) r = std::prev(r);
+    while (r != g_reservations.end() && r->first < end) r = g_reservations.erase(r);
+    g_reservations[start] = size;
 }
 
 // With g_phys_mutex held: the window holding [address, address + bytes), if one does.
@@ -882,13 +890,15 @@ LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_ty
 // Review M8: once pages are mapped into a physical-page window it is many host allocations (a view or a placeholder
 // per 64 KiB page), so the title's VirtualFree(base, 0, MEM_RELEASE) of the window would free only the first and
 // leave g_mapped naming views at addresses the host hands out again. A release at a window's base unmaps its pages,
-// releases every piece and forgets the window. Every other call passes through.
+// releases every piece and forgets the window. The extent is the window as it was reserved (g_reservations), not what
+// is left of it in g_windows after commits: pages committed into it are part of the reservation and go with it, as
+// on Win32. Every other call passes through.
 BOOL WINAPI TitleVirtualFree(LPVOID address, SIZE_T size, DWORD free_type) {
     if (address && size == 0 && free_type == MEM_RELEASE && placeholder_api().available()) {
         const std::lock_guard lock(g_phys_mutex);
-        const auto it = g_windows.find(reinterpret_cast<uintptr_t>(address));
-        if (it != g_windows.end()) {
-            const uintptr_t start = it->first, end = start + it->second.size;
+        const auto it = g_reservations.find(reinterpret_cast<uintptr_t>(address));
+        if (it != g_reservations.end()) {
+            const uintptr_t start = it->first, end = start + it->second;
             for (uintptr_t page = start; page < end; page += kPhysicalPageSize) {
                 if (!unmap_page(page)) return FALSE;
             }
@@ -902,7 +912,8 @@ BOOL WINAPI TitleVirtualFree(LPVOID address, SIZE_T size, DWORD free_type) {
                 }
                 cursor = region_end < end ? region_end : end;
             }
-            g_windows.erase(start);
+            forget_window_range(start, end);
+            g_reservations.erase(it);
             return TRUE;
         }
     }
