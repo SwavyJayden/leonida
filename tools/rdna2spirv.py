@@ -6592,8 +6592,13 @@ class Gen:
                     self.emit(f"{g} = OpFMul %float {v} {c}")
                     v = g
         if "clamp" in mods:
-            g = self.tmp()
-            self.emit(f"{g} = OpExtInst %float %glsl FClamp {v} %f0 %f1")
+            # The game's MODE has DX10_CLAMP=1, so the clamp bit turns a NaN result into +0
+            # (docs/shader_validation.md). GLSL.std.450 FClamp leaves a NaN operand undefined,
+            # so select +0 for a NaN first, as the div_fixup and cvt_pknorm clamps do.
+            nan, safe, g = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{nan} = OpIsNan %bool {v}")
+            self.emit(f"{safe} = OpSelect %float {nan} %f0 {v}")
+            self.emit(f"{g} = OpExtInst %float %glsl FClamp {safe} %f0 %f1")
             return g
         return v
 
