@@ -39,11 +39,25 @@ void WINAPI on_app_state(BOOLEAN quiesced, PVOID context) {
     }
 }
 
+using UnregFn = void(WINAPI*)(PVOID);
+UnregFn g_unreg = nullptr;
+
+// Context for a callback that unregisters `target` (another registration, or its own handle) when it runs.
+struct UnregProbe {
+    int calls = 0;
+    PVOID target = nullptr;
+};
+
+void WINAPI on_app_state_unregister(BOOLEAN, PVOID context) {
+    auto* probe = static_cast<UnregProbe*>(context);
+    ++probe->calls;
+    if (probe->target) g_unreg(probe->target);
+}
+
 }  // namespace
 
 int main() {
     using RegFn = ULONG(WINAPI*)(void(WINAPI*)(BOOLEAN, PVOID), PVOID, PVOID*);
-    using UnregFn = void(WINAPI*)(PVOID);
     using CreateExWFn = HWND(WINAPI*)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE,
                                       LPVOID);
 
@@ -60,6 +74,7 @@ int main() {
           "CreateWindowExW resolves through user32 and ext-ms-win-rtcore-ntuser-window");
     check(!rt::shims::owns_dll("user32.dll"), "user32.dll stays partially overridden");
     if (!reg || !unreg || !create_w) return 1;
+    g_unreg = unreg;
 
     // 1. Parameter validation and registration / unregistration / suspend dispatch.
     PVOID handle_a = nullptr, handle_b = nullptr;
@@ -82,6 +97,33 @@ int main() {
     unreg(handle_b);
     check(rt::lifecycle::registered_notification_count() == 0, "all registrations removed");
 
+    // 1b. A callback that unregisters a later registration: the later one is skipped during the same dispatch.
+    PVOID handle_later = nullptr, handle_first = nullptr;
+    SuspendProbe later_probe{};
+    UnregProbe first_probe{};
+    check(reg(&on_app_state_unregister, &first_probe, &handle_first) == ERROR_SUCCESS,
+          "register unregistering callback");
+    check(reg(&on_app_state, &later_probe, &handle_later) == ERROR_SUCCESS, "register later callback");
+    first_probe.target = handle_later;
+    rt::lifecycle::invoke_suspend_callbacks_for_test();
+    check(first_probe.calls == 1 && later_probe.calls == 0,
+          "unregistered later callback does not run in the same dispatch");
+    check(rt::lifecycle::registered_notification_count() == 1, "later registration is gone, the first remains");
+    unreg(handle_first);
+    check(rt::lifecycle::registered_notification_count() == 0, "dispatch test registrations removed");
+
+    // 1c. A callback that unregisters itself: no deadlock, it runs once, and it is gone afterwards.
+    PVOID handle_self = nullptr;
+    UnregProbe self_probe{};
+    check(reg(&on_app_state_unregister, &self_probe, &handle_self) == ERROR_SUCCESS,
+          "register self-unregistering callback");
+    self_probe.target = handle_self;
+    rt::lifecycle::invoke_suspend_callbacks_for_test();
+    check(self_probe.calls == 1 && rt::lifecycle::registered_notification_count() == 0,
+          "self-unregistering callback runs once and is removed without deadlock");
+    rt::lifecycle::invoke_suspend_callbacks_for_test();
+    check(self_probe.calls == 1, "removed self-unregistering callback is not called again");
+
     // 2. Oversized window scaling math.
     const RECT area{0, 0, 1920, 1040};
     const auto fitted_4k = rt::lifecycle::fit_window_to_area(area, 3840, 2160);
@@ -102,6 +144,31 @@ int main() {
         check(n == 5 && std::wcscmp(buf, L"after") == 0, "subclassed window forwards WM_SETTEXT/WM_GETTEXT");
         check(GetPropW(hwnd, L"leonida.title.wndproc") != nullptr, "original WNDPROC property installed");
         DestroyWindow(hwnd);
+    }
+
+    // 4. Only the title's first top-level window is hooked; a window is released when it is destroyed. Hidden windows
+    // only: no SC_CLOSE is posted.
+    const wchar_t* kHookProp = L"leonida.title.wndproc";
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"LeonidaLifecycleTest";
+    RegisterClassExW(&wc);
+    const DWORD kMain = WS_OVERLAPPEDWINDOW;
+    const wchar_t* kClass = L"LeonidaLifecycleTest";
+    HWND main_win = create_w(0, kClass, L"main", kMain, 0, 0, 64, 64, nullptr, nullptr, nullptr, nullptr);
+    check(main_win && GetPropW(main_win, kHookProp) != nullptr, "first parentless window is the hooked title window");
+    HWND second = create_w(0, kClass, L"second", kMain, 0, 0, 64, 64, nullptr, nullptr, nullptr, nullptr);
+    check(second && GetPropW(second, kHookProp) == nullptr, "a second parentless window is not hooked");
+    HWND tool = create_w(WS_EX_TOOLWINDOW, L"LeonidaLifecycleTest", L"tool", WS_POPUP, 0, 0, 64, 64, nullptr, nullptr,
+                         nullptr, nullptr);
+    check(tool && GetPropW(tool, kHookProp) == nullptr, "a WS_EX_TOOLWINDOW window is not hooked");
+    if (main_win) DestroyWindow(main_win);
+    HWND again = create_w(0, kClass, L"again", kMain, 0, 0, 64, 64, nullptr, nullptr, nullptr, nullptr);
+    check(again && GetPropW(again, kHookProp) != nullptr, "after the title window is destroyed, a new one is hooked");
+    for (HWND w : {second, tool, again}) {
+        if (w) DestroyWindow(w);
     }
 
     std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);
