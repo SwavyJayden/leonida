@@ -1008,7 +1008,7 @@ The compute path, end to end:
       halves of a wave64) passes natively. For the translated SPIR-V 1.5 modules, made without
       `ALLOW_VARYING_SUBGROUP_SIZE`, the specification fixes `SubgroupSize` at that default ("Varying Subgroup
       Size"); only the driver's default could change. So wave64 pixel and mesh shaders work at the default
-      (`device_default`; the layer has no mesh PSO yet), and a wave32 pixel shader is `unavailable`: two of its
+      (`device_default`), and a wave32 pixel shader is `unavailable`: two of its
       waves share a subgroup. `ps_bitmask_perm` shows it: lanes 0-31 exact, while the
       other 2,048 of 4,096 pixels read `v_mbcnt_lo` = 32 instead of their lane (the fixture's check judges lanes
       0-31 only). Of the 1,127 wave32 pixel shaders in the corpus, 1,010 contain a `v_readlane`/`v_writelane`/
@@ -1038,7 +1038,7 @@ The compute path, end to end:
     properties and the resulting create-info chain; `d3d12_subgroup_test` (GPU) runs `cs_w64x_readlane` natively
     and with `--wave64-emulate`, and `cs_wqm_w32`, through D3D12 PSOs and compares the read-back words.
 
-Known gaps: tessellation and mesh pipelines, stream output, several viewports; subgroup size for mesh pipelines (the decision covers them, no mesh PSO exists to chain it into), and for wave64 vertex, geometry and, on a GPU that cannot require 64 for pixel shaders (NVIDIA), pixel shaders, which have no emulation (SHADER-10);
+Known gaps: tessellation pipelines, stream output, several viewports; subgroup size for wave64 vertex, geometry and, on a GPU that cannot require 64 for pixel shaders (NVIDIA), pixel shaders, which have no emulation (SHADER-10);
 the game's present entry point (DXGI factory/swapchain or `PresentX`; the presenter above is what either
 calls), HDR and fullscreen; buffer and constant-buffer views (UAV clears read the descriptor bytes, so they do
 not wait on view creation), typeless volume RTVs, depth-stencil resolves to a destination offset other than
