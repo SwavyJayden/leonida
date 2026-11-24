@@ -610,6 +610,8 @@ if(BUILD_TESTING)
     add_executable(tiny_ga_tls test/fixtures/tiny_ga_tls.cpp)
     target_compile_definitions(tiny_ga_tls PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_ga_tls PRIVATE /W4 /permissive- /utf-8 /GS- /GA)
+    # /GA can remove the _tls_index reference that pulls in the CRT TLS directory.
+    target_link_options(tiny_ga_tls PRIVATE /INCLUDE:_tls_used)
     set_target_properties(tiny_ga_tls PROPERTIES
       OUTPUT_NAME tiny_ga_tls
       RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
