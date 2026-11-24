@@ -139,6 +139,75 @@ class Generation(unittest.TestCase):
         self.assertIn(16, {m.line for m in sm.mutants_for(source, first, last)})   # still code: mutated
 
 
+LOGIC = textwrap.dedent('''\
+    class Gen:
+        def op(self, op, a):
+            if op == "v_other":
+                pass
+            elif op in ("v_logic",):
+                seen, out = set(), []
+                for r in a:
+                    if r not in seen and r > 3:
+                        out.append(r)
+                    seen.update([r])
+                n = 0
+                n += 1
+                n = len(out)
+                ok = n is None or not out
+                both = ok and n and out
+                flag = True
+                self.emit(f"{t} = OpIAdd %uint {x} {self.cu(0)}")
+                s = "a == b and c in d"   # a comment: x == y and not z
+                return [x for x in out if x in seen]
+    ''').split("\n")
+
+
+class PythonLogic(unittest.TestCase):
+    """The analysis code around the emission: comparisons, and/or, not, True/False, silent statements."""
+
+    def setUp(self):
+        self.first, self.last = sm.find_branch(LOGIC, "v_logic")
+        self.mutants = sm.mutants_for(LOGIC, self.first, self.last)
+
+    def labels(self, text):
+        line = next(i for i, s in enumerate(LOGIC) if text in s) + 1
+        return sorted(m.label for m in self.mutants if m.line == line)
+
+    def test_comparisons_and_boolean_operators(self):
+        self.assertEqual(self.labels("if r not in seen"), ["> -> >=", "and -> or", "not in -> in"])
+        self.assertEqual(self.labels("ok = n is None"), ["is -> is not", "not removed", "or -> and"])
+        self.assertEqual(self.labels("both = ok"), ["and -> or #1", "and -> or #2"])
+        self.assertEqual(self.labels("flag = True"), ["True -> False"])
+
+    def test_silent_statements_are_removed(self):
+        for text in ("out.append(r)", "seen.update([r])", "n += 1", "n = len(out)"):
+            with self.subTest(statement=text):
+                self.assertEqual(self.labels(text), ["statement removed"])
+        removed = next(m for m in self.mutants if "out.append(r)" in m.old)
+        self.assertEqual(removed.new, removed.old[:len(removed.old) - len(removed.old.lstrip())] + "pass")
+
+    def test_first_assignments_and_compound_lines_stay(self):
+        # Removing a first assignment is only a NameError; `for`, `return` and the emit are not simple statements.
+        self.assertEqual(self.labels("seen, out = set()"), [])
+        self.assertEqual(self.labels("n = 0"), [])
+        self.assertEqual(self.labels("for r in a"), [])
+
+    def test_strings_comments_emit_and_branch_condition_are_left_alone(self):
+        self.assertEqual(self.labels('s = "a == b'), [])
+        self.assertEqual(self.labels("self.emit("), ["OpIAdd -> OpISub", "self.cu(0) -> self.cu(1)"])
+        self.assertEqual(self.labels('elif op in ("v_logic",)'), [])
+
+    def test_the_in_of_a_comprehension_loop_stays(self):
+        self.assertEqual(self.labels("return [x for x in out"), ["in -> not in"])
+
+    def test_every_mutant_still_compiles(self):
+        for m in self.mutants:
+            mutated = list(LOGIC)
+            mutated[m.line - 1] = m.new
+            with self.subTest(line=m.line, label=m.label):
+                compile("\n".join(mutated), "<mutant>", "exec")
+
+
 class Tables(unittest.TestCase):
     def test_entry_takes_the_other_values_of_its_table(self):
         labels = [m.label for m in sm.table_mutants(SOURCE, "v_a")]
