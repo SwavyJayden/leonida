@@ -1753,6 +1753,58 @@ class StructuredEmulationTests(unittest.TestCase):
         self.assertEqual(plan["dirty_in"][3], frozenset({("mem", "r")}))
         self.assertEqual(plan["dirty_in"][4], frozenset({("mem", "r")}))
 
+    def test_flow_sensitive_reused_scratch_saveexec_folds_without_barriers(self):
+        """Nested EXECZ region reusing s[40:41] via s_or/s_xor -1 before s_and_saveexec_b64 folds with 0 barriers."""
+        # Outer EXECZ keeps lanes with (lane & 1) == 0 active.
+        # Inside, s[40:41] is first computed with s_or_b64 + s_xor_b64 -1 (non-zero for inactive lanes),
+        # then overwritten with old EXEC by s_and_saveexec_b64 s[40:41], s[40:41], followed by an inner
+        # EXECZ branch that modifies v2 and restores EXEC via s_mov_b64 exec, s[40:41].
+        insns = [
+            ("v_mov_b32_e32 v1, 100", 4),                       # outer result
+            ("v_mov_b32_e32 v2, 200", 4),                       # inner result
+            ("v_and_b32_e32 v3, 1, v0", 4),
+            ("v_and_b32_e32 v4, 2, v0", 4),
+            ("v_and_b32_e32 v5, 4, v0", 4),
+            ("v_cmp_eq_u32_e64 s[4:5], 0, v4", 8),              # bit 1 == 0
+            ("v_cmp_eq_u32_e64 s[6:7], 0, v5", 8),              # bit 2 == 0
+            ("v_cmp_eq_u32_e64 s[8:9], 0, v3", 8),              # bit 0 == 0 (outer guard)
+            ("s_and_saveexec_b64 s[10:11], s[8:9]", 4),
+            ("s_cbranch_execz 9", 4),                           # skip to restore (9 dwords)
+            # --- folded outer region (9 dwords) ---
+            ("v_add_nc_u32_e32 v1, 10, v1", 4),                 # 1 dw: active if bit0==0 -> 110
+            ("s_or_b64 s[40:41], s[4:5], s[6:7]", 4),           # 1 dw: bit1==0 || bit2==0
+            ("s_xor_b64 s[40:41], s[40:41], -1", 4),            # 1 dw: bit1!=0 && bit2!=0 (non-zero on inactive!)
+            ("s_and_saveexec_b64 s[40:41], s[40:41]", 4),       # 1 dw: overwrites s[40:41] with old EXEC (0 on inactive)
+            ("s_cbranch_execz 1", 4),                           # 1 dw: skip 1 dw inner body
+            ("v_add_nc_u32_e32 v2, 33, v2", 4),                 # 1 dw: active if bit0==0 && bit1!=0 && bit2!=0 -> 233
+            ("s_mov_b64 exec, s[40:41]", 4),                    # 1 dw: restore outer EXEC from s[40:41]
+            ("v_add_nc_u32_e32 v1, 5, v1", 4),                  # 1 dw: active if bit0==0 -> 115
+            ("s_nop 0", 4),                                     # 1 dw
+            # --- outer join ---
+            ("s_or_b64 exec, exec, s[10:11]", 4),
+            ("v_add_nc_u32_e32 v3, v1, v2", 4),
+            ("v_lshlrev_b32_e32 v6, 2, v0", 4),
+            ("buffer_store_dword v3, v6, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        for wg in ((64, 1, 1), (128, 1, 1)):
+            spv, gen = _translate_encoded("cs_flow_sens_saveexec", insns, wg, emulate=True)
+            self.assertEqual(_switch_case_count(gen), 1,
+                             f"expected entire nested scratch-saveexec region to fold to 1 superblock (wg={wg})")
+            self.assertEqual(spv.count("OpAtomicOr"), 0,
+                             f"expected 0 wave votes when scratch saveexec region folds (wg={wg})")
+            self.assertNotIn("OpGroupNonUniform", spv)
+            mem, _ = run_emulated_workgroup(spv, wg, push_constants=VSHARP + [0] * 28)
+            for lane in range(wg[0]):
+                v1 = 100
+                v2 = 200
+                if (lane & 1) == 0:
+                    v1 += 10
+                    if (lane & 2) != 0 and (lane & 4) != 0:
+                        v2 += 33
+                    v1 += 5
+                self.assertEqual(mem[lane * 4], v1 + v2, f"wg={wg} lane={lane}")
+
 
 if __name__ == "__main__":
     unittest.main()
