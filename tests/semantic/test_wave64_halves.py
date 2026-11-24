@@ -160,6 +160,13 @@ class Classification(unittest.TestCase):
             "s_and_b64 vcc, exec, s[24:25]", "s_cbranch_vccnz 1",
             "v_add_f32_e32 v6, 1.0, v6"]), "A", [], [])
 
+    def test_a_wqm_restore_keeps_uvote(self):
+        self.tier("ps_a_wqm_restore", ps([
+            "s_mov_b64 s[12:13], exec", "s_wqm_b64 exec, exec",
+            "s_and_b64 exec, exec, s[12:13]",
+            "v_cmp_lt_f32_e64 s[14:15], 0.5, s4", "s_and_b64 vcc, exec, s[14:15]",
+            "s_cbranch_vccz 1", "v_add_f32_e32 v6, 1.0, v6"]), "A", [], [])
+
     def test_a_loop_execnz_no_scalar_state(self):
         self.tier("ps_a_loop", ps([
             "v_and_b32_e32 v4, 3, v0", "v_add_nc_u32_e32 v10, 1, v4", "v_mov_b32_e32 v9, 0",

@@ -335,6 +335,7 @@ class Analysis:
         self.vgprs = sorted({r[1] for b in blocks for ins in b for x in ins["args"]
                              for r in _regs(x) if isinstance(r, tuple) and r[0] == "v"})
         self.tok = {("e",): (None, None, True)}      # exec token -> (parent token, exec tag after, exec is the entry exec)
+        self.wqm_base = {}                           # exec token -> base token it is a WQM superset of
         self.stale = set()
         self.voted = {}                              # block -> mask register key the terminating branch votes on
         self.branch_class = {}
@@ -1283,8 +1284,10 @@ class Analysis:
                 mt = 0
                 for x in srcregs:
                     mt |= self.rd(st, ins, x)
-            if (op == "s_mov_b64" or (op == "s_or_b64" and any(_regs(x) == ["exec"] for x in srcs))) \
-                    and mg and mg[0] == "mask" and (op == "s_mov_b64" or self.ancestor(mg[1], old)):
+            if (op == "s_mov_b64" or (op == "s_or_b64" and any(_regs(x) == ["exec"] for x in srcs))
+                    or (op == "s_and_b64" and any(_regs(x) == ["exec"] for x in srcs)
+                        and mg and mg[0] == "mask" and self.wqm_base.get(old) == mg[1])) \
+                    and mg and mg[0] == "mask" and (op != "s_or_b64" or self.ancestor(mg[1], old)):
                 st["x"] = mg[1]
                 st["xg"], st["f"] = self.tok.get(mg[1], (None, None, False))[1:]
                 st["nz"] = False
@@ -1299,6 +1302,13 @@ class Analysis:
                 self.new_exec(site, old, st, True, mg, mt, violation, idiom)
             elif op == "s_andn2_b64" and len(srcs) == 2 and _regs(srcs[0]) == ["exec"]:
                 self.new_exec(site, old, st, True, None, mt, violation, idiom)
+            elif op == "s_wqm_b64" and len(srcs) == 1 and _regs(srcs[0]) == ["exec"]:
+                st["x"] = site
+                self.tok[site] = (None, None, False)
+                self.wqm_base[site] = self.wqm_base.get(old, old)
+                st["xg"], st["f"] = None, False
+                st["nz"] = False
+                st["ua"] = st["u"]
             else:
                 st["x"] = site
                 self.tok[site] = (None, None, False)
