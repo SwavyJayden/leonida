@@ -3305,7 +3305,17 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   kinds, the resolve plan and the counters the mesh pool may enable on the CPU. `d3d12_mesh_test` resolves a query
   around a vertex, two mesh and a vertex draw, one around a mesh draw and one around the two vertex draws: the vertex
   fields count only the two triangles, the mixed query has the same clipping count as the vertex-only one and more
-  pixel-shader invocations, and the mesh-only query has no clipping count.
+  pixel-shader invocations, and the mesh-only query has no clipping count without the mesh-primitives query below.
+- **The clipping invocations of a mesh segment** (D3D-MESH-CLIPPING-COUNTER). D3D-291 leaves `CInvocations` and
+  `CPrimitives` of a mesh segment at 0, because Vulkan has no clipping counter during a mesh draw. Where the device
+  has the `meshShaderQueries` feature of `VK_EXT_mesh_shader`, the number of primitives the mesh shader emitted
+  comes from a `VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT` query instead: a third pool of the submission, begun
+  and ended with each mesh segment, next to the two the statistics split needs. Its count is copied to field 5 of the
+  segment's record and `statistics_sum.comp` adds it as `CInvocations`; `CPrimitives` stays 0, because Vulkan has
+  no clipped-primitive counter and D3D12's `CPrimitives` is the clipper's output (0 when a triangle is dropped, 2
+  when it is split). The count is not D3D12's number: Vulkan counts a primitive the mesh shader culled with
+  `gl_CullPrimitiveEXT`, which D3D12 does not count, so a mesh segment's `CInvocations` can be higher than D3D12's.
+  Without the feature the field reads 0, as in D3D-291.
 - **Timestamps.** `GetTimestampFrequency` is `1e9 / timestampPeriod` (1 GHz on the test GPU). Every D3D12 queue
   shares one `VkQueue` for now (question 12), so they share one frequency.
 - **Timestamp resolves on MoltenVK.** On Apple GPUs, MoltenVK delays every `vkCmdWriteTimestamp` to the end of
