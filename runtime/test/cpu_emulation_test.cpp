@@ -9,9 +9,12 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <latch>
+#include <thread>
 #include <vector>
 
 #include "cpu_emulation.h"
+#include "../shims/shims.h"
 
 namespace ce = rt::cpu_emulation;
 
@@ -174,6 +177,116 @@ bool run(const Code& code, const void* in, void* out, DWORD* exception) {
 
 const char* path(bool host_has) { return host_has ? "native" : "emulated"; }
 
+void test_xmem_clzero() {
+    using Reserve = void* (WINAPI*)(void*, SIZE_T, DWORD, ULONGLONG, DWORD);
+    using Allocate = BOOL (WINAPI*)(uint64_t, uint64_t*, uint64_t*);
+    using Free = BOOL (WINAPI*)(uint64_t, const uint64_t*);
+    using Map = void* (WINAPI*)(void*, uint64_t, const uint64_t*);
+    const auto reserve = reinterpret_cast<Reserve>(rt::shims::find("xmem.dll", "XMemVirtualAlloc"));
+    const auto allocate = reinterpret_cast<Allocate>(rt::shims::find("xmem.dll", "XMemAllocatePhysicalPages"));
+    const auto free = reinterpret_cast<Free>(rt::shims::find("xmem.dll", "XMemFreePhysicalPages"));
+    const auto map = reinterpret_cast<Map>(rt::shims::find("xmem.dll", "XMemMapPhysicalPages"));
+    check(reserve && allocate && free && map, "find XMem physical-page shims");
+    if (!reserve || !allocate || !free || !map) return;
+
+    constexpr SIZE_T page_size = 0x10000;
+    constexpr DWORD xmem_64k_pages = 0x20400000;
+    auto* const window = static_cast<uint8_t*>(
+        reserve(nullptr, 4 * page_size, MEM_RESERVE | xmem_64k_pages, 0, PAGE_READWRITE));
+    void* const readonly = reserve(nullptr, page_size, MEM_RESERVE | xmem_64k_pages, 0, PAGE_READONLY);
+    uint64_t pages[4]{}, count = 4;
+    const bool allocated = allocate(0, &count, pages) && count == 4;
+    check(window && readonly && allocated, "reserve XMem windows and allocate backing pages");
+
+    // Inject #UD so the real handler is exercised even on hosts that implement CLZERO.
+    const auto emulate = [](void* address) -> DWORD {
+        const uint8_t code[] = {0x0F, 0x01, 0xFC};
+        const auto rip = reinterpret_cast<uint64_t>(code);
+        CONTEXT context{};
+        context.Rip = rip;
+        context.Rax = reinterpret_cast<uint64_t>(address);
+        EXCEPTION_RECORD record{};
+        record.ExceptionCode = STATUS_ILLEGAL_INSTRUCTION;
+        EXCEPTION_POINTERS exception{&record, &context};
+        const LONG disposition = ce::handler(&exception);
+        if (disposition == EXCEPTION_CONTINUE_EXECUTION && context.Rip == rip + sizeof(code)) return 0;
+        if (disposition == EXCEPTION_CONTINUE_SEARCH && context.Rip == rip) return record.ExceptionCode;
+        return STATUS_ILLEGAL_INSTRUCTION;
+    };
+    const auto state_is = [](const void* address, DWORD state) {
+        MEMORY_BASIC_INFORMATION info{};
+        return VirtualQuery(address, &info, sizeof(info)) && info.State == state;
+    };
+
+    if (window && readonly && allocated) {
+        const bool mapped = map(window, 3, pages) == window && map(readonly, 1, pages + 3) == readonly;
+        check(mapped, "map the XMem test views");
+        if (mapped) {
+            check(state_is(window, MEM_RESERVE) && state_is(window + page_size, MEM_RESERVE),
+                  "the XMem views start reserved");
+            std::latch start(2);
+            DWORD second = 0;
+            std::thread peer([&] {
+                start.arrive_and_wait();
+                second = emulate(window + 64);
+            });
+            start.arrive_and_wait();
+            const DWORD first = emulate(window);
+            peer.join();
+            check(first == 0 && second == 0 && state_is(window, MEM_COMMIT),
+                  "concurrent CLZERO first touches of one XMem page succeed");
+            check(state_is(window + page_size, MEM_RESERVE), "the adjacent XMem page stays reserved");
+
+            auto* const touched = window + page_size;
+            std::memset(touched, 0x5A, 128);
+            check(emulate(touched + 13) == 0, "CLZERO accepts an XMem page previously written by the CPU");
+            const uint8_t zeros[64]{};
+            check(std::memcmp(touched, zeros, sizeof(zeros)) == 0 && touched[64] == 0x5A,
+                  "CLZERO clears exactly one line");
+            touched[0] = 0xA5;
+            DWORD old = 0;
+            check(VirtualAlloc(touched, 4096, MEM_COMMIT, PAGE_READWRITE) == touched &&
+                      VirtualProtect(touched, 4096, PAGE_READONLY, &old) &&
+                      emulate(touched) == STATUS_ACCESS_VIOLATION && touched[0] == 0xA5,
+                  "CLZERO honors a read-only subpage and leaves its bytes intact");
+            check(VirtualProtect(touched, 4096, PAGE_READWRITE | PAGE_GUARD, &old) &&
+                      emulate(touched + 64) == STATUS_GUARD_PAGE_VIOLATION && touched[64] == 0x5A &&
+                      emulate(touched + 64) == 0 && touched[64] == 0,
+                  "CLZERO honors one-shot guard protection before clearing the line");
+            check(VirtualProtect(touched, 4096, PAGE_NOACCESS, &old) &&
+                      emulate(touched) == STATUS_ACCESS_VIOLATION,
+                  "CLZERO refuses an inaccessible subpage");
+
+            auto* const partial = window + 2 * page_size;
+            check(VirtualAlloc(partial, 4096, MEM_COMMIT, PAGE_READWRITE) == partial &&
+                      VirtualProtect(partial, 4096, PAGE_READONLY, &old) &&
+                      state_is(partial + 4096, MEM_RESERVE) && emulate(partial + 4096) == 0 &&
+                      state_is(partial + 4096, MEM_COMMIT) && emulate(partial) == STATUS_ACCESS_VIOLATION,
+                  "CLZERO commits the faulting subpage and preserves its neighbor's protection");
+            check(emulate(readonly) == STATUS_ACCESS_VIOLATION && state_is(readonly, MEM_RESERVE),
+                  "CLZERO leaves an initially read-only XMem view reserved");
+            check(emulate(window + 3 * page_size) == STATUS_ACCESS_VIOLATION,
+                  "CLZERO still faults on an unmapped XMem placeholder");
+
+            const HANDLE section =
+                CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE, 0, page_size, nullptr);
+            void* const foreign = section ? MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, page_size) : nullptr;
+            check(foreign && emulate(foreign) == STATUS_ACCESS_VIOLATION && state_is(foreign, MEM_RESERVE),
+                  "CLZERO leaves an unrelated reserve-only mapped view reserved");
+            if (foreign) UnmapViewOfFile(foreign);
+            if (section) CloseHandle(section);
+        }
+        check(map(window, 3, nullptr) == window && map(readonly, 1, nullptr) == readonly,
+              "unmap the CLZERO fixture");
+    }
+    if (allocated) check(free(count, pages) != FALSE, "free the CLZERO fixture backing");
+    if (window) {
+        for (SIZE_T offset = 0; offset < 4 * page_size; offset += page_size)
+            VirtualFree(window + offset, 0, MEM_RELEASE);
+    }
+    if (readonly) VirtualFree(readonly, 0, MEM_RELEASE);
+}
+
 void test_live(const ce::Host& host) {
     DWORD ex = 0;
     alignas(32) uint64_t in[8] = {}, out[8] = {};
@@ -273,6 +386,7 @@ int main() {
                 host.clwb);
     check(ce::install(), "install the handler");
     test_live(host);
+    test_xmem_clzero();
     if (failures) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

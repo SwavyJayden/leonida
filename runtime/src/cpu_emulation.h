@@ -137,6 +137,8 @@ inline uint64_t extract_bits(uint64_t src, unsigned len, unsigned idx) {
 #include <atomic>
 #include <cstdio>
 
+#include "../shims/xmem.h"
+
 namespace rt::cpu_emulation {
 
 struct Host {
@@ -189,9 +191,16 @@ inline std::atomic<uint64_t>& count(Op op) {
 // 0 when the page holding `addr` can be written; otherwise the exception a write raises there. A guard page loses
 // its guard on that first touch and reports STATUS_GUARD_PAGE_VIOLATION, as the system does for a real access.
 inline DWORD writable(uint64_t addr) {
-    MEMORY_BASIC_INFORMATION mbi;
-    if (!VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof mbi) || mbi.State != MEM_COMMIT)
+    const auto* address = reinterpret_cast<const void*>(addr);
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(address, &mbi, sizeof mbi))
         return DWORD(STATUS_ACCESS_VIOLATION);
+    // A normal store can first-touch an XMem view itself. The emulated store has to commit the backing before
+    // checking permissions. Wine can also leave a view reserved after a normal store has already reached it.
+    if (mbi.State == MEM_RESERVE && mbi.Type == MEM_MAPPED &&
+        (!xmem::commit_physical_page_for_write(address) || !VirtualQuery(address, &mbi, sizeof mbi)))
+        return DWORD(STATUS_ACCESS_VIOLATION);
+    if (mbi.State != MEM_COMMIT) return DWORD(STATUS_ACCESS_VIOLATION);
     if (mbi.Protect & PAGE_GUARD) {
         DWORD old = 0;
         VirtualProtect(reinterpret_cast<void*>(addr & ~uint64_t(0xFFF)), 1, mbi.Protect & ~DWORD(PAGE_GUARD), &old);

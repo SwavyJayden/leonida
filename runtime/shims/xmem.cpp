@@ -487,7 +487,9 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
 
 enum class PageCommit { not_ours, committed_before, committed_now, failed };
 
-PageCommit commit_mapped_page(uintptr_t address, uintptr_t accessed, DWORD& protect) {
+bool access_allowed(DWORD protect, ULONG_PTR access);
+
+PageCommit commit_mapped_page(uintptr_t address, uintptr_t accessed, DWORD& protect, bool for_write = false) {
     const auto it = g_mapped.find(address);
     if (it == g_mapped.end() || !it->second.section->scratch) return PageCommit::not_ours;
     MEMORY_BASIC_INFORMATION info{};
@@ -497,6 +499,12 @@ PageCommit commit_mapped_page(uintptr_t address, uintptr_t accessed, DWORD& prot
     if (info.State == MEM_COMMIT) {
         protect = info.Protect;
         return PageCommit::committed_before;
+    }
+    // Protect is undefined while reserved. AllocationProtect describes the view until the backing is committed.
+    // A guarded view still needs to deliver its guard before testing writability.
+    if (for_write && info.State == MEM_RESERVE && !(info.AllocationProtect & PAGE_GUARD) &&
+        !access_allowed(info.AllocationProtect, 1)) {
+        return PageCommit::failed;
     }
     void* const backing = static_cast<uint8_t*>(it->second.section->scratch) + it->second.offset;
     return VirtualAlloc(backing, kPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE) ? PageCommit::committed_now
@@ -803,6 +811,15 @@ LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_ty
 }  // namespace
 
 namespace rt::xmem {
+
+bool commit_physical_page_for_write(const void* address) {
+    const auto accessed = reinterpret_cast<uintptr_t>(address);
+    const auto page = accessed & ~static_cast<uintptr_t>(kPhysicalPageSize - 1);
+    const FaultLockShared lock;
+    DWORD protect = 0;
+    const auto result = commit_mapped_page(page, accessed, protect, true);
+    return result == PageCommit::committed_now || result == PageCommit::committed_before;
+}
 
 bool commit_physical_range(const void* address, size_t size) {
     if (size == 0) return true;

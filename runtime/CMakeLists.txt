@@ -252,7 +252,9 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
 
   # The Zen 2 instructions a desktop CPU may lack (src/cpu_emulation.h): decoded, emulated on a CONTEXT, and run for
   # real with the #UD handler installed, so an Intel host takes the emulated path and an AMD one the native path.
-  add_executable(cpu_emulation_test test/cpu_emulation_test.cpp)
+  add_executable(cpu_emulation_test test/cpu_emulation_test.cpp shims/xmem.cpp shims/registry.cpp)
+  target_link_options(cpu_emulation_test PRIVATE /OPT:NOREF)
+  target_link_libraries(cpu_emulation_test PRIVATE psapi)
   target_include_directories(cpu_emulation_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_compile_definitions(cpu_emulation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(cpu_emulation_test PRIVATE /W4 /permissive- /utf-8)
