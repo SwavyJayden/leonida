@@ -16,12 +16,27 @@
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/shader_library.h"
+#include "../src/subgroup_size.h"
+#include "../src/title_page_watch.h"
 #include "../src/title_va_alias.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#include <string_view>
 #include <vector>
+
+namespace rt::d3d12 {
+bool rdna2_code_walks_bvh(const std::uint8_t* code, std::size_t size);
+bool compute_program_walks_bvh_for_test(const leonida::ComputeProgram& program);
+bool evaluate_bvh_hold_policy(const char* env_value, std::string_view name, std::string_view sha256,
+                              bool walks_bvh, const leonida::SubgroupSizeCaps& subgroup,
+                              bool rehydrate_unimplemented, const char** reason = nullptr);
+}  // namespace rt::d3d12
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
@@ -314,9 +329,389 @@ int check_layer_heap_guard(ID3D12Device* device) {
     return 0;
 }
 
+void put_u32(std::vector<std::uint8_t>& out, std::uint32_t v) {
+    const std::size_t at = out.size();
+    out.resize(at + 4);
+    std::memcpy(out.data() + at, &v, 4);
+}
+
+void put_u64_at(std::vector<std::uint8_t>& out, std::size_t at, std::uint64_t v) {
+    std::memcpy(out.data() + at, &v, 8);
+}
+
+std::vector<std::uint8_t> make_synthetic_fssm(const std::vector<std::uint32_t>& words) {
+    constexpr std::size_t kCodeOff = 0x100;
+    constexpr std::size_t kCodeStart = kCodeOff + 0x28;
+    std::vector<std::uint8_t> blob(kCodeStart, 0);
+    std::memcpy(blob.data(), "FSSM", 4);
+    put_u64_at(blob, 0xC0, kCodeOff);
+    put_u64_at(blob, 0xC8, 0x28 + words.size() * 4);
+    put_u64_at(blob, 0xE8, 0xDEADBEEFDEADBEEFull);
+    for (const std::uint32_t w : words) put_u32(blob, w);
+    return blob;
+}
+
+// Blocker 4: RDNA2 MIMG image_bvh(_64)_intersect_ray scanner and LEONIDA_BVH_HOLD policy evaluation.
+int check_bvh_hold_and_scanner() {
+    const auto scan_words = [](const std::vector<std::uint32_t>& words) {
+        std::vector<std::uint8_t> bytes;
+        bytes.reserve(words.size() * 4);
+        for (const std::uint32_t w : words) put_u32(bytes, w);
+        return rt::d3d12::rdna2_code_walks_bvh(bytes.data(), bytes.size());
+    };
+
+    // Plain compute shader (s_mov_b32 s0, 1; s_endpgm): no BVH walk.
+    EXPECT(!scan_words({0xBE800381u, 0xBF810000u}));
+    // GFX10 MIMG image_bvh_intersect_ray (opc 0xE6: hi6=0x3C, bits[24:18]=0x66, bit0=1) + s_endpgm.
+    EXPECT(scan_words({0xF1980001u, 0x00010000u, 0xBF810000u}));
+    // GFX10 MIMG image_bvh64_intersect_ray (opc 0xE7) with 3 NSA dwords (20-byte instruction) + s_endpgm.
+    EXPECT(scan_words({0xBE8003FFu, 0x12345678u, 0xF19C0007u, 0x00010000u, 0x04030201u, 0x08070605u, 0x0C0B0A09u,
+                       0xBF810000u}));
+    // Negative controls: the exact MIMG BVH word appearing as a 32-bit literal constant must NOT trigger!
+    EXPECT(!scan_words({0xBE8003FFu, 0xF1980001u, 0x00010000u, 0xBF810000u}));  // SOP1 s_mov_b32 s0, lit
+    EXPECT(!scan_words({0x7E0002FFu, 0xF19C0001u, 0x00010000u, 0xBF810000u}));  // VOP1 v_mov_b32 v0, lit
+    EXPECT(!scan_words({(0x2Du << 25) | (1u << 9) | 258u, 0xF1980001u, 0x00010000u, 0xBF810000u}));  // VOP2 v_fmaak_f32
+
+    // Full FSSM container slicing (code at u64[0xC0] + 0x28, trailing constant-data block excluded).
+    leonida::ComputeProgram prog;
+    prog.kind = leonida::ComputeProgram::Kind::fssm;
+    prog.bytes = make_synthetic_fssm({0xF1980001u, 0x00010000u, 0xBF810000u});
+    EXPECT(rt::d3d12::compute_program_walks_bvh_for_test(prog));
+    // Trailing constant-data block after real s_endpgm: s_endpgm, N=2, 2 data words (matching MIMG BVH), closing s_endpgm.
+    prog.bytes = make_synthetic_fssm({0xBE800381u, 0xBF810000u, 2u, 0xF1980001u, 0x00010000u, 0xBF810000u});
+    EXPECT(!rt::d3d12::compute_program_walks_bvh_for_test(prog));
+    // Tiny dummy FSSM (< 0xC8 bytes, like synthetic test blobs): never misclassified.
+    prog.bytes = {'F', 'S', 'S', 'M', 0, 0, 0, 0, 0x01, 0x00, 0x98, 0xF1, 0, 0, 0x01, 0};
+    EXPECT(!rt::d3d12::compute_program_walks_bvh_for_test(prog));
+
+    // LEONIDA_BVH_HOLD policy parser & Wave32/Wave64 matching.
+    leonida::SubgroupSizeCaps wave32{}, wave64{}, unknown{};
+    wave32.min_size = 32;
+    wave32.max_size = 32;
+    wave32.default_size = 32;
+    wave64.min_size = 32;
+    wave64.max_size = 64;
+    wave64.default_size = 64;
+
+    const std::string_view name = "CS_IrradianceCache_ShadowTrace_WithFar";
+    const std::string_view sha = "a1b2c3d4e5f60123456789abcdef0123456789abcdef0123456789abcdef0123";
+    const char* reason = nullptr;
+
+    // Unset: defaults to auto on Wave32, off on Wave64 and unknown subgroup caps.
+    EXPECT(rt::d3d12::evaluate_bvh_hold_policy(nullptr, name, sha, true, wave32, true, &reason) && reason);
+    EXPECT(!rt::d3d12::evaluate_bvh_hold_policy(nullptr, name, sha, false, wave32, true));
+    EXPECT(!rt::d3d12::evaluate_bvh_hold_policy(nullptr, name, sha, true, wave32, false));
+    EXPECT(!rt::d3d12::evaluate_bvh_hold_policy(nullptr, name, sha, true, wave64, true));
+    EXPECT(!rt::d3d12::evaluate_bvh_hold_policy(nullptr, name, sha, true, unknown, true));
+
+    // 0 / off / none: hold nothing even on Wave32 with unimplemented rehydration.
+    for (const char* v : {"0", "off", "OFF", "none", " false "})
+        EXPECT(!rt::d3d12::evaluate_bvh_hold_policy(v, name, sha, true, wave32, true));
+
+    // 1 / all / *: hold every BVH-walking compute shader regardless of Wave64 or rehydration status.
+    for (const char* v : {"1", "all", "ALL", "*"}) {
+        EXPECT(rt::d3d12::evaluate_bvh_hold_policy(v, name, sha, true, wave64, false));
+        EXPECT(!rt::d3d12::evaluate_bvh_hold_policy(v, name, sha, false, wave32, true));
+    }
+
+    // auto: hold BVH-walking compute shaders iff rehydrate is unimplemented.
+    EXPECT(rt::d3d12::evaluate_bvh_hold_policy("auto", name, sha, true, wave32, true));
+    EXPECT(!rt::d3d12::evaluate_bvh_hold_policy("auto", name, sha, true, wave32, false));
+    EXPECT(rt::d3d12::evaluate_bvh_hold_policy("AUTO", name, sha, true, wave64, true));
+    EXPECT(!rt::d3d12::evaluate_bvh_hold_policy("auto", name, sha, true, wave64, false));
+
+    // Comma-separated name substrings and >=4-char hex sha256 prefixes (case-insensitive hex).
+    EXPECT(rt::d3d12::evaluate_bvh_hold_policy("ShadowTrace, deadbeef", name, sha, false, wave64, false));
+    EXPECT(rt::d3d12::evaluate_bvh_hold_policy("OtherShader, A1B2C3D4", "CS_Other", sha, false, wave64, false));
+    EXPECT(!rt::d3d12::evaluate_bvh_hold_policy("OtherShader, deadbeef", name, sha, true, wave32, true));
+
+    std::puts("bvh hold: RDNA2 MIMG BVH scanner (0xE6/0xE7 + literal guards) and LEONIDA_BVH_HOLD policies ok");
+    return 0;
+}
+
+int submit_empty(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Fence* fence, UINT64& fence_value) {
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                               IID_PPV_ARGS(&list.p))));
+    EXPECT(SUCCEEDED(list->Close()));
+    ID3D12CommandList* lists[] = {list.p};
+    queue->ExecuteCommandLists(1, lists);
+    EXPECT(SUCCEEDED(queue->Signal(fence, ++fence_value)));
+    EXPECT(SUCCEEDED(fence->SetEventOnCompletion(fence_value, nullptr)));
+    return 0;
+}
+
+// Blockers 2A + 2B: API buffer views (CBV, placed SRV, placed UAV) targeting initially-unbacked title memory inside a
+// console descriptor heap preserve their guest VA in title memory while refresh_console_heap zeros heap.copy, and
+// advancing leonida::title_memory_map::generation() sweeps empty_slots immediately instead of waiting 32 submissions.
+int check_console_api_and_generation_recovery(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Fence* fence,
+                                              UINT64& fence_value, std::uint64_t unmapped,
+                                              std::vector<void*>& deferred_frees) {
+    constexpr UINT slots = 256;
+    constexpr std::uint64_t heap_bytes = std::uint64_t(slots) * kDescriptor;
+    auto* title = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, heap_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    EXPECT(title);
+    const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slots,
+                                          D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    Ref<ID3D12DescriptorHeap> heap;
+    EXPECT(SUCCEEDED(rt::d3d12::create_console_descriptor_heap(device, &desc, reinterpret_cast<std::uint64_t>(title),
+                                                               heap_bytes, IID_PPV_ARGS(&heap.p))));
+    D3D12_DESCRIPTOR_HEAP_DESC got{};
+    D3D12_GPU_VIRTUAL_ADDRESS shader_va = 0;
+    EXPECT(rt::d3d12::descriptor_heap_info(heap.p, got, shader_va));
+
+    // Reserved (uncommitted) title memory: initially unbacked.
+    void* pages = VirtualAlloc(nullptr, 65536, MEM_TOP_DOWN | MEM_RESERVE, PAGE_READWRITE);
+    EXPECT(pages);
+    deferred_frees.push_back(pages);
+    const auto target_va = reinterpret_cast<std::uint64_t>(pages);
+    auto& aliases = leonida::title_va_aliases();
+    aliases.add_title_memory(target_va, 65536);
+
+    const auto handle = [&](UINT slot) {
+        return D3D12_CPU_DESCRIPTOR_HANDLE{reinterpret_cast<SIZE_T>(title + std::size_t(slot) * kDescriptor)};
+    };
+    const auto title_words = [&](UINT slot) {
+        return reinterpret_cast<const std::uint32_t*>(title + std::size_t(slot) * kDescriptor);
+    };
+
+    // Slot 0: CBV targeting uncommitted title memory -> guest VA preserved in title heap.
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{target_va, kViewBytes};
+    device->CreateConstantBufferView(&cbv, handle(0));
+    EXPECT(base_of(title_words(0)) == (target_va & 0xFFFFFFFFFFFFull) && title_words(0)[2] != 0);
+
+    // Slot 1: placed raw buffer SRV targeting uncommitted title memory -> guest VA preserved in title heap.
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R32_TYPELESS;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer.NumElements = kViewBytes / 4;
+    srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    EXPECT(rt::d3d12::write_placed_buffer_view(device, false, &srv, target_va + 0x1000, kViewBytes, handle(1)));
+    EXPECT(base_of(title_words(1)) == ((target_va + 0x1000) & 0xFFFFFFFFFFFFull) && title_words(1)[2] == kViewBytes);
+
+    // Slot 2: placed raw buffer UAV targeting uncommitted title memory -> guest VA preserved in title heap.
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_R32_TYPELESS;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.NumElements = kViewBytes / 4;
+    uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    EXPECT(rt::d3d12::write_placed_buffer_view(device, true, &uav, target_va + 0x2000, kViewBytes, handle(2)));
+    EXPECT(base_of(title_words(2)) == ((target_va + 0x2000) & 0xFFFFFFFFFFFFull) && title_words(2)[2] == kViewBytes);
+
+    // Slot 3 (negative control): non-title unmapped address in console heap MUST still be zeroed immediately.
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC non_title{unmapped, kViewBytes};
+    device->CreateConstantBufferView(&non_title, handle(3));
+    EXPECT(zero_size(title_words(3)));
+
+    // Slots 4..67 (64 slots): CPU-written raw V#s targeting the same uncommitted title memory.
+    const auto cold_vsharp = raw_vsharp(target_va + 0x3000);
+    for (UINT slot = 4; slot < 68; ++slot)
+        std::memcpy(title + std::size_t(slot) * kDescriptor, cold_vsharp.data(), sizeof(cold_vsharp));
+
+    // First submission: refresh_console_heap must zero every unbacked slot in heap.copy while preserving title bytes.
+    if (submit_empty(device, queue, fence, fence_value)) return 1;
+    for (UINT slot = 0; slot < 68; ++slot) {
+        std::uint32_t gpu_w[8]{};
+        EXPECT(rt::d3d12::read_arena(device, shader_va + std::uint64_t(slot) * kDescriptor, gpu_w, sizeof(gpu_w)));
+        EXPECT(zero_size(gpu_w));
+    }
+    EXPECT(base_of(title_words(0)) == (target_va & 0xFFFFFFFFFFFFull));
+    EXPECT(base_of(title_words(1)) == ((target_va + 0x1000) & 0xFFFFFFFFFFFFull));
+    EXPECT(base_of(title_words(2)) == ((target_va + 0x2000) & 0xFFFFFFFFFFFFull));
+
+    // Commit the title pages and bump title_memory_map::generation(), without touching title descriptor bytes.
+    EXPECT(VirtualAlloc(pages, 65536, MEM_COMMIT, PAGE_READWRITE) == pages);
+    leonida::title_memory_map::changed(pages, 65536);
+
+    // Generation-triggered sweep recovers slots immediately (well before the 32-submit fallback).
+    unsigned recovered = 0;
+    for (unsigned pass = 0; pass < 4; ++pass) {
+        if (submit_empty(device, queue, fence, fence_value)) return 1;
+        recovered = 0;
+        for (UINT slot = 0; slot < 68; ++slot) {
+            if (slot == 3) continue;
+            std::uint32_t gpu_w[8]{};
+            EXPECT(rt::d3d12::read_arena(device, shader_va + std::uint64_t(slot) * kDescriptor, gpu_w, sizeof(gpu_w)));
+            if (base_of(gpu_w) != 0 && gpu_w[2] != 0) ++recovered;
+        }
+        if (pass == 0) EXPECT(recovered >= 16);
+        if (recovered == 67) break;
+    }
+    EXPECT(recovered == 67);
+    for (UINT slot : {0u, 1u, 2u}) {
+        std::uint32_t gpu_w[8]{};
+        EXPECT(rt::d3d12::read_arena(device, shader_va + std::uint64_t(slot) * kDescriptor, gpu_w, sizeof(gpu_w)));
+        const std::uint64_t guest = target_va + std::uint64_t(slot) * 0x1000;
+        EXPECT(base_of(gpu_w) == (aliases.shader_va(guest) & 0xFFFFFFFFFFFFull) && gpu_w[2] != 0);
+    }
+
+    std::printf("console API + generation recovery: CBV/SRV/UAV + 64 cold slots recovered (%u/67) after map change\n",
+                recovered);
+    heap.reset();
+    aliases.remove_title_memory(target_va);
+    VirtualFree(title, 0, MEM_RELEASE);
+    return 0;
+}
+
+// Blocker 2C: with LEONIDA_GEOMETRY_MB > 0 (VsharpPath::scratch), valid MEM_PRIVATE V#s <= 16 MiB must still obtain
+// title windows instead of being silently zeroed, while non-canonical untyped garbage and >16 MiB spans stay zeroed.
+int run_scratch_mode() {
+    _putenv_s("LEONIDA_GEOMETRY_MB", "16");
+    vktest::Device d;
+    const auto status = d.initialize();
+    if (status == vktest::DeviceStatus::unavailable) return 77;
+    EXPECT(status == vktest::DeviceStatus::ready);
+
+    std::vector<void*> deferred_frees;
+    {
+        rt::d3d12::VulkanDeviceInfo info{};
+        info.get_instance_proc = d.instance_proc;
+        info.instance = d.instance;
+        info.physical = d.physical;
+        info.device = d.device;
+        info.queue = d.queue;
+        info.queue_family = d.family;
+        info.buffer_device_address = true;
+        info.subgroup = d.subgroup;
+        Ref<ID3D12Device> device;
+        EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
+        const D3D12_COMMAND_QUEUE_DESC queue_desc{};
+        Ref<ID3D12CommandQueue> queue;
+        Ref<ID3D12Fence> fence;
+        EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+        EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+        UINT64 fence_value = 0;
+
+        constexpr UINT slots = 64;
+        constexpr std::uint64_t heap_bytes = std::uint64_t(slots) * kDescriptor;
+        auto* title = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, heap_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        EXPECT(title);
+        const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slots,
+                                              D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        Ref<ID3D12DescriptorHeap> heap;
+        EXPECT(SUCCEEDED(rt::d3d12::create_console_descriptor_heap(device.p, &desc, reinterpret_cast<std::uint64_t>(title),
+                                                                   heap_bytes, IID_PPV_ARGS(&heap.p))));
+        D3D12_DESCRIPTOR_HEAP_DESC got{};
+        D3D12_GPU_VIRTUAL_ADDRESS shader_va = 0;
+        EXPECT(rt::d3d12::descriptor_heap_info(heap.p, got, shader_va));
+
+        auto& aliases = leonida::title_va_aliases();
+        const auto alloc_private = [&](std::size_t bytes, bool commit) {
+            void* p = VirtualAlloc(nullptr, bytes, MEM_TOP_DOWN | MEM_RESERVE | (commit ? MEM_COMMIT : 0), PAGE_READWRITE);
+            if (p) {
+                deferred_frees.push_back(p);
+                aliases.add_title_memory(reinterpret_cast<std::uint64_t>(p), bytes);
+            }
+            return p;
+        };
+
+        void* priv_fmt = alloc_private(65536, true);
+        void* priv_uav = alloc_private(65536, true);
+        void* priv_deferred = alloc_private(65536, false);
+        void* priv_garbage = alloc_private(65536, true);
+        constexpr std::size_t kOverWindow = 20u << 20;  // > kTitleWindowMax (16 MiB)
+        void* priv_big = alloc_private(kOverWindow, true);
+        EXPECT(priv_fmt && priv_uav && priv_deferred && priv_garbage && priv_big);
+
+        const auto va_fmt = reinterpret_cast<std::uint64_t>(priv_fmt);
+        const auto va_uav = reinterpret_cast<std::uint64_t>(priv_uav);
+        const auto va_deferred = reinterpret_cast<std::uint64_t>(priv_deferred);
+        const auto va_garbage = reinterpret_cast<std::uint64_t>(priv_garbage);
+        const auto va_big = reinterpret_cast<std::uint64_t>(priv_big);
+
+        // Slot 0: formatted V# (format = R32_UINT) pointing to MEM_PRIVATE title memory.
+        const auto w_fmt = raw_vsharp(va_fmt);
+        std::memcpy(title + 0 * kDescriptor, w_fmt.data(), sizeof(w_fmt));
+
+        // Slot 1: canonical raw UAV V# (format == 0, encode(desc) == words) pointing to MEM_PRIVATE title memory.
+        leonida::gfx10::Buffer uav_buf{};
+        uav_buf.address = va_uav;
+        uav_buf.num_records = kViewBytes;
+        uav_buf.format = 0;
+        uav_buf.oob_select = leonida::gfx10::OobSelect::raw;
+        const auto w_uav = leonida::gfx10::encode(uav_buf);
+        std::memcpy(title + 1 * kDescriptor, w_uav.data(), sizeof(w_uav));
+
+        // Slot 2: API CBV targeting initially-uncommitted MEM_PRIVATE title memory (2A + 2B + 2C combined).
+        const D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{va_deferred, kViewBytes};
+        device->CreateConstantBufferView(&cbv, D3D12_CPU_DESCRIPTOR_HANDLE{reinterpret_cast<SIZE_T>(title + 2 * kDescriptor)});
+
+        // Slot 3 (negative control): untyped (format == 0) non-canonical garbage word (extra reserved bit 23 set).
+        auto w_garbage = uav_buf;
+        w_garbage.address = va_garbage;
+        auto garbage_words = leonida::gfx10::encode(w_garbage);
+        garbage_words[3] |= 1u << 23;
+        std::memcpy(title + 3 * kDescriptor, garbage_words.data(), sizeof(garbage_words));
+
+        // Slot 4 (negative control): MEM_PRIVATE V# larger than kTitleWindowMax (20 MiB > 16 MiB).
+        leonida::gfx10::Buffer big_buf{};
+        big_buf.address = va_big;
+        big_buf.num_records = std::uint32_t(kOverWindow);
+        big_buf.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
+        big_buf.oob_select = leonida::gfx10::OobSelect::raw;
+        const auto w_big = leonida::gfx10::encode(big_buf);
+        std::memcpy(title + 4 * kDescriptor, w_big.data(), sizeof(w_big));
+
+        if (submit_empty(device.p, queue.p, fence.p, fence_value)) return 1;
+        auto read_slot = [&](UINT slot, std::uint32_t (&out)[8]) {
+            return rt::d3d12::read_arena(device.p, shader_va + std::uint64_t(slot) * kDescriptor, out, sizeof(out));
+        };
+        std::uint32_t s0[8]{}, s1[8]{}, s2[8]{}, s3[8]{}, s4[8]{};
+        EXPECT(read_slot(0, s0) && read_slot(1, s1) && read_slot(2, s2) && read_slot(3, s3) && read_slot(4, s4));
+        EXPECT(base_of(s0) != 0 && base_of(s0) != (va_fmt & 0xFFFFFFFFFFFFull) && s0[2] == kViewBytes);
+        EXPECT(base_of(s1) != 0 && base_of(s1) != (va_uav & 0xFFFFFFFFFFFFull) && s1[2] == kViewBytes);
+        EXPECT(zero_size(s2));  // uncommitted on submit 1
+        EXPECT(zero_size(s3));  // non-canonical format==0 garbage rejected
+        EXPECT(zero_size(s4));  // > 16 MiB MEM_PRIVATE rejected
+
+        // Commit slot 2's MEM_PRIVATE pages and advance generation -> recovered via VsharpPath::scratch window.
+        EXPECT(VirtualAlloc(priv_deferred, 65536, MEM_COMMIT, PAGE_READWRITE) == priv_deferred);
+        leonida::title_memory_map::changed(priv_deferred, 65536);
+        if (submit_empty(device.p, queue.p, fence.p, fence_value)) return 1;
+        EXPECT(read_slot(2, s2));
+        EXPECT(base_of(s2) != 0 && base_of(s2) != (va_deferred & 0xFFFFFFFFFFFFull) && s2[2] != 0);
+
+        std::puts("scratch V# path (LEONIDA_GEOMETRY_MB=16): MEM_PRIVATE V#s window-backed; garbage and >16 MiB zeroed");
+        heap.reset();
+        for (void* p : deferred_frees) aliases.remove_title_memory(reinterpret_cast<std::uint64_t>(p));
+        VirtualFree(title, 0, MEM_RELEASE);
+    }
+    for (void* p : deferred_frees) VirtualFree(p, 0, MEM_RELEASE);
+    if (d.validation_errors()) {
+        std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
+        return 1;
+    }
+    return 0;
+}
+
+int run_scratch_subprocess() {
+    wchar_t exe[MAX_PATH]{};
+    const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    EXPECT(n > 0 && n < MAX_PATH);
+    std::wstring cmd = L"\"";
+    cmd.append(exe, n);
+    cmd.append(L"\" --scratch");
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    EXPECT(CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi));
+    EXPECT(WaitForSingleObject(pi.hProcess, 60000) == WAIT_OBJECT_0);
+    DWORD exit_code = 1;
+    EXPECT(GetExitCodeProcess(pi.hProcess, &exit_code));
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    EXPECT(exit_code == 0 || exit_code == 77);
+    return 0;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--scratch") == 0) return run_scratch_mode();
+    if (check_bvh_hold_and_scanner()) return 1;
     vktest::Device d;
     const auto status = d.initialize();
     if (status == vktest::DeviceStatus::unavailable) {
@@ -324,6 +719,7 @@ int main() {
         return 77;
     }
     EXPECT(status == vktest::DeviceStatus::ready);
+    std::vector<void*> deferred_frees;
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -358,11 +754,16 @@ int main() {
         if (check_inline_table(device.p, queue.p, fence.p, fence_value, b, unmapped)) return 1;
         if (check_console_heap(device.p, queue.p, fence.p, fence_value, b, unmapped)) return 1;
         if (check_layer_heap_guard(device.p)) return 1;
+        if (check_console_api_and_generation_recovery(device.p, queue.p, fence.p, fence_value, unmapped,
+                                                      deferred_frees))
+            return 1;
     }
+    for (void* p : deferred_frees) VirtualFree(p, 0, MEM_RELEASE);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
+    if (run_scratch_subprocess()) return 1;
     std::puts("ok");
     return 0;
 }

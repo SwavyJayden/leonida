@@ -20,6 +20,7 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "d3d12_xs_pso_stream.h"
+#include "shims.h"
 #include "xg_xs_layout.h"
 #include "d3d12_title_image_upload.h"
 #include "d3d12_title_buffer_windows.h"
@@ -101,6 +102,7 @@
 #include <unordered_set>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <cwchar>
 #include <smmintrin.h>
@@ -1377,6 +1379,317 @@ bool skip_compute(const std::string& name) {
     for (const std::string& part : parts)
         if (part == "all" || part == "*" || name.find(part) != std::string::npos) return true;
     return false;
+}
+
+// ---- Wave32 BVH traversal compute hold (LEONIDA_BVH_HOLD) -------------------------------------------------------
+// On Wave32 GPUs (e.g. NVIDIA RTX 5070 Ti), BVH-walking compute shaders (image_bvh_intersect_ray /
+// image_bvh64_intersect_ray) reading unrehydrated BVH4 acceleration structures can hang the GPU (TDR / nvlddmkm 153).
+//   0 / off / none : hold nothing
+//   1 / all / *    : hold every BVH-walking compute shader (pipeline_.skipped = true)
+//   auto           : hold BVH-walking compute shaders while XboxBvhBuilder rehydration returns E_NOTIMPL
+//                    (default when unset on Wave32 subgroupSize == 32; off when unset on Wave64 GPUs)
+//   a,b,...        : hold compute shaders matching any comma-separated name substring or >=4-char hex sha256 prefix
+enum class BvhHoldMode { unset, off, all, auto_mode, filter };
+
+struct BvhHoldPolicy {
+    BvhHoldMode mode = BvhHoldMode::unset;
+    std::vector<std::string> tokens;
+};
+
+std::string_view trim_ascii_ws(std::string_view sv) {
+    while (!sv.empty() && (sv.front() == ' ' || sv.front() == '\t' || sv.front() == '\r' || sv.front() == '\n'))
+        sv.remove_prefix(1);
+    while (!sv.empty() && (sv.back() == ' ' || sv.back() == '\t' || sv.back() == '\r' || sv.back() == '\n'))
+        sv.remove_suffix(1);
+    return sv;
+}
+
+std::string lower_ascii_str(std::string_view sv) {
+    std::string out(sv);
+    for (char& c : out)
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    return out;
+}
+
+bool is_ascii_hex(std::string_view sv) {
+    if (sv.empty()) return false;
+    for (const char c : sv)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return false;
+    return true;
+}
+
+bool is_wave32_subgroup(const leonida::SubgroupSizeCaps& caps) {
+    if (caps.max_size) return caps.max_size <= 32;
+    return caps.default_size == 32;
+}
+
+BvhHoldPolicy parse_bvh_hold_policy(const char* text) {
+    BvhHoldPolicy policy;
+    if (!text) return policy;
+    const std::string_view trimmed = trim_ascii_ws(text);
+    if (trimmed.empty()) return policy;
+    const std::string lower = lower_ascii_str(trimmed);
+    if (lower == "0" || lower == "off" || lower == "none" || lower == "false") {
+        policy.mode = BvhHoldMode::off;
+        return policy;
+    }
+    if (lower == "1" || lower == "all" || lower == "*" || lower == "true") {
+        policy.mode = BvhHoldMode::all;
+        return policy;
+    }
+    if (lower == "auto") {
+        policy.mode = BvhHoldMode::auto_mode;
+        return policy;
+    }
+    for (std::size_t at = 0; at <= trimmed.size();) {
+        const std::size_t end = (std::min)(trimmed.find(',', at), trimmed.size());
+        const std::string_view tok = trim_ascii_ws(trimmed.substr(at, end - at));
+        if (!tok.empty()) {
+            const std::string tok_lower = lower_ascii_str(tok);
+            if (tok_lower == "all" || tok_lower == "*") {
+                policy.mode = BvhHoldMode::all;
+                policy.tokens.clear();
+                return policy;
+            }
+            policy.tokens.emplace_back(tok);
+        }
+        at = end + 1;
+    }
+    policy.mode = policy.tokens.empty() ? BvhHoldMode::off : BvhHoldMode::filter;
+    return policy;
+}
+
+bool match_bvh_hold_policy(const BvhHoldPolicy& policy, std::string_view name, std::string_view sha256,
+                           bool walks_bvh, const leonida::SubgroupSizeCaps& subgroup, bool rehydrate_unimplemented,
+                           const char** reason) {
+    switch (policy.mode) {
+    case BvhHoldMode::off:
+        return false;
+    case BvhHoldMode::all:
+        if (!walks_bvh) return false;
+        if (reason) *reason = "LEONIDA_BVH_HOLD=all";
+        return true;
+    case BvhHoldMode::unset:
+        if (!is_wave32_subgroup(subgroup) || !rehydrate_unimplemented || !walks_bvh) return false;
+        if (reason) *reason = "LEONIDA_BVH_HOLD=auto (Wave32 default)";
+        return true;
+    case BvhHoldMode::auto_mode:
+        if (!rehydrate_unimplemented || !walks_bvh) return false;
+        if (reason) *reason = "LEONIDA_BVH_HOLD=auto";
+        return true;
+    case BvhHoldMode::filter:
+        for (const std::string& tok : policy.tokens) {
+            if (name.find(tok) != std::string_view::npos) {
+                if (reason) *reason = "LEONIDA_BVH_HOLD";
+                return true;
+            }
+            if (!sha256.empty() && tok.size() >= 4 && tok.size() <= sha256.size() && is_ascii_hex(tok)) {
+                const std::string prefix = lower_ascii_str(tok);
+                if (lower_ascii_str(sha256.substr(0, prefix.size())) == prefix) {
+                    if (reason) *reason = "LEONIDA_BVH_HOLD";
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    return false;
+}
+
+bool bvh_hold_needs_code_scan(const BvhHoldPolicy& policy, const leonida::SubgroupSizeCaps& subgroup,
+                              bool rehydrate_unimplemented) {
+    switch (policy.mode) {
+    case BvhHoldMode::all: return true;
+    case BvhHoldMode::auto_mode: return rehydrate_unimplemented;
+    case BvhHoldMode::unset: return is_wave32_subgroup(subgroup) && rehydrate_unimplemented;
+    case BvhHoldMode::off:
+    case BvhHoldMode::filter: return false;
+    }
+    return false;
+}
+
+std::atomic<int> g_bvh_rehydrate_unimplemented_override{-1};
+std::atomic<std::uint64_t> g_bvh_held_psos{0};
+std::atomic<std::uint64_t> g_bvh_held_dispatches{0};
+
+bool bvh_rehydrate_unimplemented() {
+    const int forced = g_bvh_rehydrate_unimplemented_override.load(std::memory_order_acquire);
+    if (forced >= 0) return forced != 0;
+    using StatusFn = bool (*)();
+    if (void* fn = rt::shims::find("xboxbvhbuilder.dll", "__leonida_bvh_rehydrate_status"))
+        return reinterpret_cast<StatusFn>(fn)();
+    return false;
+}
+
+const BvhHoldPolicy& active_bvh_hold_policy() {
+    static const BvhHoldPolicy policy = [] {
+        const DWORD need = GetEnvironmentVariableA("LEONIDA_BVH_HOLD", nullptr, 0);
+        if (need == 0) return parse_bvh_hold_policy(nullptr);
+        std::string text(need, '\0');
+        const DWORD n = GetEnvironmentVariableA("LEONIDA_BVH_HOLD", text.data(), need);
+        if (n == 0 || n >= need) return parse_bvh_hold_policy(nullptr);
+        text.resize(n);
+        return parse_bvh_hold_policy(text.c_str());
+    }();
+    return policy;
+}
+
+// Trailing constant-data block layout after the last real s_endpgm: s_endpgm, u32 N, N dwords, closing s_endpgm.
+std::size_t fssm_data_block_start(const std::uint8_t* data, std::size_t start, std::size_t end) {
+    if (end < start + 8) return end;
+    const auto u32 = [data](std::size_t at) {
+        std::uint32_t v = 0;
+        std::memcpy(&v, data + at, 4);
+        return v;
+    };
+    const std::size_t last = end - 4;
+    const std::size_t max_n = (std::min)(std::size_t{1u << 16}, (last - start) / 4 - 1);
+    for (std::size_t n = 0; n <= max_n; ++n) {
+        const std::size_t count = last - 4 * (n + 1);
+        if (count < start + 4) break;
+        if (u32(count) == n && u32(count - 4) == 0xBF810000u) return count;
+    }
+    return end;
+}
+
+// Walks raw RDNA2 (GFX10 / GFX10.3) machine code and returns true if it contains MIMG
+// image_bvh_intersect_ray (0xE6) or image_bvh64_intersect_ray (0xE7), stepping by exact decoded
+// instruction length so 32-bit literal constants and multi-word payloads cannot false-positive.
+bool rdna2_code_walks_bvh_impl(const std::uint8_t* code, std::size_t size) {
+    if (!code || size < 8) return false;
+    const auto u32 = [code](std::size_t at) {
+        std::uint32_t v = 0;
+        std::memcpy(&v, code + at, 4);
+        return v;
+    };
+    for (std::size_t pc = 0; pc + 4 <= size;) {
+        const std::uint32_t w0 = u32(pc);
+        std::size_t step = 4;
+        if ((w0 >> 31) == 0u) {
+            // VOP1 / VOPC / VOP2 (32-bit, +4 bytes for literal / DPP16 / DPP8 / SDWA or mandatory VOP2 literal).
+            const std::uint32_t hi7 = w0 >> 25;
+            const std::uint32_t src0 = w0 & 0x1FFu;
+            bool extra = src0 == 255u || src0 == 250u || src0 == 249u || src0 == 233u || src0 == 234u;
+            if (!extra && hi7 != 0x3Fu && hi7 != 0x3Eu) {
+                const std::uint32_t opc = hi7 & 0x3Fu;
+                extra = opc == 0x20u || opc == 0x21u || opc == 0x2Cu || opc == 0x2Du || opc == 0x37u || opc == 0x38u;
+            }
+            if (extra && pc + 8 <= size) step = 8;
+        } else if ((w0 >> 30) == 2u) {
+            // SOP1 / SOPC / SOPP / SOPK / SOP2 (32-bit, +4 bytes for literal or SOPK s_setreg_imm32_b32).
+            const std::uint32_t hi9 = w0 >> 23;
+            bool extra = false;
+            if (hi9 == 0x17Du) {  // SOP1
+                extra = (w0 & 0xFFu) == 255u;
+            } else if (hi9 == 0x17Eu) {  // SOPC
+                extra = (w0 & 0xFFu) == 255u || ((w0 >> 8) & 0xFFu) == 255u;
+            } else if (hi9 == 0x17Fu) {  // SOPP
+                extra = false;
+            } else if ((w0 >> 28) == 0xBu) {  // SOPK
+                extra = ((w0 >> 23) & 0x1Fu) == 0x15u;
+            } else {  // SOP2
+                extra = (w0 & 0xFFu) == 255u || ((w0 >> 8) & 0xFFu) == 255u;
+            }
+            if (extra && pc + 8 <= size) step = 8;
+        } else {
+            const std::uint32_t hi6 = w0 >> 26;
+            if (hi6 == 0x32u) {  // VINTRP (32-bit)
+                step = 4;
+            } else if (pc + 8 <= size) {
+                const std::uint32_t w1 = u32(pc + 4);
+                if (hi6 == 0x3Cu) {  // MIMG (64-bit + up to 3 NSA dwords)
+                    const std::uint32_t nsa = (w0 >> 1) & 3u;
+                    const std::size_t nbytes = 8u + 4u * std::size_t(nsa);
+                    if (pc + nbytes <= size) {
+                        const std::uint32_t opc = ((w0 >> 18) & 0x7Fu) | ((w0 & 1u) << 7);
+                        // GFX10 MIMG reserved zero bits: w0[14], w0[6], w1[29:26]; BVH takes no sampler (w1[25:21] == 0).
+                        if ((opc == 0xE6u || opc == 0xE7u) && !(w0 & 0x00004040u) && !(w1 & 0x3FE00000u))
+                            return true;
+                        step = nbytes;
+                    }
+                } else if (hi6 == 0x33u || hi6 == 0x35u) {  // VOP3P / VOP3 / VOP3B (64-bit, +literal)
+                    const std::uint32_t src0 = w1 & 0x1FFu;
+                    const std::uint32_t src1 = (w1 >> 9) & 0x1FFu;
+                    const std::uint32_t src2 = (w1 >> 18) & 0x1FFu;
+                    bool interp_src0 = false;
+                    if (hi6 == 0x35u) {
+                        const std::uint32_t opc = (w0 >> 16) & 0x3FFu;
+                        interp_src0 = opc == 0x200u || opc == 0x201u || opc == 0x202u ||
+                                      opc == 0x342u || opc == 0x343u || opc == 0x35Au;
+                    }
+                    const bool lit = (!interp_src0 && src0 == 255u) || src1 == 255u || src2 == 255u;
+                    step = (lit && pc + 12 <= size) ? 12u : 8u;
+                } else if (hi6 == 0x36u || hi6 == 0x37u || hi6 == 0x38u || hi6 == 0x3Au ||
+                           hi6 == 0x3Du || hi6 == 0x3Eu) {
+                    // DS, FLAT/SCRATCH/GLOBAL, MUBUF, MTBUF, SMEM, EXP (64-bit)
+                    step = 8;
+                }
+            }
+        }
+        pc += step;
+    }
+    return false;
+}
+
+bool compute_program_walks_bvh(const leonida::ComputeProgram& program) {
+    const auto& bytes = program.bytes;
+    if (bytes.size() < 8) return false;
+    const auto u32 = [&](std::size_t at) {
+        std::uint32_t v = 0;
+        std::memcpy(&v, bytes.data() + at, 4);
+        return v;
+    };
+    const auto u64 = [&](std::size_t at) {
+        std::uint64_t v = 0;
+        std::memcpy(&v, bytes.data() + at, 8);
+        return v;
+    };
+    std::size_t start = 0;
+    std::size_t bound = bytes.size();
+    if (program.kind == leonida::ComputeProgram::Kind::fssm) {
+        if (bytes.size() < 0xC8 || std::memcmp(bytes.data(), "FSSM", 4) != 0) return false;
+        const std::uint64_t off = u64(0xC0);
+        if (!off || off >= bytes.size() || bytes.size() - std::size_t(off) <= 0x28) return false;
+        start = std::size_t(off) + 0x28;
+        if (bytes.size() >= 0xF0) {
+            constexpr std::uint64_t kCodeEndUnset = 0xDEADBEEFDEADBEEFull;
+            std::uint64_t code_end = u64(0xE8);
+            if (code_end == kCodeEndUnset) {
+                const std::uint64_t code_size = u64(0xC8);
+                if (code_size && code_size <= bytes.size() - off) code_end = off + code_size;
+            }
+            if (code_end > start && code_end <= bytes.size()) bound = std::size_t(code_end);
+        }
+    } else if (program.kind == leonida::ComputeProgram::Kind::fspx) {
+        start = leonida::fspx_bare_program(bytes) ? 36u : 0u;
+        if (start >= bound) return false;
+    } else {
+        return false;
+    }
+    std::size_t end = start + ((bound - start) & ~std::size_t(3));
+    if (end >= start + 4) {
+        for (std::size_t at = end - 4;; at -= 4) {
+            if (u32(at) == 0xBF810000u) {
+                end = at + 4;
+                if (program.kind == leonida::ComputeProgram::Kind::fssm)
+                    end = fssm_data_block_start(bytes.data(), start, end);
+                break;
+            }
+            if (at < start + 4) break;
+        }
+    }
+    return end > start && rdna2_code_walks_bvh_impl(bytes.data() + start, end - start);
+}
+
+bool hold_bvh_compute(const leonida::ComputeProgram& program, std::string_view name, std::string_view sha256,
+                      const leonida::SubgroupSizeCaps& subgroup, const char** reason) {
+    const BvhHoldPolicy& policy = active_bvh_hold_policy();
+    if (policy.mode == BvhHoldMode::off) return false;
+    const bool rehydrate_missing = bvh_rehydrate_unimplemented();
+    bool walks_bvh = false;
+    if (bvh_hold_needs_code_scan(policy, subgroup, rehydrate_missing))
+        walks_bvh = compute_program_walks_bvh(program);
+    return match_bvh_hold_policy(policy, name, sha256, walks_bvh, subgroup, rehydrate_missing, reason);
 }
 
 // Graphics pipelines are built at their first draw, not at CreatePipelineState (LEONIDA_LAZY_PIPELINES=0: at
@@ -2931,10 +3244,14 @@ struct DeviceState {
         const uint64_t span = uint64_t(w[2]) * (stride ? stride : 1);
         const leonida::gfx10::BufferWords words{w[0], w[1], w[2], w[3]};
         leonida::gfx10::Buffer desc{};
-        const bool copy_geometry = leonida::gfx10::decode(words, desc) &&
+        const bool valid_vsharp = leonida::gfx10::decode(words, desc);
+        const bool scratch_window = valid_vsharp && span <= kTitleWindowMax &&
+            (desc.format || leonida::gfx10::encode(desc) == words);
+        const bool copy_geometry = valid_vsharp &&
             (path != VsharpPath::scratch || span <= kTitleWindowMax || (desc.format && leonida::gfx10::encode(desc) == words));
+        const bool make_window = path != VsharpPath::scratch || scratch_window;
         const auto to = vsharp_address(base, span, leonida::TitleVaAliases::table_view,
-                                       path != VsharpPath::scratch, copy_geometry);
+                                       make_window, copy_geometry);
         if (!to) {
             static std::atomic_flag noted[3]{};
             if (!noted[unsigned(path)].test_and_set(std::memory_order_relaxed)) {
@@ -3210,6 +3527,8 @@ struct DeviceState {
         std::uint64_t pin = 0;  // the imported pages' leonida::kernel_writes pin while `memory` lives
         std::size_t scan_at = 0;  // the next slot the T# scan reads
         uint64_t checked_generation{}, alias_generation{};
+        std::uint64_t map_generation = leonida::title_memory_map::generation();
+        std::size_t map_retry_left = 0;  // remaining empty_slots to sweep after title_memory_map::generation() advances
         // copy
         bool identity = false;
         ShadowPagesPtr pages;
@@ -3345,16 +3664,21 @@ struct DeviceState {
         }
     }
 
-    // The slots of a heap copy not settled yet: fixed again, and kept while they are still not. Round robin, for at
-    // most LEONIDA_CONSOLE_RETRY_US a submission (500 by default, 0: all of them every time): during the story load
-    // thousands of T#s name textures that come much later, and trying them all at every submission cost hundreds of
-    // milliseconds each. One not reached waits a few submissions more for its texture.
-    void retry_console_slots(ConsoleHeap& heap) {
+    static std::uint64_t console_retry_budget_us() {
         static const std::uint64_t budget_us = [] {
             char text[16] = {};
             const DWORD n = GetEnvironmentVariableA("LEONIDA_CONSOLE_RETRY_US", text, sizeof(text));
             return n > 0 && n < sizeof(text) ? std::strtoull(text, nullptr, 10) : 500ull;
         }();
+        return budget_us;
+    }
+
+    // The slots of a heap copy not settled yet: fixed again, and kept while they are still not. Round robin, for at
+    // most LEONIDA_CONSOLE_RETRY_US a submission (500 by default, 0: all of them every time): during the story load
+    // thousands of T#s name textures that come much later, and trying them all at every submission cost hundreds of
+    // milliseconds each. One not reached waits a few submissions more for its texture.
+    void retry_console_slots(ConsoleHeap& heap) {
+        const std::uint64_t budget_us = console_retry_budget_us();
         const auto start = std::chrono::steady_clock::now();
         std::size_t i = heap.retry_at, visited = 0;
         const std::size_t total = heap.retries.size();
@@ -3436,9 +3760,40 @@ struct DeviceState {
             });
         }
         const auto t2 = clock::now();
-        // A settled zero can acquire GPU backing without a CPU map event. Probe at most eight in
-        // round-robin order every 32 submissions. Keep texture and copy-budget retries independent.
-        if ((heap.refreshes & 31) == 31 && !heap.empty_slots.empty()) {
+        // When the title maps or commits pages (title_memory_map::generation() advances), arm a budgeted sweep
+        // over empty_slots so previously unbacked V#s recover on the next submission rather than waiting for
+        // the 8-slot / 32-submission background probe.
+        if (heap.resource_heap) {
+            const auto map_generation = leonida::title_memory_map::generation();
+            if (map_generation != heap.map_generation) {
+                heap.map_generation = map_generation;
+                heap.map_retry_left = heap.empty_slots.size();
+            }
+        }
+        if (heap.map_retry_left && !heap.empty_slots.empty()) {
+            if (heap.map_retry_left > heap.empty_slots.size()) heap.map_retry_left = heap.empty_slots.size();
+            const std::uint64_t budget_us = console_retry_budget_us();
+            const auto sweep_start = clock::now();
+            auto it = heap.empty_slots.lower_bound(heap.next_empty);
+            std::size_t visited = 0;
+            while (heap.map_retry_left && !heap.empty_slots.empty()) {
+                if (it == heap.empty_slots.end()) it = heap.empty_slots.begin();
+                const auto slot = *it++;
+                heap.next_empty = slot + 1;
+                --heap.map_retry_left;
+                ++visited;
+                if (!heap.retry[slot]) {
+                    fix_console_slot(heap, slot);
+                    ++heap.retried;
+                }
+                if (budget_us && !(visited & 15) &&
+                    clock::now() - sweep_start >= std::chrono::microseconds(budget_us))
+                    break;
+            }
+            if (heap.empty_slots.empty()) heap.map_retry_left = 0;
+        } else if ((heap.refreshes & 31) == 31 && !heap.empty_slots.empty()) {
+            // A settled zero can acquire GPU backing without a CPU map event. Probe at most eight in
+            // round-robin order every 32 submissions. Keep texture and copy-budget retries independent.
             auto it = heap.empty_slots.lower_bound(heap.next_empty);
             const auto count = (std::min)(std::size_t{8}, heap.empty_slots.size());
             for (std::size_t n = 0; n < count && !heap.empty_slots.empty(); ++n) {
@@ -9070,6 +9425,8 @@ public:
             wchar_t v[2]{};
             return !(GetEnvironmentVariableW(L"LEONIDA_LAZY_COMPUTE", v, 2) == 1 && v[0] == L'0');
         }();
+        const std::string& program_hash = !entry->fssm_sha256.empty() ? entry->fssm_sha256 : entry->fspx_code_sha256;
+        const char* bvh_hold_reason = nullptr;
         if (skip_compute(entry->name)) {
             // Never built. Replay drops each dispatch (ComputePipeline::skipped); the first one is logged, so a
             // boot's log lists the skipped programs the title actually ran.
@@ -9079,6 +9436,33 @@ public:
                 if (!pso->skip_logged_.exchange(true))
                     std::fprintf(stderr, "[rt] d3d12: compute program %s is skipped (LEONIDA_SKIP_COMPUTE): its "
                                          "dispatches are dropped\n", pso->compute_entry_->name.c_str());
+                return VK_NULL_HANDLE;
+            };
+            pipeline_.build_context = this;
+        } else if (hold_bvh_compute(program, entry->name, program_hash, device_.info.subgroup, &bvh_hold_reason)) {
+            pipeline_.skipped = true;
+            bvh_hold_reason_ = bvh_hold_reason;
+            const std::uint64_t held_total = ++g_bvh_held_psos;
+            if (held_total == 1)
+                std::fprintf(stderr,
+                             "[rt] d3d12: BVH compute hold active (%s): holding %s (sha256 %s; %llu held so far; "
+                             "set LEONIDA_BVH_HOLD=0 to disable)\n",
+                             bvh_hold_reason_, entry->name.c_str(), program_hash.c_str(),
+                             static_cast<unsigned long long>(held_total));
+            pipeline_.build = [](void* self) -> VkPipeline {
+                auto* pso = static_cast<PipelineState*>(self);
+                if (!pso->skip_logged_.exchange(true)) {
+                    const std::uint64_t dispatched = ++g_bvh_held_dispatches;
+                    const auto* e = pso->compute_entry_;
+                    const std::string& hash = !e->fssm_sha256.empty() ? e->fssm_sha256 : e->fspx_code_sha256;
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: compute program %s (sha256 %s) is held (%s): its dispatches are dropped "
+                                 "(%llu held BVH compute shader(s) dispatched, %llu held PSOs total)\n",
+                                 e->name.c_str(), hash.c_str(),
+                                 pso->bvh_hold_reason_ ? pso->bvh_hold_reason_ : "LEONIDA_BVH_HOLD",
+                                 static_cast<unsigned long long>(dispatched),
+                                 static_cast<unsigned long long>(g_bvh_held_psos.load(std::memory_order_relaxed)));
+                }
                 return VK_NULL_HANDLE;
             };
             pipeline_.build_context = this;
@@ -9583,6 +9967,7 @@ private:
     const leonida::ShaderEntry* compute_entry_ = nullptr;  // compute: the translated shader build_compute reads
     bool compute_failed_ = false;                          // compute: could not be built; not retried
     std::atomic<bool> skip_logged_{false};                 // compute: the skipped program's first dispatch was logged
+    const char* bvh_hold_reason_ = nullptr;                // compute: reason set by LEONIDA_BVH_HOLD when held
     bool lazy_ = false;       // graphics: built at the first draw (lazy_graphics_pipelines)
     bool f16_linked_ = false; // graphics: the VS and PS words had their f16 halves linked
     leonida::Depth24Bias depth24_bias_{};
@@ -14067,11 +14452,22 @@ public:
             return !(GetEnvironmentVariableW(L"LEONIDA_CBV_RAW", value, 2) == 1 && value[0] == L'1');
         }();
         const uint64_t rows = (uint64_t(desc->SizeInBytes) + 15) / 16;
-        buffer.address = state_.vsharp_address(buffer.address, console_form ? rows * 16 : desc->SizeInBytes);
-        // No backing for the title's memory: a zero-size V# (loads 0, stores dropped), never the raw address.
+        const std::uint64_t target = buffer.address;
+        buffer.address = state_.vsharp_address(target, console_form ? rows * 16 : desc->SizeInBytes);
+        // No backing for the title's memory: a zero-size V# (loads 0, stores dropped), never the raw address on a
+        // GPU-visible heap. Inside a console descriptor heap's title pages, preserve the guest VA for title memory so
+        // refresh_console_heap zeros heap.copy now and recovers it automatically once those pages become backed.
         const bool backed = buffer.address != 0;
+        bool preserve_guest = false;
         if (!backed) {
-            buffer.stride = 0, buffer.num_records = 0;
+            std::uint64_t lo = 0, hi = 0;
+            preserve_guest = state_.has_console_descriptor_copy(destination.ptr) &&
+                             leonida::title_va_aliases().title_memory(target, lo, hi);
+            if (preserve_guest) {
+                buffer.address = target;
+            } else {
+                buffer.stride = 0, buffer.num_records = 0;
+            }
             leonida::note_unbacked_view("constant-buffer view", desc->BufferLocation, desc->SizeInBytes);
         }
         leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
@@ -14081,7 +14477,7 @@ public:
         // the stride: the batched Scaleform vertex shader reads its X and Y transform rows as base + index * stride.
         // With the raw form (stride 0) both rows are the same 16 bytes and every batched triangle collapses onto the
         // line x = y. LEONIDA_CBV_RAW=1 restores the raw form.
-        if (console_form && backed) {
+        if (console_form && (backed || preserve_guest)) {
             words[1] = (words[1] & 0xFFFFu) | (16u << 16);
             words[2] = UINT(rows);
             words[3] = 0x0002403Cu;
@@ -14173,9 +14569,17 @@ public:
         } else {
             const std::uint64_t target = buffer.address;
             buffer.address = state_.vsharp_address(buffer.address, bytes);
-            // No backing: no records, so loads return 0 and stores are dropped (never a raw title base).
+            // No backing: no records, so loads return 0 and stores are dropped (never a raw title base on a
+            // GPU-visible heap). Preserve guest title-memory VAs inside console descriptor heaps so
+            // refresh_console_heap zeros heap.copy now and recovers once those pages are mapped.
             if (!buffer.address) {
-                buffer.stride = 0, buffer.num_records = 0;
+                std::uint64_t lo = 0, hi = 0;
+                if (state_.has_console_descriptor_copy(destination.ptr) &&
+                    leonida::title_va_aliases().title_memory(target, lo, hi)) {
+                    buffer.address = target;
+                } else {
+                    buffer.stride = 0, buffer.num_records = 0;
+                }
                 leonida::note_unbacked_view("buffer SRV", target, bytes);
             }
         }
@@ -14399,9 +14803,17 @@ public:
         const std::uint64_t target = buffer.address;
         buffer.address = state_.vsharp_address(buffer.address,
                                         std::uint64_t(buffer.num_records) * (buffer.stride ? buffer.stride : 1));
-        // No backing: no records, so loads return 0 and stores are dropped (never a raw title base).
+        // No backing: no records, so loads return 0 and stores are dropped (never a raw title base on a GPU-visible
+        // heap). Preserve guest title-memory VAs inside console descriptor heaps so refresh_console_heap zeros
+        // heap.copy now and recovers once those pages are mapped.
         if (!buffer.address) {
-            buffer.stride = 0, buffer.num_records = 0;
+            std::uint64_t lo = 0, hi = 0;
+            if (state_.has_console_descriptor_copy(destination.ptr) &&
+                leonida::title_va_aliases().title_memory(target, lo, hi)) {
+                buffer.address = target;
+            } else {
+                buffer.stride = 0, buffer.num_records = 0;
+            }
             leonida::note_unbacked_view("buffer UAV", target, std::uint64_t(view.NumElements) * (unit ? unit : 1));
         }
         const g::BufferWords words = g::encode(buffer);
@@ -14409,8 +14821,19 @@ public:
         if (counter_va) {
             g::Buffer counter_buffer{};
             counter_buffer.address = state_.vsharp_address(counter_va, 4);
-            counter_buffer.num_records = counter_buffer.address ? 4 : 0;
-            if (!counter_buffer.address) leonida::note_unbacked_view("UAV counter", counter_va, 4);
+            if (counter_buffer.address) {
+                counter_buffer.num_records = 4;
+            } else {
+                std::uint64_t lo = 0, hi = 0;
+                if (state_.has_console_descriptor_copy(destination.ptr) &&
+                    leonida::title_va_aliases().title_memory(counter_va, lo, hi)) {
+                    counter_buffer.address = counter_va;
+                    counter_buffer.num_records = 4;
+                } else {
+                    counter_buffer.num_records = 0;
+                }
+                leonida::note_unbacked_view("UAV counter", counter_va, 4);
+            }
             counter_buffer.oob_select = g::OobSelect::raw;
             const g::BufferWords counter_words = g::encode(counter_buffer);
             std::memcpy(reinterpret_cast<char*>(destination.ptr) + sizeof(words), counter_words.data(),
@@ -18573,6 +18996,25 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
 
 std::filesystem::path configured_shader_directory(std::string* error, const std::filesystem::path& config) {
     return leonida::shader_paths::configured(error, config);
+}
+
+bool rdna2_code_walks_bvh(const std::uint8_t* code, std::size_t size) {
+    return rdna2_code_walks_bvh_impl(code, size);
+}
+
+bool compute_program_walks_bvh_for_test(const leonida::ComputeProgram& program) {
+    return compute_program_walks_bvh(program);
+}
+
+bool evaluate_bvh_hold_policy(const char* env_value, std::string_view name, std::string_view sha256,
+                              bool walks_bvh, const leonida::SubgroupSizeCaps& subgroup,
+                              bool rehydrate_unimplemented, const char** reason) {
+    const BvhHoldPolicy policy = parse_bvh_hold_policy(env_value);
+    return match_bvh_hold_policy(policy, name, sha256, walks_bvh, subgroup, rehydrate_unimplemented, reason);
+}
+
+void set_bvh_rehydrate_unimplemented_override_for_test(int state) {
+    g_bvh_rehydrate_unimplemented_override.store(state, std::memory_order_release);
 }
 
 }  // namespace rt::d3d12

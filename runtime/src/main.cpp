@@ -436,6 +436,8 @@ int wmain(int argc, wchar_t** argv) {
     rt::d3d12_trace::set_enabled(trace_d3d12);
     // Slot 133 imports the title's pages; xmem commits them on first touch, so they are committed first.
     rt::d3d12_xs::set_placed_at_va_pages_hook(&rt::xmem::commit_physical_range);
+    // Queue slot 31 (CopyPageMappingsBatchX): batched, multi-window-safe page mapping with paired CPU mirroring.
+    rt::d3d12_xs::set_copy_page_mappings_hook(&rt::xmem::copy_page_mappings);
     // So do the file shims' reads, whose kernel writes do not fault them in: on ERROR_NOACCESS (title_page_watch.h).
     leonida::geometry_writes::aliases.store(&rt::xmem::geometry_aliases);
     leonida::kernel_writes::set_committer(&rt::xmem::commit_physical_range);

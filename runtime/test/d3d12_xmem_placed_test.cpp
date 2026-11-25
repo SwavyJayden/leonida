@@ -174,6 +174,103 @@ int queue_remap(ID3D12Device* real, ID3D12Device* proxy) {
     return 0;
 }
 
+// End-to-end queue slot 31 through the default production path (no explicit set_copy_page_mappings_hook):
+// verifies batched multi-window carved destinations, cross-range overlap + source holes, default-on paired CPU view
+// mirroring with title_texel_writes on both GPU and CPU addresses, to_cpu source fallback, and non-zero flags.
+int queue_remap_default_and_paired(ID3D12Device* real, ID3D12Device* proxy) {
+    (void)real;
+    using rt::xmem::PageRange;
+    using rt::xmem::PageBatch;
+    auto reserve = reinterpret_cast<XMemVirtualAllocFn>(rt::shims::find("xmem.dll", "XMemVirtualAlloc"));
+    auto allocate = reinterpret_cast<XMemAllocatePhysicalPagesFn>(rt::shims::find("xmem.dll", "XMemAllocatePhysicalPages"));
+    auto map = reinterpret_cast<XMemMapPhysicalPagesFn>(rt::shims::find("xmem.dll", "XMemMapPhysicalPages"));
+    auto free_pages = reinterpret_cast<XMemFreePhysicalPagesFn>(rt::shims::find("xmem.dll", "XMemFreePhysicalPages"));
+    EXPECT(reserve && allocate && map && free_pages);
+
+    struct TwinEnvGuard {
+        char saved[16]{};
+        TwinEnvGuard() {
+            GetEnvironmentVariableA("LEONIDA_SLOT31_CPU_TWIN", saved, sizeof(saved));
+            SetEnvironmentVariableA("LEONIDA_SLOT31_CPU_TWIN", nullptr);
+        }
+        ~TwinEnvGuard() { SetEnvironmentVariableA("LEONIDA_SLOT31_CPU_TWIN", *saved ? saved : nullptr); }
+    } env_guard;
+
+    constexpr unsigned n = 4;
+    auto window = [&](DWORD protect) {
+        return static_cast<std::uint8_t*>(reserve(nullptr, n * kPage64k, MEM_RESERVE | kXmem64kPages, 0, protect));
+    };
+    auto* pool = window(PAGE_READWRITE);
+    auto* carved_dst = window(PAGE_READWRITE);
+    auto* pair_cpu = window(PAGE_READWRITE);
+    auto* pair_gpu = window(0x801);
+    EXPECT(pool && carved_dst && pair_cpu && pair_gpu);
+    EXPECT(leonida::title_gpu_views::to_cpu(uintptr_t(pair_gpu)) == uintptr_t(pair_cpu));
+    void* split = reserve(carved_dst + kPage64k, 2 * kPage64k,
+                          MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | kXmem64kPages, 0, PAGE_READWRITE);
+    EXPECT(split == carved_dst + kPage64k);
+
+    std::uint64_t pages[n]{}, count = n;
+    EXPECT(allocate(0x280, &count, pages) && count == n);
+    // Map only 3 of 4 pool pages so page 3 is a source hole.
+    EXPECT(map(pool, 3, pages) == pool);
+    for (unsigned i = 0; i < 3; ++i) pool[i * kPage64k] = static_cast<std::uint8_t>(40 + i);
+
+    D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_COPY};
+    Ref<ID3D12CommandQueue> queue;
+    EXPECT(SUCCEEDED(proxy->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue.p))));
+    // Explicitly keep the test hook cleared so slot 31 exercises the default production path.
+    rt::d3d12_xs::set_copy_page_mappings_hook(nullptr);
+    using Copy = HRESULT(WINAPI*)(void*, UINT, const PageBatch*, std::uintptr_t, UINT, UINT);
+    auto call = reinterpret_cast<Copy>((*reinterpret_cast<void***>(queue.p))[31]);
+
+    // 1. Multi-window contiguous destination spanning carved windows + trailing source hole + non-zero flags.
+    const PageRange multi_win[] = {{0, 0, n}};
+    const PageBatch multi_batch{uintptr_t(carved_dst), 1, multi_win};
+    EXPECT(SUCCEEDED(call(queue.p, 1, &multi_batch, uintptr_t(pool), n, 0x1u)));
+    EXPECT(carved_dst[0] == 40 && carved_dst[kPage64k] == 41 && carved_dst[2 * kPage64k] == 42 &&
+           state_is(carved_dst + 3 * kPage64k, MEM_RESERVE));
+
+    // 2. Cross-range overlap + source hole across split windows: [hole, 40, 41, 42].
+    const PageRange overlap[] = {{0, 3, 1}, {0, 0, 2}, {0, 2, 1}};
+    const PageBatch overlap_batch{uintptr_t(carved_dst), 3, overlap};
+    EXPECT(SUCCEEDED(call(queue.p, 1, &overlap_batch, uintptr_t(carved_dst), n, 0x1234u)));
+    EXPECT(state_is(carved_dst, MEM_RESERVE) && carved_dst[kPage64k] == 40 &&
+           carved_dst[2 * kPage64k] == 41 && carved_dst[3 * kPage64k] == 42);
+
+    // 3. Legacy paired GPU+CPU view mirrors by default (no LEONIDA_SLOT31_CPU_TWIN=1) and notifies both addresses.
+    const auto has_range = [](const std::vector<std::pair<std::uintptr_t, std::uintptr_t>>& ranges,
+                              uintptr_t begin, uintptr_t end) {
+        for (const auto& [a, b] : ranges) {
+            if (a <= begin && b >= end) return true;
+        }
+        return false;
+    };
+    bool overflow = false;
+    leonida::title_texel_writes::take(overflow);
+    const PageRange map_pair[] = {{0, 0, 2}};
+    const PageBatch pair_batch{uintptr_t(pair_gpu), 1, map_pair};
+    EXPECT(SUCCEEDED(call(queue.p, 1, &pair_batch, uintptr_t(pool), n, 0)));
+    EXPECT(pair_gpu[0] == 40 && pair_gpu[kPage64k] == 41 && pair_cpu[0] == 40 && pair_cpu[kPage64k] == 41 &&
+           state_is(pair_cpu + 2 * kPage64k, MEM_RESERVE));
+    auto writes = leonida::title_texel_writes::take(overflow);
+    EXPECT(!overflow && has_range(writes, uintptr_t(pair_gpu), uintptr_t(pair_gpu) + 2 * kPage64k) &&
+           has_range(writes, uintptr_t(pair_cpu), uintptr_t(pair_cpu) + 2 * kPage64k));
+
+    // 4. to_cpu source fallback through queue slot 31: source mapped only at pair_cpu[2], read via pair_gpu[2].
+    EXPECT(map(pair_cpu + 2 * kPage64k, 1, &pages[2]) == pair_cpu + 2 * kPage64k);
+    const PageRange from_gpu[] = {{0, 2, 1}};
+    const PageBatch fallback_batch{uintptr_t(carved_dst), 1, from_gpu};
+    EXPECT(SUCCEEDED(call(queue.p, 1, &fallback_batch, uintptr_t(pair_gpu), n, 0)));
+    EXPECT(carved_dst[0] == 42);
+
+    EXPECT(map(carved_dst, n, nullptr) && map(pair_gpu, n, nullptr) && map(pair_cpu, n, nullptr) &&
+           map(pool, n, nullptr));
+    EXPECT(free_pages(n, pages));
+    std::puts("queue slot 31 default path: carved multi-window, cross-range overlap, source holes, default paired CPU mirroring, texel writes on GPU+CPU, to_cpu fallback, and non-zero flags passed");
+    return 0;
+}
+
 // What a GPU copy of `buffer` reads now (a submission: the shadows are refreshed first).
 int read_back(ID3D12Device* real, ID3D12Resource* buffer, UINT64 size, std::vector<std::uint8_t>& out) {
     D3D12_RESOURCE_DESC desc = buffer->GetDesc();
@@ -547,6 +644,7 @@ int main(int argc, char** argv) {
             failures += run(real.p, device.p, eager);
             failures += exposure_map_ranges(device.p);
             failures += queue_remap(real.p, device.p);
+            failures += queue_remap_default_and_paired(real.p, device.p);
             failures += paired_views(real.p);
         }
     }

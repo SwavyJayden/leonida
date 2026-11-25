@@ -388,7 +388,6 @@ constexpr uintptr_t kTitleImage = 0x140000000;
 // Only the reservations consumed by gfx_stream_pool_init_cpu_and_gpu_alias.
 // Both locks protect writes; queue readers hold the physical lock, handlers the fault lock.
 uintptr_t stream_cpu, stream_gpu, stream_size;
-bool mirror_stream;
 leonida::host_heap::map<uintptr_t, Window> stream_offsets;
 std::mutex g_phys_mutex;
 std::map<uintptr_t, Window> g_windows;              // base -> window
@@ -2308,10 +2307,15 @@ void note_stream_reservation(uintptr_t base, size_t size, uintptr_t caller_rva) 
     } else if (stream_cpu && size == stream_size && !stream_gpu) {
         stream_gpu = base;
         stream_offsets.emplace(0, Window{size, 0});
-        char value[2]{};
-        mirror_stream = GetEnvironmentVariableA("LEONIDA_SLOT31_CPU_TWIN", value, sizeof(value)) == 1 && value[0] == '1';
     }
     rt::placed_image_map_note::publish_pair(stream_gpu, stream_cpu, stream_size);
+}
+
+// Paired CPU-view mirroring for CopyPageMappingsBatchX: on by default; LEONIDA_SLOT31_CPU_TWIN=0 disables it.
+bool slot31_cpu_twin_enabled() {
+    char value[8]{};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_SLOT31_CPU_TWIN", value, sizeof(value));
+    return !(n == 1 && value[0] == '0');
 }
 
 bool queue_page_mappings_enabled() {
@@ -2355,7 +2359,13 @@ bool copy_page_mappings(std::uint32_t count, const PageBatch* batches, std::uint
         return false;
     };
     const auto fail = [](DWORD error) { SetLastError(error); return false; };
-    if (flags || (count && !batches)) return fail(ERROR_INVALID_PARAMETER);
+    if (count && !batches) return fail(ERROR_INVALID_PARAMETER);
+    if (flags) {
+        static std::atomic<bool> logged_flags{false};
+        if (!logged_flags.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr, "[rt] xmem: copy_page_mappings ignoring non-zero flags 0x%x (logged once)\n", flags);
+        }
+    }
     if (!count) return true;
     if (!placeholder_api().available()) return fail(ERROR_NOT_SUPPORTED);
     struct Range {
@@ -2407,10 +2417,17 @@ bool copy_page_mappings(std::uint32_t count, const PageBatch* batches, std::uint
                         const auto source = pool + uint64_t(r.start) * kPhysicalPageSize;
                         for (uint32_t j = 0; j < n; ++j) {
                             const auto src = source + uint64_t(j) * kPhysicalPageSize;
-                            const auto it = g_mapped.find(src);
+                            auto it = g_mapped.find(src);
+                            uintptr_t cpu_src = src;
+                            if (it == g_mapped.end()) {
+                                // A GPU-only source whose pages were mapped at its paired CPU view.
+                                cpu_src = leonida::title_gpu_views::to_cpu(src, kPhysicalPageSize);
+                                if (cpu_src != src) it = g_mapped.find(cpu_src);
+                            }
                             if (it == g_mapped.end()) {
                                 // A hole in a valid source window unmaps the destination (CLHelper, RT-QUEUE31).
-                                if (!find_window(src, kPhysicalPageSize))
+                                if (!find_window(src, kPhysicalPageSize) &&
+                                    (cpu_src == src || !find_window(cpu_src, kPhysicalPageSize)))
                                     return refuse(ERROR_INVALID_ADDRESS, 5, src, r.kind);
                                 frames.push_back(0);
                             } else {
@@ -2429,7 +2446,6 @@ bool copy_page_mappings(std::uint32_t count, const PageBatch* batches, std::uint
             const bool mirror = gpu_source != 0;
             const auto bytes = uint64_t(r.spec.count) * kPhysicalPageSize;
             bool ok = true;
-            bool changed_mirror = false;
             uintptr_t failed_at = r.at;
             if (!mirror && r.spec.kind == 2) {
                 const UnmapCause cause("CopyPageMappingsBatchX (unmap range)");
@@ -2482,7 +2498,6 @@ bool copy_page_mappings(std::uint32_t count, const PageBatch* batches, std::uint
                     while (end < r.spec.count && changes(end)) ++end;
                     const uintptr_t from = r.at + uint64_t(j) * kPhysicalPageSize;
                     failed_at = from;
-                    changed_mirror = mirror;
                     const FaultLockExclusive faults;
                     {
                         const UnmapCause cause("CopyPageMappingsBatchX (remap run)");
@@ -2528,31 +2543,71 @@ bool copy_page_mappings(std::uint32_t count, const PageBatch* batches, std::uint
                 }
             }
             const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
-            // Publish after changing the mapping, including partial host failures.
-            if (!mirror || changed_mirror) leonida::title_texel_writes::note(reinterpret_cast<void*>(r.at), bytes);
+            // Publish after changing the mapping, including partial host failures, for both GPU and mirrored CPU ranges.
+            leonida::title_texel_writes::note(reinterpret_cast<void*>(r.at), bytes);
             if (!ok) return refuse(error, 7, failed_at, r.spec.kind);
             return true;
         };
+        const bool mirror_cpu_twin = slot31_cpu_twin_enabled();
         for (const auto& r : plan) {
             const bool ok = apply(r, 0);
             const auto error = ok ? ERROR_SUCCESS : GetLastError();
             const auto end = r.at + uint64_t(r.spec.count) * kPhysicalPageSize;
-            if (mirror_stream && stream_gpu && end > stream_gpu && r.at < stream_gpu + stream_size) {
-                for (const auto& [offset, extent] : stream_offsets) {
-                    auto gpu = (std::max)(r.at, stream_gpu + offset);
-                    const auto stop = (std::min)(end, stream_gpu + offset + extent.size);
-                    while (gpu < stop) {
-                        const auto cpu = stream_cpu + (gpu - stream_gpu);
+            if (mirror_cpu_twin) {
+                bool mirrored_view = false;
+                leonida::title_gpu_views::Range view{};
+                if (leonida::title_gpu_views::view_at(r.at, end - r.at, view) && !view.independent_pages &&
+                    r.at >= view.gpu && r.at - view.gpu < view.size) {
+                    mirrored_view = true;
+                    uintptr_t gpu = r.at;
+                    while (gpu < end) {
+                        const auto cpu = view.cpu + (gpu - view.gpu);
                         auto it = g_windows.upper_bound(cpu);
-                        if (it == g_windows.begin()) return refuse(ERROR_INVALID_ADDRESS, 8, cpu, r.spec.kind);
-                        --it;
-                        const auto cpu_end = it->first + it->second.size;
-                        if (cpu >= cpu_end) return refuse(ERROR_INVALID_ADDRESS, 8, cpu, r.spec.kind);
-                        const auto bytes = (std::min)(stop - gpu, cpu_end - cpu);
-                        if (bytes < kPhysicalPageSize) return refuse(ERROR_INVALID_ADDRESS, 8, cpu, r.spec.kind);
-                        Range twin{cpu, {0, 0, static_cast<uint32_t>(bytes / kPhysicalPageSize)}, 0, view_protect(it->second)};
-                        if (!apply(twin, gpu)) return false;
-                        gpu += bytes;
+                        if (it != g_windows.begin()) {
+                            --it;
+                            const auto cpu_end = it->first + it->second.size;
+                            if (cpu < cpu_end && cpu_end - cpu >= kPhysicalPageSize) {
+                                const auto twin_bytes =
+                                    ((std::min)(end - gpu, cpu_end - cpu)) & ~uintptr_t(kPhysicalPageSize - 1);
+                                Range twin{cpu,
+                                           {r.spec.kind, 0, static_cast<uint32_t>(twin_bytes / kPhysicalPageSize)},
+                                           0,
+                                           view_protect(it->second)};
+                                if (!apply(twin, gpu)) return false;
+                                gpu += twin_bytes;
+                                continue;
+                            }
+                        }
+                        auto next = g_windows.upper_bound(cpu);
+                        if (next == g_windows.end()) break;
+                        const auto advance = next->first - cpu;
+                        if (advance >= end - gpu) break;
+                        const auto step = (advance + kPhysicalPageSize - 1) & ~uintptr_t(kPhysicalPageSize - 1);
+                        if (step >= end - gpu) break;
+                        gpu += step;
+                    }
+                }
+                if (!mirrored_view && stream_gpu && end > stream_gpu && r.at < stream_gpu + stream_size) {
+                    for (const auto& [offset, extent] : stream_offsets) {
+                        auto gpu = (std::max)(r.at, stream_gpu + offset);
+                        const auto stop = (std::min)(end, stream_gpu + offset + extent.size);
+                        while (gpu < stop) {
+                            const auto cpu = stream_cpu + (gpu - stream_gpu);
+                            auto it = g_windows.upper_bound(cpu);
+                            if (it == g_windows.begin()) return refuse(ERROR_INVALID_ADDRESS, 8, cpu, r.spec.kind);
+                            --it;
+                            const auto cpu_end = it->first + it->second.size;
+                            if (cpu >= cpu_end) return refuse(ERROR_INVALID_ADDRESS, 8, cpu, r.spec.kind);
+                            const auto twin_bytes = (std::min)(stop - gpu, cpu_end - cpu);
+                            if (twin_bytes < kPhysicalPageSize)
+                                return refuse(ERROR_INVALID_ADDRESS, 8, cpu, r.spec.kind);
+                            Range twin{cpu,
+                                       {r.spec.kind, 0, static_cast<uint32_t>(twin_bytes / kPhysicalPageSize)},
+                                       0,
+                                       view_protect(it->second)};
+                            if (!apply(twin, gpu)) return false;
+                            gpu += twin_bytes;
+                        }
                     }
                 }
             }
@@ -2563,6 +2618,9 @@ bool copy_page_mappings(std::uint32_t count, const PageBatch* batches, std::uint
     }
     return true;
 }
+
+[[maybe_unused]] const bool g_copy_page_mappings_batch_set =
+    (rt::xmem::copy_page_mappings_batch_fn = &rt::xmem::copy_page_mappings, true);
 
 void geometry_aliases(std::uintptr_t va, std::vector<std::uintptr_t>& addresses) {
     AddressList snapshot;

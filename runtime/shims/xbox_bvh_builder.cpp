@@ -63,6 +63,11 @@ struct BuilderState {
 
 std::mutex g_mutex;
 std::unordered_map<const void*, BuilderState> g_builders;
+std::atomic<std::uint64_t> g_rehydrate_not_impl_calls{0};
+
+// Queried by d3d12_vulkan_device.cpp (LEONIDA_BVH_HOLD=auto) through rt::shims::find without adding a link
+// dependency between the two libraries. Flip to false once builder_rehydrate_batched2x implements rehydration.
+bool rehydrate_unimplemented_status() { return true; }
 
 void log_once(std::atomic<bool>& flag, const char* text) {
     if (!flag.exchange(true)) std::fprintf(stderr, "[rt] XboxBvhBuilder shim: %s\n", text);
@@ -228,8 +233,11 @@ void builder_copy(void*, void* list, UINT64 dest, UINT64 source, D3D12_RAYTRACIN
 
 // ?RehydrateRaytracingAccelerationStructureBatched2X@XboxBvhBuilder@@QEAAJPEAUID3D12GraphicsCommandList8@@IPEBUD3D12_
 // BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC@@PEB_K@Z -> HRESULT. Not implemented yet (see the header comment).
+// While this returns E_NOTIMPL, rehydrate_unimplemented_status() reports true so LEONIDA_BVH_HOLD=auto on Wave32
+// holds BVH-walking compute shaders instead of letting them traverse unrehydrated structures.
 HRESULT builder_rehydrate_batched2x(void*, void*, UINT, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC*,
                                     const UINT64*) {
+    g_rehydrate_not_impl_calls.fetch_add(1, std::memory_order_relaxed);
     static std::atomic<bool> s_logged{false};
     log_once(s_logged, "RehydrateRaytracingAccelerationStructureBatched2X is not implemented yet; E_NOTIMPL");
     return E_NOTIMPL;
@@ -257,6 +265,7 @@ const rt::shims::Entry kEntries[] = {
      "?RehydrateRaytracingAccelerationStructureBatched2X@XboxBvhBuilder@@QEAAJPEAUID3D12GraphicsCommandList8@@IPEBU"
      "D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC@@PEB_K@Z",
      reinterpret_cast<void*>(&builder_rehydrate_batched2x)},
+    {kDll, "__leonida_bvh_rehydrate_status", reinterpret_cast<void*>(&rehydrate_unimplemented_status)},
 };
 
 bool shim_enabled() {
@@ -281,5 +290,9 @@ namespace rt::shims {
 size_t xbox_bvh_builder_live_count() {
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_builders.size();
+}
+bool xbox_bvh_builder_rehydrate_unimplemented() { return shim_enabled() && rehydrate_unimplemented_status(); }
+std::uint64_t xbox_bvh_builder_rehydrate_not_impl_calls() {
+    return g_rehydrate_not_impl_calls.load(std::memory_order_relaxed);
 }
 }  // namespace rt::shims

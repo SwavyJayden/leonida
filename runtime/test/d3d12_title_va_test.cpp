@@ -741,9 +741,10 @@ int check_title_memory(Context& c, int& checks, bool geometry) {
     c.device->CreateConstantBufferView(&not_title, D3D12_CPU_DESCRIPTOR_HANDLE{cpu + 5 * inc});
     c.device->CreateConstantBufferView(&reserved_only, D3D12_CPU_DESCRIPTOR_HANDLE{cpu + 6 * inc});
     EXPECT(vsharp_base(cpu + 5 * inc) == 0);
-    // A title range with no committed page gets no copy: the view is written with no base and no records (loads
-    // return 0, stores are dropped), never with the raw title address a shader would add heap_base to.
-    EXPECT(vsharp_base(cpu + 6 * inc) == 0);
+    // A title range with no committed page gets no GPU copy: for a regular PC heap the view is written with no base
+    // and no records; for a console descriptor heap, title CPU memory retains the guest VA so refresh_console_heap
+    // zeroes the GPU copy now and recovers the slot automatically once those pages are committed.
+    EXPECT(vsharp_base(cpu + 6 * inc) == (console ? (gone_va & 0xFFFFFFFFFFFFull) : 0));
     EXPECT(aliases.untranslated(leonida::TitleVaAliases::created_view) == untranslated_before);
     if (console) heap.reset();
     if (geometry) {

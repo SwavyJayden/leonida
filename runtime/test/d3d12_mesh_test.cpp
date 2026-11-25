@@ -12,8 +12,8 @@
 //     bottom-left quadrant (yellow). Each pixel is read back and compared.
 //   - A vertex draw with the mesh PSO, and DispatchMesh with the VS one, fail at execution (ReplayResult::
 //     invalid_draw); a mesh grid beyond D3D12's limits fails at Close; an empty grid records nothing.
-//   - A DISPATCH_MESH command signature is created only with the extension; ExecuteIndirect with it records nothing
-//     yet, so its list closes.
+//   - A DISPATCH_MESH command signature is created only with the extension; ExecuteIndirect with it replays through
+//     vkCmdDrawMeshTasksIndirectEXT / vkCmdDrawMeshTasksIndirectCountEXT (fixed, counted, and 0xFFFFFFFF clamped).
 // The shaders are GLSL written to the translator's contract (test/glsl/ms_draw.mesh, ps_draw.frag, vs_fullscreen.vert).
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
@@ -105,6 +105,8 @@ int main(int argc, char** argv) {
     EXPECT(SetEnvironmentVariableW(L"LEONIDA_XS_STREAM_ENUM", pc_only ? L"0" : L"1"));
     vktest::Device d;
     d.request_mesh_shader = true;
+    d.request_multi_draw_indirect = true;
+    d.request_draw_indirect_count = true;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) {
         std::fprintf(stderr, "SKIP: no usable Vulkan 1.3 device\n");
@@ -160,6 +162,9 @@ int main(int argc, char** argv) {
         info.mesh_shader = mesh;
         info.mesh_shader_queries = mesh && d.mesh_shader_queries;
         info.pipeline_statistics_query = d.pipeline_statistics_query;
+        info.multi_draw_indirect = d.enabled.multiDrawIndirect == VK_TRUE;
+        info.draw_indirect_count_enabled = d.draw_indirect_count_enabled;
+        info.max_draw_indirect_count = d.max_draw_indirect_count;
         return info;
     };
     const auto make_device = [&](bool mesh, Ref<ID3D12Device>& device) {
@@ -590,20 +595,230 @@ int main(int argc, char** argv) {
             std::printf("direct heaps on graphics draws: resource heap at s%u, sampler heap at s%u%s\n", 12u, 13u,
                         enabled ? "" : " (LEONIDA_GRAPHICS_DIRECT_HEAPS=0: not written)");
         }
-        // A DISPATCH_MESH command signature (D3D12_DISPATCH_MESH_ARGUMENTS, 12 bytes) is created; a stride below its
-        // 12 bytes is refused as the PC runtime refuses it. ExecuteIndirect with it records nothing yet (#3777 replays
-        // it), so the list still closes.
+        // ExecuteIndirect with DISPATCH_MESH (D3D12_DISPATCH_MESH_ARGUMENTS, 12 bytes):
+        //   - command signature creation accepts stride >= 12 and refuses stride < 12;
+        //   - empty viewport or oversized (!mesh_ok) root signature skips cleanly while keeping the list valid;
+        //   - fixed ExecuteIndirect draws pixels to the render target via vkCmdDrawMeshTasksIndirectEXT;
+        //   - counted ExecuteIndirect (GPU count buffer in a DEFAULT resource) respects count == 0, 1, and clamping to
+        //     max_command_count via vkCmdDrawMeshTasksIndirectCountEXT;
+        //   - 0xFFFFFFFF garbage indirect mesh records (and garbage counts) are safely clamped by indirect_clamp_mesh
+        //     without hanging or crashing, drawing zero quads;
+        //   - wrong pipeline kind (VS PSO with DISPATCH_MESH indirect) fails with ReplayResult::invalid_draw.
         {
             const D3D12_INDIRECT_ARGUMENT_DESC mesh_arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
             const D3D12_COMMAND_SIGNATURE_DESC mesh_sig{12, 1, &mesh_arg, 0};
+            const D3D12_COMMAND_SIGNATURE_DESC padded_sig_desc{16, 1, &mesh_arg, 0};
             const D3D12_COMMAND_SIGNATURE_DESC short_sig{8, 1, &mesh_arg, 0};
-            Ref<ID3D12CommandSignature> sig, short_one;
+            Ref<ID3D12CommandSignature> sig, padded_sig, short_one;
             EXPECT(SUCCEEDED(device->CreateCommandSignature(&mesh_sig, nullptr, IID_PPV_ARGS(&sig.p))) && sig.p);
+            EXPECT(SUCCEEDED(device->CreateCommandSignature(&padded_sig_desc, nullptr, IID_PPV_ARGS(&padded_sig.p))) &&
+                   padded_sig.p);
             EXPECT(device->CreateCommandSignature(&short_sig, nullptr, IID_PPV_ARGS(&short_one.p)) == E_INVALIDARG);
+
+            // Empty viewport skips recording cleanly; list still closes.
             EXPECT(SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
             list->SetGraphicsRootSignature(root.p);
             list->ExecuteIndirect(sig.p, 1, upload.p, 0, nullptr, 0);
             EXPECT(list->Close() == S_OK);
+            {
+                std::vector<leonida::Command> cmds;
+                EXPECT(rt::d3d12::recorded_commands(list.p, cmds) && cmds.empty());
+            }
+
+            // Root signature larger than the mesh shader's 16-dword window skips recording cleanly.
+            {
+                Ref<ID3D12RootSignature> wide;
+                EXPECT(wide_root_signature(device.p, wide));
+                EXPECT(SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
+                list->SetGraphicsRootSignature(wide.p);
+                list->RSSetViewports(1, &viewport);
+                list->ExecuteIndirect(sig.p, 1, upload.p, 0, nullptr, 0);
+                EXPECT(list->Close() == S_OK);
+                std::vector<leonida::Command> cmds;
+                EXPECT(rt::d3d12::recorded_commands(list.p, cmds) && cmds.empty());
+            }
+
+            Ref<ID3D12Resource> ind_target, ind_readback, ind_args_up, ind_args, ind_counts_up, ind_counts;
+            const auto ind_args_desc = buffer_desc(512);
+            const auto ind_counts_desc = buffer_desc(128);
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &rt_desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&ind_target.p))));
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&ind_readback.p))));
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &ind_args_desc,
+                                                             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                             IID_PPV_ARGS(&ind_args_up.p))));
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &ind_args_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&ind_args.p))));
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &ind_counts_desc,
+                                                             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                             IID_PPV_ARGS(&ind_counts_up.p))));
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &ind_counts_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&ind_counts.p))));
+
+            {
+                std::uint8_t* dst = nullptr;
+                EXPECT(SUCCEEDED(ind_args_up->Map(0, nullptr, reinterpret_cast<void**>(&dst))));
+                std::memset(dst, 0, 512);
+                const D3D12_DISPATCH_MESH_ARGUMENTS decoy{4, 1, 1};
+                const D3D12_DISPATCH_MESH_ARGUMENTS fixed_rec{2, 1, 1};
+                const D3D12_DISPATCH_MESH_ARGUMENTS counted_recs[3] = {{1, 1, 1}, {2, 1, 1}, {4, 1, 1}};
+                const D3D12_DISPATCH_MESH_ARGUMENTS garbage_all{0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+                const D3D12_DISPATCH_MESH_ARGUMENTS garbage_x{0xFFFFFFFFu, 1u, 1u};
+                std::memcpy(dst + 0, &decoy, sizeof(decoy));
+                std::memcpy(dst + 64, &fixed_rec, sizeof(fixed_rec));
+                for (UINT i = 0; i < 3; ++i)
+                    std::memcpy(dst + 128 + 16 * i, &counted_recs[i], sizeof(counted_recs[i]));
+                std::memcpy(dst + 256, &garbage_all, sizeof(garbage_all));
+                std::memcpy(dst + 272, &garbage_x, sizeof(garbage_x));
+                ind_args_up->Unmap(0, nullptr);
+            }
+            {
+                std::uint8_t* dst = nullptr;
+                EXPECT(SUCCEEDED(ind_counts_up->Map(0, nullptr, reinterpret_cast<void**>(&dst))));
+                std::memset(dst, 0, 128);
+                const UINT decoy_count = 3, c0 = 0, c1 = 1, c5 = 5, cmax = 0xFFFFFFFFu;
+                std::memcpy(dst + 0, &decoy_count, sizeof(decoy_count));
+                std::memcpy(dst + 16, &c0, sizeof(c0));
+                std::memcpy(dst + 20, &c1, sizeof(c1));
+                std::memcpy(dst + 24, &c5, sizeof(c5));
+                std::memcpy(dst + 28, &cmax, sizeof(cmax));
+                ind_counts_up->Unmap(0, nullptr);
+            }
+
+            Ref<ID3D12DescriptorHeap> ind_rtv_heap;
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&ind_rtv_heap.p))));
+            const D3D12_CPU_DESCRIPTOR_HANDLE ind_rtv{
+                SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(ind_rtv_heap.p, 9))(ind_rtv_heap.p))};
+            device->CreateRenderTargetView(ind_target.p, nullptr, ind_rtv);
+            Ref<ID3D12Fence> ind_fence;
+            EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&ind_fence.p))));
+            UINT64 ind_fence_val = 0;
+            D3D12_RESOURCE_STATES ind_target_state = D3D12_RESOURCE_STATE_COMMON;
+            bool buffers_uploaded = false;
+
+            const auto run_indirect_mesh = [&](ID3D12CommandSignature* use_sig, UINT max_count, UINT64 arg_offset,
+                                               ID3D12Resource* count_buf, UINT64 count_offset,
+                                               std::vector<std::uint8_t>& out) -> bool {
+                if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, mesh_pso.p))) return false;
+                if (!buffers_uploaded) {
+                    list->CopyBufferRegion(ind_args.p, 0, ind_args_up.p, 0, ind_args_desc.Width);
+                    list->CopyBufferRegion(ind_counts.p, 0, ind_counts_up.p, 0, ind_counts_desc.Width);
+                    const D3D12_RESOURCE_BARRIER ready[] = {
+                        transition(ind_args.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+                        transition(ind_counts.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+                    };
+                    list->ResourceBarrier(2, ready);
+                    buffers_uploaded = true;
+                }
+                const D3D12_RESOURCE_BARRIER to_rt =
+                    transition(ind_target.p, ind_target_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                list->ResourceBarrier(1, &to_rt);
+                list->ClearRenderTargetView(ind_rtv, blue, 0, nullptr);
+                list->SetGraphicsRootSignature(root.p);
+                list->RSSetViewports(1, &viewport);
+                list->RSSetScissorRects(1, &scissor);
+                list->OMSetRenderTargets(1, &ind_rtv, FALSE, nullptr);
+                list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+                list->SetGraphicsRootConstantBufferView(1, upload_va);
+                list->ExecuteIndirect(use_sig, max_count, ind_args.p, arg_offset, count_buf, count_offset);
+                const D3D12_RESOURCE_BARRIER to_src =
+                    transition(ind_target.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list->ResourceBarrier(1, &to_src);
+                ind_target_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                D3D12_TEXTURE_COPY_LOCATION ind_dst{};
+                ind_dst.pResource = ind_readback.p;
+                ind_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                ind_dst.PlacedFootprint = {0, {DXGI_FORMAT_R8G8B8A8_UNORM, size, size, 1, 256}};
+                D3D12_TEXTURE_COPY_LOCATION ind_src{};
+                ind_src.pResource = ind_target.p;
+                ind_src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                list->CopyTextureRegion(&ind_dst, 0, 0, 0, &ind_src, nullptr);
+                if (list->Close() != S_OK) return false;
+                queue->ExecuteCommandLists(1, lists);
+                if (rt::d3d12::last_execute_result(queue.p) != leonida::ReplayResult::success) return false;
+                ++ind_fence_val;
+                if (FAILED(queue->Signal(ind_fence.p, ind_fence_val)) ||
+                    FAILED(ind_fence->SetEventOnCompletion(ind_fence_val, nullptr)))
+                    return false;
+                void* ind_mapped = nullptr;
+                if (FAILED(ind_readback->Map(0, nullptr, &ind_mapped))) return false;
+                out.resize(size * 256);
+                std::memcpy(out.data(), ind_mapped, out.size());
+                ind_readback->Unmap(0, nullptr);
+                return true;
+            };
+            const auto check_red_band = [&](const std::vector<std::uint8_t>& img, UINT red_w, UINT red_h,
+                                            const char* label) -> bool {
+                unsigned bad_px = 0;
+                for (UINT row = 0; row < size; ++row) {
+                    for (UINT col = 0; col < size; ++col) {
+                        const bool in_band = col < red_w && row < red_h;
+                        const std::array<std::uint8_t, 4> want =
+                            in_band ? std::array<std::uint8_t, 4>{255, 0, 0, 255}
+                                    : std::array<std::uint8_t, 4>{0, 0, 255, 255};
+                        const std::uint8_t* got = img.data() + row * 256 + col * 4;
+                        if (std::equal(want.begin(), want.end(), got)) continue;
+                        if (bad_px++ < 6)
+                            std::fprintf(stderr, "%s pixel (%u, %u): got %u,%u,%u,%u want %u,%u,%u,%u\n", label, col,
+                                         row, got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+                    }
+                }
+                return bad_px == 0;
+            };
+
+            std::vector<std::uint8_t> ind_pixels;
+            // 1. Fixed indirect DISPATCH_MESH: {2, 1, 1} draws two 16x16 red quads across [0..32) x [0..16).
+            EXPECT(run_indirect_mesh(sig.p, 1, 64, nullptr, 0, ind_pixels));
+            EXPECT(check_red_band(ind_pixels, 32, 16, "indirect mesh fixed"));
+
+            // 2. Counted indirect DISPATCH_MESH with padded 16-byte stride and GPU count buffer (0, 1, and > max).
+            const bool counted_supported = d.draw_indirect_count_enabled && d.max_draw_indirect_count == UINT32_MAX;
+            if (counted_supported) {
+                EXPECT(run_indirect_mesh(padded_sig.p, 2, 128, ind_counts.p, 16, ind_pixels));
+                EXPECT(check_red_band(ind_pixels, 0, 0, "indirect mesh counted=0"));
+                EXPECT(run_indirect_mesh(padded_sig.p, 2, 128, ind_counts.p, 20, ind_pixels));
+                EXPECT(check_red_band(ind_pixels, 16, 16, "indirect mesh counted=1"));
+                EXPECT(run_indirect_mesh(padded_sig.p, 2, 128, ind_counts.p, 24, ind_pixels));
+                EXPECT(check_red_band(ind_pixels, 32, 16, "indirect mesh counted=5 clamped to 2"));
+            } else {
+                std::printf("drawIndirectCount or UINT32_MAX maxDrawIndirectCount unavailable: counted indirect mesh "
+                            "check skipped\n");
+            }
+
+            // 3. 0xFFFFFFFF garbage indirect mesh records are zeroed by indirect_clamp_mesh without hanging/crashing.
+            char clamp_env[2]{};
+            const bool clamp_enabled = GetEnvironmentVariableA("LEONIDA_INDIRECT_CLAMP", clamp_env, 2) != 1 ||
+                                       clamp_env[0] != '0';
+            if (clamp_enabled) {
+                EXPECT(run_indirect_mesh(sig.p, 1, 256, nullptr, 0, ind_pixels));
+                EXPECT(check_red_band(ind_pixels, 0, 0, "indirect mesh clamped 0xFFFFFFFF all"));
+                EXPECT(run_indirect_mesh(sig.p, 1, 272, nullptr, 0, ind_pixels));
+                EXPECT(check_red_band(ind_pixels, 0, 0, "indirect mesh clamped 0xFFFFFFFF x"));
+                if (counted_supported) {
+                    EXPECT(run_indirect_mesh(sig.p, 1, 256, ind_counts.p, 28, ind_pixels));
+                    EXPECT(check_red_band(ind_pixels, 0, 0, "indirect mesh counted clamped 0xFFFFFFFF"));
+                }
+            }
+
+            // 4. Indirect DISPATCH_MESH with a VS PSO fails at execution (ReplayResult::invalid_draw).
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, vs_pso.p)));
+            list->SetGraphicsRootSignature(root.p);
+            list->RSSetViewports(1, &viewport);
+            list->RSSetScissorRects(1, &scissor);
+            list->OMSetRenderTargets(1, &ind_rtv, FALSE, nullptr);
+            list->ExecuteIndirect(sig.p, 1, ind_args.p, 64, nullptr, 0);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_draw);
+
+            std::printf("indirect DISPATCH_MESH: fixed OK%s%s\n",
+                        counted_supported ? ", counted (0/1/clamped) OK" : "",
+                        clamp_enabled ? ", 0xFFFFFFFF clamp OK" : "");
         }
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)) && SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
 

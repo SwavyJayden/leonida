@@ -621,13 +621,151 @@ void test_stream_cpu_twin(const PhysicalApi& api) {
           "GPU unmap removes mirrors and preserves the scatter mapping");
     check(batch(0) && api.map(source, 1, nullptr) == source && batch(0) && reserved_only(cpu),
           "a source hole removes its CPU mirror");
+    // With LEONIDA_SLOT31_CPU_TWIN unset (default), any legacy paired title_gpu_views reservation outside the
+    // hardcoded stream pool also mirrors to its paired CPU view, while an independent GPU view does not.
+    SetEnvironmentVariableA("LEONIDA_SLOT31_CPU_TWIN", nullptr);
     auto* other_cpu = window();
     auto* other_gpu = api.virtual_alloc(nullptr, n * kPage64k, MEM_RESERVE | kXmem64kPages, 0x3, 0x801);
     const rt::xmem::PageRange other_range{0, 1, 1};
     const rt::xmem::PageBatch other_batch{uintptr_t(other_gpu), 1, &other_range};
-    check(other_gpu && other_cpu && rt::xmem::copy_page_mappings(1, &other_batch, uintptr_t(source), n, 0)
-          && reserved_only(other_cpu), "slot 31 outside the stream pool leaves other CPU reservations empty");
+    check(other_gpu && other_cpu && rt::xmem::copy_page_mappings(1, &other_batch, uintptr_t(source), n, 0) &&
+              page_holds(other_cpu, 0x4101),
+          "slot 31 mirrors legacy paired GPU views outside the stream pool by default");
+    auto* indep_cpu = window();
+    auto* indep_gpu = api.virtual_alloc(nullptr, n * kPage64k, MEM_RESERVE | kXmem64kPages, 0x3, 0x801);
+    const rt::xmem::PageBatch indep_batch{uintptr_t(indep_gpu), 1, &other_range};
+    check(indep_gpu && indep_cpu && leonida::title_gpu_views::set_independent_pages(uintptr_t(indep_gpu)) &&
+              rt::xmem::copy_page_mappings(1, &indep_batch, uintptr_t(source), n, 0) && reserved_only(indep_cpu),
+          "slot 31 leaves an independent GPU view's paired CPU reservation empty");
     rt::xmem::note_stream_reservation(0, 0, 0x1e1d00f);
+    SetEnvironmentVariableA("LEONIDA_SLOT31_CPU_TWIN", *previous ? previous : nullptr);
+}
+
+// Batched queue slot 31 (rt::xmem::copy_page_mappings): multi-window carved destination, cross-range overlap, source
+// holes, default-on paired CPU view mirroring with title_texel_writes on both addresses, to_cpu source fallback, and
+// non-zero flags accepted gracefully.
+void test_copy_page_mappings_batch(const PhysicalApi& api) {
+    check(rt::xmem::copy_page_mappings_batch_fn == &rt::xmem::copy_page_mappings,
+          "xmem.cpp publishes copy_page_mappings_batch_fn for default queue slot 31 wiring");
+    char previous[16]{};
+    GetEnvironmentVariableA("LEONIDA_SLOT31_CPU_TWIN", previous, sizeof(previous));
+    SetEnvironmentVariableA("LEONIDA_SLOT31_CPU_TWIN", nullptr);  // test default behavior (unset = ON)
+
+    constexpr uint32_t kPages = 4;
+    auto* const pool = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE));
+    auto* const dst = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE));
+    check(pool && dst, "batch slot 31 reserves pool and destination windows");
+    if (!pool || !dst) {
+        SetEnvironmentVariableA("LEONIDA_SLOT31_CPU_TWIN", *previous ? previous : nullptr);
+        return;
+    }
+    // Carve the middle two pages of `dst` into a separate window so a 4-page range crosses three windows.
+    void* const carved = api.virtual_alloc(dst + kPage64k, 2 * kPage64k,
+                                           MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | kXmem64kPages, 0x23,
+                                           PAGE_READWRITE | PAGE_GRAPHICS_READWRITE);
+    check(carved == dst + kPage64k, "batch slot 31 carves a split window in the destination");
+
+    uint64_t pages[kPages]{};
+    uint64_t count = kPages;
+    check(api.allocate(0x280, &count, pages) == TRUE && count == kPages, "batch slot 31 allocates four pages");
+    // Map pages 0..2 into pool, leaving pool page 3 as a source hole.
+    check(api.map(pool, 3, pages) == pool, "batch slot 31 maps three pool pages and leaves a hole at page 3");
+    for (uint32_t i = 0; i < 3; ++i) fill_page(pool + i * kPage64k, 0x8100u + i);
+
+    // Multi-window contiguous destination range ending on a source hole.
+    const rt::xmem::PageRange initial_range{0, 0, kPages};
+    const rt::xmem::PageBatch initial_batch{uintptr_t(dst), 1, &initial_range};
+    check(rt::xmem::copy_page_mappings(1, &initial_batch, uintptr_t(pool), kPages, 0),
+          "batch slot 31 maps a single range spanning carved windows with a trailing source hole");
+    check(page_holds(dst, 0x8100u) && page_holds(dst + kPage64k, 0x8101u) &&
+              page_holds(dst + 2 * kPage64k, 0x8102u) && reserved_only(dst + 3 * kPage64k),
+          "carved destination pages match source frames and the source hole leaves page 3 unmapped");
+
+    // Cross-range overlap + source hole across carved windows: dst[0..3] <- {hole(dst[3]), dst[0], dst[1], dst[2]}.
+    const rt::xmem::PageRange overlap_ranges[] = {{0, 3, 1}, {0, 0, 2}, {0, 2, 1}};
+    const rt::xmem::PageBatch overlap_batch{uintptr_t(dst), 3, overlap_ranges};
+    check(rt::xmem::copy_page_mappings(1, &overlap_batch, uintptr_t(dst), kPages, 0),
+          "batch slot 31 handles cross-range overlap and source holes across split windows");
+    check(reserved_only(dst) && page_holds(dst + kPage64k, 0x8100u) && page_holds(dst + 2 * kPage64k, 0x8101u) &&
+              page_holds(dst + 3 * kPage64k, 0x8102u),
+          "cross-range overlap snapshots all source frames before modifying any destination page");
+
+    // Legacy paired CPU+GPU views mirror unconditionally by default (no LEONIDA_SLOT31_CPU_TWIN=1) and report
+    // title_texel_writes on both GPU and paired CPU addresses.
+    constexpr uint32_t kPair = 3;
+    auto* const pair_cpu = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, kPair * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE));
+    auto* const pair_gpu = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPair * kPage64k, MEM_RESERVE | kXmem64kPages, 0x3, 0x801));
+    check(pair_cpu && pair_gpu && leonida::title_gpu_views::to_cpu(uintptr_t(pair_gpu)) == uintptr_t(pair_cpu),
+          "batch slot 31 reserves a legacy paired CPU + GPU-only view");
+    if (pair_cpu && pair_gpu) {
+        const auto has_range = [](const std::vector<std::pair<std::uintptr_t, std::uintptr_t>>& ranges,
+                                  uintptr_t begin, uintptr_t end) {
+            for (const auto& [a, b] : ranges) {
+                if (a <= begin && b >= end) return true;
+            }
+            return false;
+        };
+        bool overflow = false;
+        leonida::title_texel_writes::take(overflow);  // drain earlier notes
+        const rt::xmem::PageRange map_pair{0, 0, 2};
+        const rt::xmem::PageBatch pair_batch{uintptr_t(pair_gpu), 1, &map_pair};
+        check(rt::xmem::copy_page_mappings(1, &pair_batch, uintptr_t(pool), kPages, 0),
+              "batch slot 31 maps into a legacy paired GPU view");
+        check(page_holds(pair_gpu, 0x8100u) && page_holds(pair_gpu + kPage64k, 0x8101u) &&
+                  page_holds(pair_cpu, 0x8100u) && page_holds(pair_cpu + kPage64k, 0x8101u) &&
+                  reserved_only(pair_cpu + 2 * kPage64k),
+              "paired CPU view mirrors mapped GPU pages by default without LEONIDA_SLOT31_CPU_TWIN=1");
+        auto writes = leonida::title_texel_writes::take(overflow);
+        check(!overflow && has_range(writes, uintptr_t(pair_gpu), uintptr_t(pair_gpu) + 2 * kPage64k) &&
+                  has_range(writes, uintptr_t(pair_cpu), uintptr_t(pair_cpu) + 2 * kPage64k),
+              "title_texel_writes::take observes both GPU and mirrored CPU addresses on map");
+
+        // Source lookup falls back via title_gpu_views::to_cpu when a GPU-only source page is mapped only at CPU view.
+        check(api.map(pair_cpu + 2 * kPage64k, 1, &pages[2]) == pair_cpu + 2 * kPage64k,
+              "map a page at the paired CPU view alone");
+        const rt::xmem::PageRange from_gpu_only{0, 2, 1};
+        const rt::xmem::PageBatch fallback_batch{uintptr_t(dst), 1, &from_gpu_only};
+        check(rt::xmem::copy_page_mappings(1, &fallback_batch, uintptr_t(pair_gpu), kPair, 0) &&
+                  page_holds(dst, 0x8102u),
+              "batch slot 31 resolves GPU-only source pages through title_gpu_views::to_cpu fallback");
+
+        // Unmap on paired GPU view mirrors unmap to paired CPU view and notes both addresses.
+        leonida::title_texel_writes::take(overflow);
+        const rt::xmem::PageRange unmap_pair{2, 0, 2};
+        const rt::xmem::PageBatch unmap_batch{uintptr_t(pair_gpu), 1, &unmap_pair};
+        check(rt::xmem::copy_page_mappings(1, &unmap_batch, uintptr_t(pool), kPages, 0),
+              "batch slot 31 unmaps a legacy paired GPU view");
+        check(reserved_only(pair_gpu) && reserved_only(pair_cpu) && reserved_only(pair_cpu + kPage64k) &&
+                  page_holds(pair_cpu + 2 * kPage64k, 0x8102u),
+              "unmapping paired GPU view unmaps mirrored CPU pages and keeps non-mirror CPU pages");
+        writes = leonida::title_texel_writes::take(overflow);
+        check(!overflow && has_range(writes, uintptr_t(pair_gpu), uintptr_t(pair_gpu) + 2 * kPage64k) &&
+                  has_range(writes, uintptr_t(pair_cpu), uintptr_t(pair_cpu) + 2 * kPage64k),
+              "title_texel_writes::take observes both GPU and mirrored CPU addresses on unmap");
+
+        api.map(pair_gpu, kPair, nullptr);
+        api.map(pair_cpu, kPair, nullptr);
+    }
+
+    // Non-zero flags are accepted (logged once) instead of failing with ERROR_INVALID_PARAMETER.
+    const rt::xmem::PageRange flags_range{0, 1, 1};
+    const rt::xmem::PageBatch flags_batch{uintptr_t(dst), 1, &flags_range};
+    check(rt::xmem::copy_page_mappings(1, &flags_batch, uintptr_t(pool), kPages, 1u) && page_holds(dst, 0x8101u),
+          "batch slot 31 accepts non-zero flags (1) and maps the batch");
+    check(rt::xmem::copy_page_mappings(1, &flags_batch, uintptr_t(pool), kPages, 0xdeadbeefu),
+          "batch slot 31 accepts subsequent non-zero flags gracefully");
+    SetLastError(ERROR_SUCCESS);
+    check(!rt::xmem::copy_page_mappings(1, nullptr, uintptr_t(pool), kPages, 0) &&
+              GetLastError() == ERROR_INVALID_PARAMETER,
+          "batch slot 31 still rejects a null batch pointer when count > 0");
+
+    api.map(dst, kPages, nullptr);
+    api.map(pool, kPages, nullptr);
+    check(api.free_pages(kPages, pages) == TRUE, "batch slot 31 frees its physical pages");
     SetEnvironmentVariableA("LEONIDA_SLOT31_CPU_TWIN", *previous ? previous : nullptr);
 }
 
@@ -2663,6 +2801,7 @@ int main(int argc, char** argv) {
         test_copy_page_mappings(physical);
         test_copy_page_mappings_cpu_view(physical);
         test_stream_cpu_twin(physical);
+        test_copy_page_mappings_batch(physical);
         test_unowned_guards(physical);
         test_physical_pages_commit_on_touch(physical);
         test_unmapped_window_page(physical);

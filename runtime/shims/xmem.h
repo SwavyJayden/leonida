@@ -77,6 +77,11 @@ bool transfer_physical(std::span<const std::uint64_t> pages, std::uint16_t offse
 // Set by xmem.cpp when it is linked: the command-object proxy is also compiled into tests without it.
 using CopyPageMappingsFn = bool (*)(void* destination, const void* source, std::uint64_t pages, bool repeat_first);
 inline CopyPageMappingsFn copy_page_mappings_fn = nullptr;
+// Batched, multi-window-safe queue slot 31 entry point (rt::xmem::copy_page_mappings). Set by xmem.cpp when it is
+// linked so d3d12_xs_device.cpp uses the batched path by default without requiring a link-time dependency on xmem.cpp.
+using CopyPageMappingsBatchFn = bool (*)(std::uint32_t count, const PageBatch* batches, std::uintptr_t pool,
+                                         std::uint32_t pool_pages, std::uint32_t flags);
+inline CopyPageMappingsBatchFn copy_page_mappings_batch_fn = nullptr;
 
 // Writes `size` bytes at `address` in the title's memory, through the host pages xmem manages: its own mapping of the
 // physical page, which the CPU may write where the title's view of the page is PAGE_NOACCESS. False when the range is
